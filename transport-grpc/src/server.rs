@@ -59,12 +59,20 @@ pub(crate) fn serve_connection(stream: crate::conn::LowerIo, state: Arc<ConnStat
         let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(io, svc);
         tokio::pin!(conn);
-        tokio::select! {
-            _ = conn.as_mut() => {}
+        let served = tokio::select! {
+            served = conn.as_mut() => served,
             _ = stop_rx => {
                 conn.as_mut().graceful_shutdown();
-                let _ = conn.await;
+                conn.await
             }
+        };
+        // HOW the connection ended, not merely that it did. A peer that spoke a framing this
+        // server could not read, or a socket that died mid-call, is not a peer that finished, and
+        // a reader handed the clean end-of-stream for either would read an aborted conversation as
+        // a complete one. The failure goes up as this connection's terminal error, ahead of the
+        // end.
+        if served.is_err() {
+            let _ = ending.send_inbound(Err(TransportError::Reset)).await;
         }
         // The connection is over, so nothing will ever arrive on it again: end the inbound side so
         // a reader on `frames()` finishes rather than waiting out a deadline for a frame that
@@ -227,6 +235,8 @@ pub(crate) fn map_status(status: &Status) -> busbar_contract_transport::wire::St
     use tonic::Code;
     match status.code() {
         Code::Ok => StatusClass::Success,
+        // The upstream blamed the request: the argument, the name, the credential, the state the
+        // caller asked against, or a quota the caller has spent.
         Code::InvalidArgument
         | Code::NotFound
         | Code::AlreadyExists
@@ -235,10 +245,30 @@ pub(crate) fn map_status(status: &Status) -> busbar_contract_transport::wire::St
         | Code::FailedPrecondition
         | Code::OutOfRange
         | Code::ResourceExhausted => StatusClass::ClientError,
-        Code::Internal | Code::Unavailable | Code::DataLoss | Code::Unimplemented => {
-            StatusClass::ServerError
-        }
-        _ => StatusClass::Other,
+        // The upstream blamed ITSELF. The four that were falling to the catch-all belong here and
+        // are named rather than left to it, because the two classes part company on money: only a
+        // server-side failure is one this node retries elsewhere and holds the destination
+        // responsible for. `Unknown` is gRPC's own word for a server-side failure it could not
+        // attribute; `DeadlineExceeded` is an upstream that did not answer in time; `Aborted` is
+        // an upstream aborting the call over its own concurrency; `Unavailable` and `Internal` say
+        // so outright. Reading any of them as "outside the three classes" said the upstream was
+        // fine and the caller was at fault, which is neither true nor free.
+        //
+        // An HTTP 5xx carrying NO `grpc-status` at all lands here too, by the same reading: there
+        // is no code to read off such an answer, so it arrives as `Unknown`, and an upstream that
+        // answered 5xx without finishing the gRPC framing has blamed itself twice over.
+        Code::Internal
+        | Code::Unavailable
+        | Code::DataLoss
+        | Code::Unimplemented
+        | Code::Unknown
+        | Code::DeadlineExceeded
+        | Code::Aborted => StatusClass::ServerError,
+        // Cancelled is the one code where NEITHER side is blamed: the call was called off, usually
+        // by the caller itself, so `Other` is the honest reading. Named, with no catch-all behind
+        // it: every code gRPC defines has a row here, so one added later stops this compiling
+        // rather than quietly acquiring a class nobody chose.
+        Code::Cancelled => StatusClass::Other,
     }
 }
 

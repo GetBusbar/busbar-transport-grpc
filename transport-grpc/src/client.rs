@@ -19,6 +19,18 @@ use busbar_contract_transport::wire::TransportError;
 use crate::codec::RawCodec;
 use crate::conn::ConnState;
 
+/// How the HTTP/2 connection under a dial ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionEnd {
+    /// The driver finished with nothing left to carry.
+    Clean,
+    /// The driver failed: a protocol error, or the socket beneath it going away.
+    Failed,
+}
+
+/// The leg that fires when the connection itself is over, carrying HOW it ended.
+pub(crate) type ConnectionOver = tokio::sync::oneshot::Receiver<ConnectionEnd>;
+
 /// The dial-side HTTP/2 sender. `Clone`-able (it is a cheap handle onto the connection's dispatch
 /// channel), so every RPC this connection opens gets its own owned handle rather than sharing a
 /// lock.
@@ -59,16 +71,24 @@ impl tower::Service<http::Request<tonic::body::Body>> for Dialer {
 pub(crate) async fn handshake_h2(
     stream: crate::conn::Cuttable,
     authority: &str,
-) -> Result<(Dialer, http::Uri, tokio::sync::oneshot::Receiver<()>), TransportError> {
+) -> Result<(Dialer, http::Uri, ConnectionOver), TransportError> {
     let io = TokioIo::new(stream);
     let (send_request, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, tonic::body::Body>(io)
         .await
         .map_err(|_| TransportError::HandshakeFailed)?;
-    let (over_tx, over_rx) = tokio::sync::oneshot::channel::<()>();
+    let (over_tx, over_rx) = tokio::sync::oneshot::channel::<ConnectionEnd>();
     tokio::spawn(async move {
-        let _ = connection.await;
-        let _ = over_tx.send(());
+        // HOW it ended, not merely that it did. A GOAWAY the upstream sent, a protocol error, a
+        // socket that died under the driver — each ends this connection, and each is a fact the
+        // reader on the other side needs. Discarding it turned every one of them into the same
+        // clean end-of-stream, which is what a reader sees when a peer is finished rather than
+        // when it has failed: an aborted answer read as a complete one.
+        let end = match connection.await {
+            Ok(()) => ConnectionEnd::Clean,
+            Err(_) => ConnectionEnd::Failed,
+        };
+        let _ = over_tx.send(end);
     });
     let origin = http::Uri::builder()
         .scheme("http")
