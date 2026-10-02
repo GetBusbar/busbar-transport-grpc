@@ -15,33 +15,34 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
-# The only busbar crate this plugin names (#40(a)). Its `hyper_io!` SDK macro is the sans-IO drive
+# The only busbar crate this plugin names (#40(a)). Pinned by git rev to the busbar commit in
+# `.busbar-ref`. Its `hyper_io!` SDK macro is the sans-IO drive
 # this framer runs `hyper` on, expanded here over this crate's own `hyper` and `bytes`.
-busbar-contract = { path = "../busbar-contract" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "d27ad38bda657805e1c8bee9bca6dfe87963ec48" }
 # HTTP/2 is `hyper`'s (the owner's PLUGIN LIBRARIES ruling: a prebuilt library, driven over the
 # host's bytes); gRPC's own layer — the length-prefixed message, grpc-timeout, grpc-status — is
 # this crate's.
-hyper = { workspace = true }
-http = { workspace = true }
-http-body = { workspace = true }
-bytes = { workspace = true }
+hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
+http = "1"
+http-body = "1"
+bytes = "1"
 # The door's settings blob is JSON.
-serde_json = { workspace = true }
+serde_json = "1"
 
 [dev-dependencies]
 # THE DOOR'S CONFORMANCE (`tests/conformance.rs`): the dropped-in image (`examples/grpc_door.rs`)
 # loaded beside the linked one.
-libloading = { workspace = true }
+libloading = "0.9"
 # THE REAL PEERS (`tests/peers.rs`): tonic servers and clients on real sockets, over cleartext and
 # over TLS, with this door on the other end through a test host that carries the socket's bytes.
-tonic = { workspace = true, features = ["server", "channel", "router", "codegen"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
-rcgen = { workspace = true }
-hyper-util = { workspace = true, features = ["tokio"] }
-tower = { workspace = true }
-futures = { workspace = true }
+tonic = { version = "0.14", default-features = false, features = ["server", "channel", "router", "codegen"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.14"
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "http1", "http2", "server-auto", "service"] }
+tower = "0.5"
+futures = "0.3"
 
 # THE DROPPED-IN IMAGE ON THE ONE DOOR: built by `cargo test`.
 [[example]]

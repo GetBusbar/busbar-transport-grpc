@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-transport-grpc-plugin"
+version = "1.6.0"
+publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
+edition = "2021"
+rust-version = "1.97"
+description = "First-party signed kind:transport plugin cdylib: the grpc transport, packaged as a droppable busbar plugin. Drop the signed tarball into plugins/."
+license = "Apache-2.0"
+
+[lib]
+# cdylib: the DROPPED-IN door (a signed tarball in `plugins/`), exporting `busbar_plugin_door`.
+# rlib: what `cargo test` links, and what makes `cargo test` emit the cdylib the conformance test
+# loads (a cdylib-only package builds a trivial test harness and never produces the library).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# THE LOGIC, same repo: its `door::door` is the door this image exports.
+busbar-transport-grpc = { path = "../transport-grpc" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "d27ad38bda657805e1c8bee9bca6dfe87963ec48" }
+
+[dev-dependencies]
+# The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
+# dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "d27ad38bda657805e1c8bee9bca6dfe87963ec48" }
