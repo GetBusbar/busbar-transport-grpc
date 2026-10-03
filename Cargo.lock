@@ -257,6 +257,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-transport-grpc",
+ "busbar-transport-grpc-plugin",
 ]
 
 [[package]]
