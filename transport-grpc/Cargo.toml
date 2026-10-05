@@ -18,7 +18,7 @@ crate-type = ["rlib"]
 # The only busbar crate this plugin names (#40(a)). Pinned by git rev to the busbar commit in
 # `.busbar-ref`. Its `hyper_io!` SDK macro is the sans-IO drive
 # this framer runs `hyper` on, expanded here over this crate's own `hyper` and `bytes`.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "53ace2f43efbfe3cf7f7720f17d6aec0e5c5cf9c" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "085c207abc59cb87f50c950b6a8e6c73d56f221a" }
 # HTTP/2 is `hyper`'s (the owner's PLUGIN LIBRARIES ruling: a prebuilt library, driven over the
 # host's bytes); gRPC's own layer — the length-prefixed message, grpc-timeout, grpc-status — is
 # this crate's.
