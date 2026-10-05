@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE ENGINE: gRPC over `hyper`'s HTTP/2, both sides, run as a sans-IO framer.
+//! THE ENGINE, as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN, §2: meta, claims, and the
+//! kind-named entry): gRPC over `hyper`'s HTTP/2, both sides, run as a sans-IO framer.
 //!
 //! One [`Conn`] is one connection. Its HTTP/2 machine is `hyper`'s own — `client::conn::http2`
 //! on a dialled connection, `server::conn::http2` on an accepted one — driven over the host's
