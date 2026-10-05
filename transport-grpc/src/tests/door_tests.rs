@@ -12,10 +12,9 @@ use busbar_contract::abi::transport::{
     ROLE_FRAMER, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
 };
 
-use super::{
-    class_of, read_settings, CLAIMS, CLAIM_NAMES, COMPOSES_OVER, SETTINGS, STATEMENT, STATUS_ROWS,
-    TAIL,
-};
+use super::{class_of, read_settings, CLAIM_NAMES, STATEMENT, TAIL};
+use crate::claims::CLAIMS;
+use crate::meta::{COMPOSES_OVER, SETTINGS, STATUS_ROWS};
 
 #[test]
 fn the_tail_is_a_framer_that_names_no_other_transport() {
