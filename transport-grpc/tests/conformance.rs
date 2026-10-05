@@ -14,6 +14,8 @@ mod common;
 
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use busbar_contract::abi::mechanism::call::Outcome;
 use busbar_contract::abi::transport::{
     Ops, SIDE_ACCEPT, SIDE_DIAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_SUCCESS,
@@ -291,4 +293,173 @@ fn locate_offers_h2_alone_on_a_secured_target_and_nothing_in_the_clear() {
         assert_eq!(host.locate("grpc://peer.test"), Err(Outcome::Failed));
         host.close();
     }
+}
+
+// ── ONE STREAM (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────────────────
+
+/// The unit's message on the close: every byte tonic 0.14 percent-encodes, and some it does not.
+const MESSAGE: &str = "not here: \u{2713} 100% {x} <y> `z` ?q #h \"s\" ok-_.~";
+/// The unit's details, raw (the value it writes is their base64, without padding, verbatim).
+const DETAILS: &[u8] = &[0x08, 0x05, 0x12, 0x03, b'a', b'b', 0xff, 0x00, 0x7f];
+
+/// Base64, standard alphabet, without padding: the value 1.5.5's tonic wrote for raw details.
+fn b64_nopad(raw: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in raw.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for k in 0..=chunk.len() {
+            out.push(char::from(A[((n >> (18 - 6 * k)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// What 1.5.5's gRPC line wrote for a status: tonic 0.14's own header rendering, as field lines
+/// (with `head`: the trailers-only answer's `:status` and `content-type` first, `into_http`).
+fn tonic_block(status: tonic::Status, head: bool) -> String {
+    let mut out = String::new();
+    let map = if head {
+        let r = status.into_http::<()>();
+        out.push_str(&format!(":status: {}\r\n", r.status().as_u16()));
+        r.headers().clone()
+    } else {
+        let mut map = http::HeaderMap::new();
+        status
+            .add_header(&mut map)
+            .expect("tonic renders the status");
+        map
+    };
+    for (n, v) in &map {
+        out.push_str(&format!("{n}: {}\r\n", v.to_str().expect("text")));
+    }
+    out
+}
+
+/// One stream through `ops`: its body's messages, a reply framed, and the close rendered from the
+/// close's final tail alone; the proof lines, and the closing block.
+fn one_stream(ops: &'static Ops, caps: Caps) -> (Vec<String>, String) {
+    let mut proof = Vec::new();
+    let mut host = Host::open(ops, "{}", caps);
+    let fields = [("content-type", "application/grpc"), ("te", "trailers")];
+    assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
+    let mut body = lpm(b"hello");
+    body.extend(lpm(b""));
+    body.extend(lpm(b"again"));
+    assert_eq!(host.feed(&body, true), Outcome::Ready);
+    let messages = host.frames(1);
+    proof.push(format!("messages {messages:?}"));
+    assert_eq!(
+        messages,
+        [b"hello".to_vec(), Vec::new(), b"again".to_vec()],
+        "each message's payload, an empty one too"
+    );
+    let at = host.wire_log.len();
+    assert_eq!(host.emit(1, b"got:", false, 0), Outcome::Ready);
+    assert_eq!(host.emit(1, b"hello", true, 0), Outcome::Ready);
+    let reply = host.wire_log[at..].to_vec();
+    proof.push(format!("reply {reply:?}"));
+    assert_eq!(
+        reply,
+        lpm(b"got:hello"),
+        "one reply message, length-prefixed"
+    );
+    let at = host.wire_log.len();
+    let details = b64_nopad(DETAILS);
+    assert_eq!(
+        host.finish_final(5, MESSAGE.as_bytes(), details.as_bytes()),
+        Outcome::Ready
+    );
+    let block = String::from_utf8(host.wire_log[at..].to_vec()).expect("text");
+    proof.push(format!("close {block:?}"));
+    host.close();
+    (proof, block)
+}
+
+/// THE CLOSE IS THE DOOR'S, BOTH WAYS IN, IN 1.5.5'S BYTES: the linked and the dropped-in door
+/// frame one stream the same (a tight sink's re-calls included), and the closing block is the
+/// trailers tonic 0.14 wrote for the same status, message and details (a status-with-details cell),
+/// and for a whole end.
+#[test]
+fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_1_5_5s_bytes() {
+    let l = linked();
+    let (d, _lib) = dropped();
+    let mut runs = Vec::new();
+    for (image, ops) in [("linked", l), ("dropped", d)] {
+        for caps in [ROOMY, TIGHT] {
+            let (proof, block) = one_stream(ops, caps);
+            for line in &proof {
+                println!("PROOF {image}: {line}");
+            }
+            assert_eq!(
+                block,
+                tonic_block(
+                    tonic::Status::with_details(
+                        tonic::Code::NotFound,
+                        MESSAGE,
+                        Bytes::from_static(DETAILS)
+                    ),
+                    false
+                ),
+                "{image}: the close is 1.5.5's trailers, byte for byte"
+            );
+            runs.push(proof);
+        }
+    }
+    for run in &runs[1..] {
+        assert_eq!(same_proof(&runs[0], run), Ok(()));
+    }
+    // A whole end: `grpc-status: 0` alone.
+    let mut host = Host::open(l, "{}", ROOMY);
+    host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+    let at = host.wire_log.len();
+    assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+    assert_eq!(
+        String::from_utf8_lossy(&host.wire_log[at..]),
+        tonic_block(tonic::Status::new(tonic::Code::Ok, ""), false)
+    );
+    host.close();
+}
+
+/// A STREAM REFUSED BEFORE ANY REPLY is the door's trailers-only answer, in 1.5.5's bytes (tonic
+/// 0.14's `into_http` for the status the refusal's neutral status maps to, predev's words).
+#[test]
+fn a_stream_refused_before_any_reply_is_1_5_5s_trailers_only_answer() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        let at = host.wire_log.len();
+        assert_eq!(host.refuse_as(1, b"", 401), Outcome::Ready);
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            tonic_block(
+                tonic::Status::new(tonic::Code::Unauthenticated, "busbar answered HTTP 401"),
+                true
+            )
+        );
+        host.close();
+    }
+}
+
+/// RED: a call that is not gRPC is refused at `begin`; details that are not one field value fail
+/// the close.
+#[test]
+fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
+    let mut host = Host::open(linked(), "{}", ROOMY);
+    assert_eq!(
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/json")]),
+        Outcome::Refused
+    );
+    let mut host = Host::open(linked(), "{}", ROOMY);
+    host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+    assert_eq!(
+        host.finish_final(13, b"x", b"line\r\nbreak"),
+        Outcome::Failed
+    );
 }

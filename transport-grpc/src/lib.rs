@@ -23,6 +23,7 @@ mod claims;
 pub mod door;
 mod meta;
 pub mod msg;
+mod stream;
 mod transport;
 
 /// THE TRANSPORT AXIS ENTRY: what the composition root folds for this transport — its key, the
