@@ -7,7 +7,7 @@
 //! A framer frames; it does not dial. The connector owns the socket and connection security; this
 //! framer tells it, at `locate`, where a target is, whether it asks for security (`https`) and what
 //! to offer in the handshake (`h2`, alone: gRPC is HTTP/2 only). A cleartext target is HTTP/2 by
-//! prior knowledge. From there each op is one step of [`engine::Conn`], on either side:
+//! prior knowledge. From there each op is one step of [`transport::Conn`], on either side:
 //!
 //! * `begin` opens a dialled connection (the HTTP/2 preface and settings are owed first) or an
 //!   accepted one;
@@ -20,7 +20,7 @@
 //!   framer asked for, and `finish` drops the connection.
 //!
 //! What a stream carries each way, and how `grpc-status` reaches the host (the terminal piece's
-//! code, in the `grpc` numbering this door's status rows class), is the engine's module note.
+//! code, in the `grpc` numbering this door's status rows class), is the framer's module note (`transport.rs`).
 //!
 //! No op pends. Every slot is a `SafeSlot` on the SDK's safe surface: this crate holds no `unsafe`.
 
@@ -30,180 +30,33 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::hyper_io::{fill, Owed};
-use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
 };
-use busbar_contract::abi::sdk::door::{abi_str, statement};
+use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::life::Refusal;
-use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
-    AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
-    EmitIn, EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn,
-    ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn, StatusRow,
-    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
-    SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_TERMINAL, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
-    STATUS_OTHER, STATUS_SUCCESS, UNIT0_FIRST_MESSAGE, YIELD_ENDED,
+    AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
+    EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn, ListenOut,
+    LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail, WriteIn,
+    CANCEL_NOTHING_MOVED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
-    facts as tfacts, status_ns, DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
+    DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
 };
-use busbar_contract::SelectorForm;
 
-use crate::engine::{self, Conn, Posture};
 use crate::msg;
+use crate::transport::{self, Conn, Posture};
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
-/// This transport's key: the scheme it claims.
-pub const KEY: &str = "grpc";
-
-/// The settings this transport reads, at their 1.5.5 paths.
-pub mod setting {
-    /// A dialled call's deadline when the host states none, in seconds.
-    pub const REQUEST_TIMEOUT_SECS: &str = "limits.upstream_request_timeout_secs";
-    /// The largest message carried, in bytes.
-    pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
-}
-
-/// The shapes an ingress claim over this wire may take: a call is a path (`/<service>/<method>`)
-/// and its metadata, on a connection its listener's port, name and protocol pick. gRPC is the top
-/// framer of its connection, so it owns claim selection over the request that opens each call.
-const SELECTOR_FORMS: &[SelectorForm] = &[
-    SelectorForm::ExactPath,
-    SelectorForm::PrefixOneLevel,
-    SelectorForm::PathPattern,
-    SelectorForm::HeaderExact,
-    SelectorForm::HeaderPresent,
-    SelectorForm::HeaderPrefix,
-    SelectorForm::Sni,
-    SelectorForm::Alpn,
-    SelectorForm::Port,
-];
-
-const SELECTOR_CODES: [u8; SELECTOR_FORMS.len()] = form_codes(SELECTOR_FORMS);
-
-const FACTS: &[AbiStr] = &[
-    abi_str(tfacts::PATH),
-    abi_str(tfacts::METHOD),
-    abi_str(tfacts::AUTHORITY),
-    abi_str(tfacts::PEER),
-];
-
-const fn bytes_str(b: &'static [u8]) -> AbiStr {
-    AbiStr {
-        ptr: b.as_ptr(),
-        len: b.len(),
-    }
-}
-
-/// The scheme `grpc` claims, by name: the Statement's `claims`, the one place it is stated.
-const CLAIM_NAMES: &[AbiStr] = &[abi_str(KEY)];
-
-/// The claimed scheme's row, by index into [`CLAIM_NAMES`].
-const CLAIMS: &[Claim] = &[Claim {
-    selector_forms: bytes_str(&SELECTOR_CODES),
-    egress_selector_forms: abi_str(""),
-    facts: FACTS.as_ptr(),
-    facts_len: FACTS.len(),
-    status_namespace: abi_str(status_ns::GRPC),
-    // A connection multiplexes calls, each its own stream; the session opens at a call's first
-    // message.
-    session: 1,
-    session_bound: 1,
-    unit0_trigger: UNIT0_FIRST_MESSAGE,
-    status_at: STATUS_AT_TERMINAL,
-    _reserved: 0,
-}];
-
-/// What `grpc` composes over: NOTHING. No transport names another. The connector builds every
-/// connection as carrier -> [TLS] -> framer, and it picks the carrier from the target's scheme.
-/// This framer frames whatever bytes it is handed. HTTP/2 is its own.
-const COMPOSES_OVER: &[AbiStr] = &[];
-
-/// `grpc-status` by class, as the canonical HTTP mapping of each code reads it: a `4xx` code is
-/// the caller's fault, a `5xx` the far end's.
-const STATUS_ROWS: &[StatusRow] = &[
-    row(0, 0, STATUS_SUCCESS),
-    // CANCELLED (499).
-    row(1, 1, STATUS_CALLER_FAULT),
-    // UNKNOWN (500).
-    row(2, 2, STATUS_FAR_END_FAULT),
-    // INVALID_ARGUMENT (400).
-    row(3, 3, STATUS_CALLER_FAULT),
-    // DEADLINE_EXCEEDED (504).
-    row(4, 4, STATUS_FAR_END_FAULT),
-    // NOT_FOUND .. OUT_OF_RANGE (404, 409, 403, 429, 400, 409, 400).
-    row(5, 11, STATUS_CALLER_FAULT),
-    // UNIMPLEMENTED .. DATA_LOSS (501, 500, 503, 500).
-    row(12, 15, STATUS_FAR_END_FAULT),
-    // UNAUTHENTICATED (401).
-    row(16, 16, STATUS_CALLER_FAULT),
-];
-
-const fn row(lo: u32, hi: u32, class: u8) -> StatusRow {
-    StatusRow {
-        claim: 0,
-        lo,
-        hi,
-        class: class as u32,
-    }
-}
-
-fn class_of(code: u16) -> u8 {
-    STATUS_ROWS
-        .iter()
-        .find(|r| (r.lo..=r.hi).contains(&u32::from(code)))
-        .map_or(STATUS_OTHER, |r| r.class as u8)
-}
-
-const SETTINGS: &[SettingDecl] = &[
-    SettingDecl {
-        path: abi_str(setting::REQUEST_TIMEOUT_SECS),
-        kind: SETTING_COUNT,
-        _reserved: 0,
-        default: abi_str("300"),
-    },
-    SettingDecl {
-        path: abi_str(setting::BODY_MAX_BYTES),
-        kind: SETTING_COUNT,
-        _reserved: 0,
-        default: abi_str("33554432"),
-    },
-];
-
-const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
-
-const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
-    role: ROLE_FRAMER,
-    framing: FRAMING_STREAM,
-    facts: 0,
-    handshake_max_steps: 0,
-    composes_over: COMPOSES_OVER.as_ptr(),
-    composes_over_len: COMPOSES_OVER.len(),
-    claim_rows: CLAIMS.as_ptr(),
-    claim_rows_len: CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
-    status_rows: STATUS_ROWS.as_ptr(),
-    status_rows_len: STATUS_ROWS.len(),
-    settings: SETTINGS.as_ptr(),
-    settings_len: SETTINGS.len(),
-};
+use crate::claims::CLAIM_NAMES;
+use crate::meta::{class_of, TAIL};
+pub use crate::meta::{setting, KEY};
 
 /// The door's Statement: the `grpc` framer.
 pub const STATEMENT: Statement = Statement {
@@ -563,7 +416,7 @@ fn with(
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    f: impl FnOnce(&mut Conn) -> Result<(), engine::Failure>,
+    f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
     let held = p
         .get()
@@ -580,7 +433,7 @@ fn step(
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    f: impl FnOnce(&mut Conn) -> Result<(), engine::Failure>,
+    f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
     if let Err(e) = f(&mut h.conn) {
         return o.fail(Refusal::failed(e.0));
