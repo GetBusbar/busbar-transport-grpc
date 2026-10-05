@@ -7,7 +7,7 @@
 //! ([`door`]) is the same table compiled in and dropped in. It frames whatever bytes the connector
 //! hands it (it names no carrier): the host owns the socket, connection security and the protocol
 //! offer. HTTP/2 is `hyper`'s, run over the host's bytes by the contract's sans-IO drive
-//! (`busbar_contract::hyper_io!`). The gRPC layer is this crate's ([`msg`], `engine`): the head
+//! (`busbar_contract::hyper_io!`). The gRPC layer is this crate's ([`msg`], `transport`): the head
 //! block, the length-prefixed message, `te: trailers`, `grpc-timeout`, and `grpc-status` read from
 //! the trailers (or a trailers-only head).
 //!
@@ -17,9 +17,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+// THE KIND'S SKELETON (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
+// (`claims`), the entry (`transport`: the sans-IO gRPC framer), and the door that states them.
+mod claims;
 pub mod door;
-mod engine;
+mod meta;
 pub mod msg;
+mod transport;
 
 /// THE TRANSPORT AXIS ENTRY: what the composition root folds for this transport — its key, the
 /// layers it declares and its door. The root names none of them.

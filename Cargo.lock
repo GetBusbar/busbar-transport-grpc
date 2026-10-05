@@ -167,7 +167,7 @@ dependencies = [
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=d27ad38bda657805e1c8bee9bca6dfe87963ec48#d27ad38bda657805e1c8bee9bca6dfe87963ec48"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "async-trait",
  "futures",
@@ -189,7 +189,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=d27ad38bda657805e1c8bee9bca6dfe87963ec48#d27ad38bda657805e1c8bee9bca6dfe87963ec48"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "busbar-contract",
  "serde",
@@ -199,7 +199,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=d27ad38bda657805e1c8bee9bca6dfe87963ec48#d27ad38bda657805e1c8bee9bca6dfe87963ec48"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "busbar-contract",
  "sha2 0.11.0",
@@ -208,7 +208,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=d27ad38bda657805e1c8bee9bca6dfe87963ec48#d27ad38bda657805e1c8bee9bca6dfe87963ec48"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "async-trait",
  "busbar-contract",
