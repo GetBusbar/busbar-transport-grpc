@@ -18,8 +18,8 @@
 //! A message on this wire, both ways, is its LENGTH-PREFIXED FORM: one flag byte (`0` = not
 //! compressed; this door negotiates no compression), a four-byte big-endian length, the payload.
 //! A frame this door answers is one whole message in that form, so it is never empty — an empty
-//! payload is still five bytes — and the empty piece stays what the kind says it is: the stream's
-//! end.
+//! payload is still five bytes; the stream's end is its own piece (`PIECE_END`), never an empty
+//! frame.
 
 use std::time::Duration;
 
