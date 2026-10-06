@@ -293,7 +293,7 @@ slot!(
             };
             let token = inst.next.fetch_add(1, Ordering::Relaxed);
             o.set(|x| &x.framing, token);
-            fill(&mut call, i.field(|x| &x.sink), &mut o, class_of);
+            fill(&mut call, i.field(|x| &x.sink), &mut o, class_of, fault_of);
             inst.streams
                 .lock()
                 .expect("streams")
@@ -498,7 +498,7 @@ fn on_stream(
     if let Err(e) = f(&mut c) {
         return o.fail(Refusal::failed(e.0));
     }
-    fill(&mut *c, sink, o, class_of);
+    fill(&mut *c, sink, o, class_of, fault_of);
     Outcome::Ready
 }
 
