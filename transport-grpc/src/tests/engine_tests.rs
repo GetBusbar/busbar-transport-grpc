@@ -146,6 +146,10 @@ fn a_unary_call_half_closes_and_its_answer_ends_with_status_ok() {
     assert_eq!(a.len(), 2, "message, end: {a:?}");
     assert_eq!(a[0], msg::frame(b"hello").as_slice());
     assert!(a[1].is_empty(), "the far end's last");
+    assert!(
+        last(&p.got_a, 1).expect("the end").end,
+        "said as the stream's end"
+    );
 
     p.a.emit(1, b"\r\n", false, 0, p.now).expect("answer head");
     p.a.emit(1, &msg::frame(b"hi"), false, 0, p.now)
@@ -169,6 +173,10 @@ fn a_unary_call_half_closes_and_its_answer_ends_with_status_ok() {
     );
     let end = last(&p.got_d, 1).expect("a terminal piece");
     assert!(!end.fields && !end.failed && end.bytes.is_empty() && end.status.is_none());
+    assert!(
+        end.end,
+        "the terminal piece is the stream's end (PIECE_END)"
+    );
 }
 
 #[test]
