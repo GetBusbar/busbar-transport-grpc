@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_JSON,
 };
@@ -34,9 +35,10 @@ use busbar_contract::abi::transport::check::{
     check_framer, check_framer_fields, check_head_slots, check_locate,
 };
 use busbar_contract::abi::transport::{
-    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FrameSpan, FramerOut, FramerSink,
-    FramingIn, HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn, PIECE_END_OF_FRAME,
-    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, YIELD_HAS_DEADLINE, YIELD_MORE,
+    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FinishIn, FramePiece, FrameSpan, FramerOut,
+    FramerSink, FramingIn, HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn,
+    PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, SIDE_ACCEPT_STREAM,
+    YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -408,6 +410,12 @@ impl Host {
                     i.sink = self.sink();
                     call(self.ops.ingest, self.inst, &mut i, &mut o, index)
                 }
+                slot::FINISH => {
+                    let mut i: FinishIn = z();
+                    i.framing = self.framing;
+                    i.sink = self.sink();
+                    call(self.ops.finish, self.inst, &mut i, &mut o, index)
+                }
                 _ => {
                     let mut i: FramingIn = z();
                     i.framing = self.framing;
@@ -420,6 +428,71 @@ impl Host {
             }
         }
         Outcome::Ready
+    }
+
+    /// `begin` ONE STREAM (`SIDE_ACCEPT_STREAM`) at `target` with its head `fields`.
+    pub fn begin_stream(&mut self, target: &str, fields: &[(&str, &str)]) -> Outcome {
+        let lent: Vec<Field> = fields
+            .iter()
+            .map(|(n, v)| Field {
+                name: s(n),
+                value: s(v),
+            })
+            .collect();
+        let mut i: BeginIn = z();
+        i.side = SIDE_ACCEPT_STREAM;
+        i.target = s(target);
+        i.fields = lent.as_ptr();
+        i.fields_len = lent.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
+        self.framing = o.framing;
+        if self.take(r, &o) != Outcome::Ready {
+            return r;
+        }
+        self.drain(slot::BEGIN, 0)
+    }
+
+    /// `ingest` `bytes` (`end` = the far side's last).
+    pub fn feed(&mut self, bytes: &[u8], end: bool) -> Outcome {
+        let mut i: IngestIn = z();
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.end = u32::from(end);
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        if self.take(r, &o) != Outcome::Ready {
+            return r;
+        }
+        self.drain(slot::INGEST, 0)
+    }
+
+    /// `finish` the framing with the close's FINAL TAIL: `status`, its `message` and `details`.
+    pub fn finish_final(&mut self, status: u32, message: &[u8], details: &[u8]) -> Outcome {
+        let bytes = [message, details].concat();
+        let mut i: FinishIn = z();
+        i.framing = self.framing;
+        i.final_status = status;
+        i.final_message = Span {
+            offset: 0,
+            len: message.len() as u32,
+        };
+        i.final_details = Span {
+            offset: message.len() as u32,
+            len: details.len() as u32,
+        };
+        i.final_bytes = bytes.as_ptr();
+        i.final_bytes_len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH);
+        if self.take(r, &o) != Outcome::Ready {
+            return r;
+        }
+        self.drain(slot::FINISH, 0)
     }
 
     /// `begin` on `side`, over `sock`, with `agreed` the protocol connection security agreed.
