@@ -61,7 +61,7 @@ use crate::transport::{self, Conn, Posture};
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
 use crate::claims::CLAIM_NAMES;
-use crate::meta::{class_of, TAIL};
+use crate::meta::{class_of, fault_of, TAIL};
 pub use crate::meta::{setting, KEY};
 
 /// The door's Statement: the `grpc` framer.
@@ -537,7 +537,7 @@ fn step(
             return o.fail(Refusal::failed(e.0));
         }
     }
-    fill(&mut h.conn, sink, o, class_of);
+    fill(&mut h.conn, sink, o, class_of, fault_of);
     Outcome::Ready
 }
 

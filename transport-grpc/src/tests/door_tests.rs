@@ -5,16 +5,17 @@
 //! `grpc-status`, and its settings read as their declarations say.
 
 use busbar_contract::abi::transport::check::{
-    check_claim_rows, check_claims, check_composes_over, check_settings, check_status_rows,
-    check_tail,
+    check_claim_rows, check_claims, check_composes_over, check_fault_cover, check_fault_rows,
+    check_settings, check_status_rows, check_tail,
 };
 use busbar_contract::abi::transport::{
-    ROLE_FRAMER, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    FAULT_CALLER, FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, ROLE_FRAMER, STATUS_CALLER_FAULT,
+    STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
 };
 
-use super::{class_of, read_settings, CLAIM_NAMES, STATEMENT, TAIL};
+use super::{class_of, fault_of, read_settings, CLAIM_NAMES, STATEMENT, TAIL};
 use crate::claims::CLAIMS;
-use crate::meta::{COMPOSES_OVER, SETTINGS, STATUS_ROWS};
+use crate::meta::{COMPOSES_OVER, FAULT_ROWS, SETTINGS, STATUS_ROWS};
 
 #[test]
 fn the_tail_is_a_framer_that_names_no_other_transport() {
@@ -25,6 +26,8 @@ fn the_tail_is_a_framer_that_names_no_other_transport() {
     assert_eq!(check_claims(CLAIMS), Ok(()));
     assert_eq!(check_composes_over(COMPOSES_OVER), Ok(()));
     assert_eq!(check_status_rows(STATUS_ROWS, CLAIMS.len() as u64), Ok(()));
+    assert_eq!(check_fault_rows(FAULT_ROWS, CLAIMS.len() as u64), Ok(()));
+    assert_eq!(check_fault_cover(STATUS_ROWS, FAULT_ROWS), Ok(()));
     assert_eq!(check_settings(SETTINGS), Ok(()));
     assert_eq!(TAIL.role, ROLE_FRAMER);
     // No transport names another (THE DESIGN, the transport chain). The connector picks the
@@ -43,6 +46,39 @@ fn every_canonical_status_has_the_class_its_http_mapping_gives_it() {
         assert_eq!(class_of(code), STATUS_FAR_END_FAULT, "code {code}");
     }
     assert_eq!(class_of(17), STATUS_OTHER);
+}
+
+/// Every code gRPC defines, stated as the breaker's reading. Written out rather than derived from
+/// the table, so a row that drifted fails here: which codes penalise the destination, which take it
+/// down across every pool, and which are the caller's own and cost the destination nothing.
+#[test]
+fn every_canonical_status_has_the_breakers_fault_reading() {
+    let expect: [(u16, u8); 17] = [
+        (0, FAULT_CALLER),
+        (1, FAULT_CALLER),
+        (2, FAULT_TRANSIENT),
+        (3, FAULT_CALLER),
+        (4, FAULT_TRANSIENT),
+        (5, FAULT_CALLER),
+        (6, FAULT_CALLER),
+        (7, FAULT_HARD),
+        (8, FAULT_TRANSIENT),
+        (9, FAULT_CALLER),
+        (10, FAULT_TRANSIENT),
+        (11, FAULT_CALLER),
+        (12, FAULT_CALLER),
+        (13, FAULT_TRANSIENT),
+        (14, FAULT_TRANSIENT),
+        (15, FAULT_TRANSIENT),
+        (16, FAULT_HARD),
+    ];
+    for (code, fault) in expect {
+        assert_eq!(fault_of(code), fault, "code {code}");
+    }
+    assert_eq!(FAULT_ROWS.len(), expect.len(), "one row per code, no more");
+    // A code gRPC has not defined is evidence about nobody: no reading.
+    assert_eq!(fault_of(17), FAULT_NONE);
+    assert_eq!(fault_of(200), FAULT_NONE);
 }
 
 #[test]
