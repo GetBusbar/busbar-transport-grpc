@@ -1,0 +1,74 @@
+{
+  "settings": {},
+  "transport": {
+    "locate": {
+      "reads": [
+        {
+          "target": "http://peer.test:50051",
+          "authority": "peer.test:50051",
+          "secure": false,
+          "has_name": true
+        }
+      ],
+      "refuses": [
+        "ftp://peer.test/x"
+      ]
+    },
+    "dial": {
+      "target": "http://peer.test:50051/pkg.Svc/Call",
+      "emit": {
+        "hex": "706174683a202f706b672e5376632f43616c6c0d0a636f6e74656e742d6c656e6774683a20360d0a0d0a000000000162"
+      },
+      "wire": {
+        "hex": "0000440104000000018386418baca5b1749509b8d800d87f048a62beb32fbbb918bc3a285f8b1d75d0620d263d4c4d65644082497f864d833505b11f40899acac8b24d494f6a7f85640000014f000006000100000001000000000162"
+      },
+      "ingest": {
+        "hex": "000000040000000000000000040100000000000014010400000001880f10106170706c69636174696f6e2f6772706300000700000000000100000000026f6b00000f010500000001000b677270632d7374617475730130"
+      },
+      "frames": [
+        "content-type: application/grpc\r\n",
+        {
+          "hex": "00000000026f6b"
+        },
+        "",
+        ""
+      ],
+      "opening": {
+        "hex": "505249202a20485454502f322e300d0a0d0a534d0d0a0d0a00001804000000000000020000000000040000ffff000500004000000600004000"
+      },
+      "deadline": [
+        "begin",
+        "emit",
+        "ingest"
+      ],
+      "ingest_wire": {
+        "hex": "0000000401000000000000080600000000003b7cdb7a0b8716b4"
+      },
+      "ingest_ends": false
+    },
+    "encode": [
+      {
+        "body": "b",
+        "fields": [
+          [
+            "path",
+            "/pkg.Svc/Call"
+          ]
+        ],
+        "wire": {
+          "hex": "706174683a202f706b672e5376632f43616c6c0d0a636f6e74656e742d6c656e6774683a20360d0a0d0a000000000162"
+        }
+      }
+    ],
+    "refuse": {
+      "begin": {
+        "hex": "0000180400000000000003000000c800040000ffff000500004000000600004000"
+      },
+      "bytes": "no",
+      "wire": "",
+      "refused": true
+    },
+    "detach": "refused",
+    "adopt": "refused"
+  }
+}
