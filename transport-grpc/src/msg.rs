@@ -289,6 +289,49 @@ pub fn encode_message(text: &[u8]) -> String {
     out
 }
 
+// ── one stream's close (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────
+
+/// `text` as a `grpc-message` value in 1.5.5's bytes (tonic 0.14's `Status`, which 1.5.5's gRPC
+/// line answered with): every control byte, every byte past ASCII, and each of `` "#%<>`?{}`` and
+/// the space percent-encoded, upper-case hex; every other byte as it is.
+#[must_use]
+pub fn encode_status_message(text: &[u8]) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &b in text {
+        if (0x21..=0x7e).contains(&b) && !b"\"#%<>`?{}".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A stream's CLOSING STATUS LINES in 1.5.5's bytes and order (tonic 0.14's
+/// `Status::add_header`): `grpc-status`, then `grpc-message` where there is a message, then
+/// `grpc-status-details-bin` where there are details, the value the plane wrote, verbatim.
+///
+/// # Errors
+///
+/// The details are not one field value (a byte outside visible ASCII and the space).
+pub fn status_lines(code: u32, message: &[u8], details: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if !details.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return Err("the status details are not one field value");
+    }
+    let mut out = format!("{GRPC_STATUS}: {code}\r\n").into_bytes();
+    if !message.is_empty() {
+        out.extend_from_slice(
+            format!("grpc-message: {}\r\n", encode_status_message(message)).as_bytes(),
+        );
+    }
+    if !details.is_empty() {
+        out.extend_from_slice(b"grpc-status-details-bin: ");
+        out.extend_from_slice(details);
+        out.extend_from_slice(b"\r\n");
+    }
+    Ok(out)
+}
+
 // ── the head block ───────────────────────────────────────────────────────────────────────────────
 
 /// A head block, read.

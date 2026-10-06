@@ -19,6 +19,11 @@
 //! * `ingest` takes what the far end sent, `timer` is the host's clock reaching a deadline this
 //!   framer asked for, and `finish` drops the connection.
 //!
+//! ONE STREAM (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l): a framing begun on that side frames one call
+//! whose connection and head the host's own framer carries, and its `finish` closes the call with
+//! the final status the unit stated (the close's final tail), rendered here alone
+//! (`crate::stream`).
+//!
 //! What a stream carries each way, and how `grpc-status` reaches the host (the terminal piece's
 //! code, in the `grpc` numbering this door's status rows class), is the framer's module note (`transport.rs`).
 //!
@@ -43,13 +48,14 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
     EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn, ListenOut,
     LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail, WriteIn,
-    CANCEL_NOTHING_MOVED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
+    CANCEL_NOTHING_MOVED, SIDE_ACCEPT, SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
     DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
 };
 
 use crate::msg;
+use crate::stream::StreamCall;
 use crate::transport::{self, Conn, Posture};
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
@@ -75,6 +81,8 @@ const OFFER_H2: &[u8] = b"\x02h2";
 pub struct Instance {
     posture: Posture,
     framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
+    /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
+    streams: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
     next: AtomicU64,
 }
 
@@ -162,6 +170,7 @@ slot!(
                 instance.open(Instance {
                     posture,
                     framings: Mutex::new(HashMap::new()),
+                    streams: Mutex::new(HashMap::new()),
                     next: AtomicU64::new(1),
                 });
                 Outcome::Ready
@@ -270,6 +279,27 @@ slot!(
         let Some(inst) = p.get() else {
             return Outcome::Failed;
         };
+        if i.side == SIDE_ACCEPT_STREAM {
+            let fields = i.fields();
+            let opened = StreamCall::open(
+                fields
+                    .iter()
+                    .map(|f| (f.field(|x| &x.name).bytes(), f.field(|x| &x.value).bytes())),
+                inst.posture.max_message_bytes,
+            );
+            let mut call = match opened {
+                Ok(call) => call,
+                Err(e) => return o.fail(Refusal::refused(e.0)),
+            };
+            let token = inst.next.fetch_add(1, Ordering::Relaxed);
+            o.set(|x| &x.framing, token);
+            fill(&mut call, i.field(|x| &x.sink), &mut o, class_of, fault_of);
+            inst.streams
+                .lock()
+                .expect("streams")
+                .insert(token, Arc::new(Mutex::new(call)));
+            return Outcome::Ready;
+        }
         let agreed = i
             .facts()
             .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
@@ -315,6 +345,10 @@ slot!(
     /// `ingest`.
     Ingest, IngestIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
+        if let Some(call) = one_stream(&p, i.framing) {
+            let end = i.end != 0;
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.ingest(bytes, end));
+        }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| {
             c.ingest(bytes, i.end != 0);
             Ok(())
@@ -327,6 +361,12 @@ slot!(
     Emit, EmitIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
         let (now, deadline, end) = (i.sink.now_monotonic_ns, i.deadline_ns, i.end_of_frame != 0);
+        if let Some(call) = one_stream(&p, i.framing) {
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+                c.emit(bytes, end);
+                Ok(())
+            });
+        }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| {
             c.emit(i.stream, bytes, end, deadline, now)
         })
@@ -343,6 +383,10 @@ slot!(
             return Outcome::Refused;
         }
         let bytes = i.bytes();
+        if let Some(call) = one_stream(&p, i.framing) {
+            let status = i.status;
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status));
+        }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| c.end_call(i.stream, bytes, i.status))
     }
 );
@@ -350,13 +394,40 @@ slot!(
 slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
+        if let Some(call) = one_stream(&p, i.framing) {
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+        }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }
 );
 
 slot!(
-    /// `finish`: the connection is dropped, with every call on it.
+    /// `finish`: the connection is dropped, with every call on it. A one-stream framing's finish
+    /// closes its call with the final status the close states (its final tail), as trailers.
     Finish, FinishIn, FramerOut, |p, i, o| {
+        let call = p
+            .get()
+            .and_then(|inst| inst.streams.lock().expect("streams").remove(&i.framing));
+        if let Some(call) = call {
+            let all = i.final_bytes();
+            let at = |s: busbar_contract::abi::mechanism::call::Span| {
+                let start = s.offset as usize;
+                all.get(start..start.saturating_add(s.len as usize))
+                    .unwrap_or_default()
+            };
+            let (message, details) = (at(i.final_message), at(i.final_details));
+            let status = i.final_status;
+            let answered = on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+                c.finish(status, message, details)
+            });
+            // A close the sink could not take whole stays until the host's re-call drains it.
+            if call.lock().expect("stream").wire_pending() {
+                if let Some(inst) = p.get() {
+                    inst.streams.lock().expect("streams").insert(i.framing, call);
+                }
+            }
+            return answered;
+        }
         let removed = p
             .get()
             .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing));
@@ -409,6 +480,27 @@ slot!(
         Outcome::Ready
     }
 );
+
+/// The one-stream framing `token` names, where it names one.
+fn one_stream(p: &sdk::Instance<'_, Instance>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
+    p.get()
+        .and_then(|inst| inst.streams.lock().expect("streams").get(&token).cloned())
+}
+
+/// Run `f` on a one-stream framing, then fill the sink with what it owes.
+fn on_stream(
+    call: &Mutex<StreamCall>,
+    sink: Lent<'_, FramerSink>,
+    o: &mut Out<'_, FramerOut>,
+    f: impl FnOnce(&mut StreamCall) -> Result<(), transport::Failure>,
+) -> Outcome {
+    let mut c = call.lock().expect("stream");
+    if let Err(e) = f(&mut c) {
+        return o.fail(Refusal::failed(e.0));
+    }
+    fill(&mut *c, sink, o, class_of, fault_of);
+    Outcome::Ready
+}
 
 /// Run `f` on framing `token`, then drive it and fill the sink.
 fn with(
