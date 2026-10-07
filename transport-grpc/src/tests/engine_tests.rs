@@ -575,3 +575,149 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
         );
     }
 }
+
+// ── a stream's lifetime ──────────────────────────────────────────────────────────────────────────
+
+/// The calls an accepted connection still holds.
+fn held(c: &Conn) -> usize {
+    match &c.side {
+        super::Side::Accept(a) => a.calls.len(),
+        super::Side::Dial(d) => d.calls.len(),
+    }
+}
+
+/// A client that opened stream 1, sent its one message and half-closed (END_STREAM on the DATA).
+fn half_closed() -> Conn {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening(Some("trailers"));
+    wire.extend(h2(0, 0x1, 1, &msg::frame(b"q")));
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert!(
+        last(&got, 1).is_some_and(|p| p.end && p.bytes.is_empty() && !p.failed),
+        "the far end's last: {got:?}"
+    );
+    a
+}
+
+/// The client cancels stream 1 (RST_STREAM CANCEL); what the accepted side hands up.
+fn cancel(a: &mut Conn) -> Vec<Piece> {
+    drop(a.take_wire(usize::MAX));
+    a.ingest(&h2(3, 0, 1, &8u32.to_be_bytes()), false);
+    a.drive(5 * SEC);
+    a.pieces().drain(..).collect()
+}
+
+/// A CLIENT'S CANCEL AFTER ITS HALF-CLOSE IS TOLD TO THE HOST. The client sent its last message,
+/// the host is streaming the answer, and the client resets the call: the host hears it as the
+/// stream failing `CANCELLED`, the call is let go of, and an answer emitted after it queues
+/// nothing. RED before the fix: the reset was seen only while the call's body was still read, so
+/// nothing reached the host, the call stayed held, and every later message was queued for a
+/// stream nobody reads.
+#[test]
+fn a_cancel_after_the_half_close_fails_the_stream_cancelled() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    a.emit(1, &msg::frame(b"one"), false, 0, 5 * SEC)
+        .expect("a message");
+    a.drive(5 * SEC);
+    let got = cancel(&mut a);
+    let t = terminal(&got, 1).expect("the host hears the cancel");
+    assert!(t.failed, "the stream failed: {t:?}");
+    assert_eq!(t.status, Some(msg::CANCELLED));
+    assert_eq!(held(&a), 0, "the call is let go of");
+    assert!(
+        a.emit(1, &msg::frame(b"two"), false, 0, 5 * SEC).is_err(),
+        "nothing more is taken for the cancelled call"
+    );
+    assert!(a.pieces().is_empty(), "one terminal piece, once");
+}
+
+/// The same cancel, before the host stated the answer's head: the connection drops the call's
+/// pending answer, and the host hears `CANCELLED` all the same.
+#[test]
+fn a_cancel_before_the_answer_fails_the_stream_cancelled() {
+    let mut a = half_closed();
+    let got = cancel(&mut a);
+    let t = terminal(&got, 1).expect("the host hears the cancel");
+    assert!(t.failed);
+    assert_eq!(t.status, Some(msg::CANCELLED));
+    assert_eq!(held(&a), 0);
+}
+
+/// A call answered in full is not a cancel: its body is let go of only after its end.
+#[test]
+fn an_answered_call_is_never_reported_cancelled() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    a.emit(1, &msg::frame(b"one"), false, 0, 5 * SEC)
+        .expect("a message");
+    a.end_call(1, b"grpc-status: 0\r\n", 0).expect("end");
+    a.drive(5 * SEC);
+    drop(a.take_wire(usize::MAX));
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert!(
+        got.iter().all(|p| !p.failed),
+        "no failure for an answered call: {got:?}"
+    );
+    assert_eq!(held(&a), 0);
+}
+
+/// A LATE EMIT ON A DIALLED STREAM THAT ENDED IS DROPPED. The far end answers a client-streaming
+/// call early (trailers-only, before the upload is done); the host's next message and its end
+/// arrive after the stream's terminal piece. They open nothing: no second terminal piece, no
+/// held call, and no deadline firing later on a stream the host already saw end. RED before the
+/// fix: the late bytes opened a fresh call whose head they were read as, and failed it INTERNAL
+/// (or let its deadline fail it), a second terminal piece on a closed stream.
+#[test]
+fn a_late_emit_on_an_ended_dialled_stream_opens_nothing() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Upload")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"part one"));
+    p.d.emit(1, &c, false, 0, p.now).expect("emit");
+    p.settle();
+    p.a.end_call(1, b"grpc-status: 7\r\ngrpc-message: no\r\n", 0)
+        .expect("refuse early");
+    p.settle();
+    let before = of(&p.got_d, 1).len();
+    assert_eq!(
+        terminal(&p.got_d, 1).and_then(|t| t.status),
+        Some(7),
+        "the early answer"
+    );
+    assert_eq!(held(&p.d), 0, "the stream ended");
+
+    p.d.emit(1, &msg::frame(b"part two"), false, 0, p.now)
+        .expect("a late message is taken and dropped");
+    p.d.emit(1, b"", true, 0, p.now).expect("a late end too");
+    p.settle();
+    let t = p.now;
+    p.at(t + 301 * SEC);
+    assert_eq!(
+        of(&p.got_d, 1).len(),
+        before,
+        "nothing more on the ended stream: {:?}",
+        of(&p.got_d, 1)
+    );
+    assert_eq!(held(&p.d), 0, "no call was opened");
+}
+
+/// Ended ids are kept as runs, and every id is judged exactly.
+#[test]
+fn ended_streams_are_remembered_as_runs() {
+    let mut e = super::Ended::default();
+    for id in [1, 2, 3, 5, 4, 9] {
+        e.insert(id);
+    }
+    assert_eq!(e.0.len(), 2, "1..=5 and 9: {:?}", e.0);
+    for id in [1, 3, 5, 9] {
+        assert!(e.contains(id), "{id}");
+    }
+    for id in [0, 6, 8, 10] {
+        assert!(!e.contains(id), "{id}");
+    }
+    e.insert(u64::MAX);
+    assert!(e.contains(u64::MAX) && !e.contains(u64::MAX - 1));
+}
