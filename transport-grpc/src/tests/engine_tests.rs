@@ -510,3 +510,61 @@ fn a_missing_te_is_served() {
     let got: Vec<Piece> = a.pieces().drain(..).collect();
     assert_eq!(field(&head(&got, 1).bytes, "te"), None);
 }
+
+/// AN ANSWER THAT IS NOT gRPC IS STILL AN ANSWER. A member that answers a call with a bare HTTP
+/// status (no `grpc-status`, as a proxy or an auth wall in front of the service does) has
+/// answered: its status reaches the host as the gRPC status that HTTP status stands for
+/// (`http-grpc-status-mapping.md`: 401 -> UNAUTHENTICATED, 403 -> PERMISSION_DENIED, 503 ->
+/// UNAVAILABLE), on a head and its status block, exactly as a trailers-only answer arrives. It is
+/// never a failed stream with nothing read, which the host would take for no answer at all and
+/// fail over as transient. 1.5.5's breaker read an HTTP 401 or 403 as `Auth`, which is `HardDown`
+/// (v1.5.5 `crates/busbar/src/breaker.rs`, its step 2 and its `Auth | Billing => HardDown`
+/// arm), and this framer's fault table reads UNAUTHENTICATED and PERMISSION_DENIED as hard.
+/// RED on a framer that fails the stream on a non-200 HTTP status.
+#[test]
+fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
+    for (http, grpc) in [
+        (401u16, msg::UNAUTHENTICATED),
+        (403, msg::PERMISSION_DENIED),
+        (503, msg::UNAVAILABLE),
+    ] {
+        let now = 5 * SEC;
+        let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+        d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, now)
+            .expect("emit");
+        let mut got: Vec<Piece> = Vec::new();
+        let turn = |d: &mut Conn, got: &mut Vec<Piece>| {
+            for _ in 0..20 {
+                d.drive(now);
+                let _ = d.take_wire(usize::MAX);
+                got.extend(d.pieces().drain(..));
+            }
+        };
+        // The far end, by hand: its SETTINGS and the ACK of ours once the call is on the wire,
+        // then one HEADERS frame ending the stream with `:status` alone (HPACK literal without
+        // indexing, the name `:status` at static index 8).
+        turn(&mut d, &mut got);
+        let mut wire = h2(4, 0, 0, &[]);
+        wire.extend(h2(4, 1, 0, &[]));
+        d.ingest(&wire, false);
+        turn(&mut d, &mut got);
+        let code = http.to_string();
+        let mut block = vec![0x08, 3];
+        block.extend_from_slice(code.as_bytes());
+        d.ingest(&h2(1, 0x05, 1, &block), false);
+        turn(&mut d, &mut got);
+        head(&got, 1);
+        let t = terminal(&got, 1).expect("the answer's status");
+        assert_eq!(
+            (t.status, t.fields),
+            (Some(grpc), true),
+            "HTTP {http}: {got:?}"
+        );
+        let end = last(&got, 1).expect("terminal");
+        assert_eq!(
+            (end.failed, end.bytes.as_ref()),
+            (true, format!("HTTP status {http}").as_bytes()),
+            "HTTP {http}"
+        );
+    }
+}
