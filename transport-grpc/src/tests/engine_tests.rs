@@ -523,10 +523,16 @@ fn a_missing_te_is_served() {
 /// RED on a framer that fails the stream on a non-200 HTTP status.
 #[test]
 fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
-    for (http, grpc) in [
-        (401u16, msg::UNAUTHENTICATED),
-        (403, msg::PERMISSION_DENIED),
-        (503, msg::UNAVAILABLE),
+    use busbar_contract::abi::transport::{FAULT_CALLER, FAULT_HARD, FAULT_TRANSIENT};
+    // The fault reading is the HTTP status's own, by 1.5.5's bands (BUSBAR ruling (b), 2026-10-07):
+    // a bare 400 is INTERNAL to the caller but the caller's fault to the breaker, as 1.5.5 read it.
+    for (http, grpc, fault) in [
+        (401u16, msg::UNAUTHENTICATED, FAULT_HARD),
+        (403, msg::PERMISSION_DENIED, FAULT_HARD),
+        (503, msg::UNAVAILABLE, FAULT_TRANSIENT),
+        (400, msg::INTERNAL, FAULT_CALLER),
+        (409, msg::UNKNOWN, FAULT_CALLER),
+        (500, msg::UNKNOWN, FAULT_TRANSIENT),
     ] {
         let now = 5 * SEC;
         let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
@@ -560,6 +566,7 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
             (Some(grpc), true),
             "HTTP {http}: {got:?}"
         );
+        assert_eq!(t.fault, Some(fault), "HTTP {http}: the HTTP band's reading");
         let end = last(&got, 1).expect("terminal");
         assert_eq!(
             (end.failed, end.bytes.as_ref()),
