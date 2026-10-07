@@ -24,7 +24,7 @@
 //!
 //! ACCEPTED. Each call the far end opens is a stream: its head (a field block, with the call's
 //! method, target and authority in the stream's head slots, never as fields), one frame per
-//! message, and the empty piece when the far end has sent its last. `te` is checked as 1.5.5's
+//! message, and the end piece (`PIECE_END`) when the far end has sent its last. `te` is checked as 1.5.5's
 //! server checked it, by HTTP/2 itself: a `te` other than `trailers` resets the stream with
 //! `PROTOCOL_ERROR` before it is a call, and a missing one is served; it is then dropped as
 //! hop-by-hop. The host answers on the same stream: `emit` a head block (the answer's metadata) and
@@ -710,7 +710,7 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
         ..Piece::fields(id, Bytes::from(field_block(fields, STATUS_FIELDS)))
     };
     if code == msg::OK {
-        return [block, Piece::data(id, Bytes::new())];
+        return [block, Piece::end(id)];
     }
     let text = status
         .get(msg::GRPC_MESSAGE)
@@ -940,8 +940,8 @@ impl Accept {
                         let whole = msgs.end();
                         s.body = None;
                         match whole {
-                            // The far end sent its last: the empty piece.
-                            Ok(()) => out.push_back(Piece::data(*id, Bytes::new())),
+                            // The far end sent its last: the stream's end (`PIECE_END`).
+                            Ok(()) => out.push_back(Piece::end(*id)),
                             Err(e) => {
                                 let why = e.to_string();
                                 s.fail_reply(msg::INTERNAL, why.as_bytes());

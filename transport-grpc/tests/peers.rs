@@ -273,10 +273,7 @@ fn accept(
 }
 
 fn last_in(stream: u64) -> impl Fn(&[Got]) -> bool {
-    move |got| {
-        got.iter()
-            .any(|g| g.stream == stream && g.bytes.is_empty() && !g.coded() && !g.fields())
-    }
+    move |got| got.iter().any(|g| g.stream == stream && g.end())
 }
 
 #[test]
