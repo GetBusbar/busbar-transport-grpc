@@ -117,6 +117,30 @@ pub(crate) fn fault_of(code: u16) -> u8 {
         .map_or(FAULT_NONE, |r| r.fault as u8)
 }
 
+/// How the breaker reads a BARE HTTP ANSWER (a far end, or a proxy or auth wall in front of it,
+/// answering a call with an HTTP status and no `grpc-status`), by that HTTP status: 1.5.5's bands
+/// (`v1.5.5 crates/busbar/src/breaker.rs` step 2: 401/403 `Auth` -> `HardDown`; 408, 429, 529 and
+/// 5xx transient; every other status the caller's). The call's own status is the gRPC status the
+/// HTTP one stands for (`msg::status_of_http`); its fault is read here, by the wire it came on, so a
+/// bare 400 that the mapping calls INTERNAL records nothing, as 1.5.5 recorded nothing. Data, walked
+/// once: the first row that holds the status reads it.
+const HTTP_FAULTS: &[(u16, u16, u8)] = &[
+    (401, 401, FAULT_HARD),
+    (403, 403, FAULT_HARD),
+    (408, 408, FAULT_TRANSIENT),
+    (429, 429, FAULT_TRANSIENT),
+    (500, 599, FAULT_TRANSIENT),
+];
+
+/// The breaker's reading of a bare HTTP answer's `status` ([`HTTP_FAULTS`]; off the table, the
+/// caller's).
+pub(crate) fn fault_of_http(status: u16) -> u8 {
+    HTTP_FAULTS
+        .iter()
+        .find(|(lo, hi, _)| (*lo..=*hi).contains(&status))
+        .map_or(FAULT_CALLER, |(_, _, f)| *f)
+}
+
 pub(crate) const SETTINGS: &[SettingDecl] = &[
     SettingDecl {
         path: abi_str(setting::REQUEST_TIMEOUT_SECS),

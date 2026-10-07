@@ -660,7 +660,14 @@ fn advance(
                             HeaderValue::from_str(&format!("HTTP status {code}"))
                                 .expect("digits and spaces are a field value"),
                         );
-                        out.extend(trailers(id, &HeaderMap::new(), &status));
+                        // Its fault is the HTTP status's own reading (1.5.5's bands), not the
+                        // mapped code's: a bare 400 maps to INTERNAL but is the caller's.
+                        let [block, text] = trailers(id, &HeaderMap::new(), &status);
+                        out.push_back(Piece {
+                            fault: Some(crate::meta::fault_of_http(code)),
+                            ..block
+                        });
+                        out.push_back(text);
                         s.stage = DStage::Done;
                         return Ok(());
                     }
