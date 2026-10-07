@@ -94,3 +94,25 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     assert!(read_settings(b"not json").is_err());
     assert!(read_settings(br#"{"limits.upstream_request_timeout_secs":"5"}"#).is_err());
 }
+
+/// A BARE HTTP ANSWER'S FAULT IS READ BY ITS HTTP BAND, 1.5.5's (`v1.5.5 crates/busbar/src/breaker.rs`
+/// step 2, `Auth | Billing => HardDown`, the transient classes, the rest the caller's), over every
+/// status a far end can answer. The expected reading below is 1.5.5's if-chain, written out as it
+/// reads there, not this framer's table: the two must agree on all 500 codes.
+#[test]
+fn a_bare_http_answers_fault_is_its_status_read_by_the_1_5_5_bands() {
+    use crate::meta::fault_of_http;
+    use busbar_contract::abi::transport::{FAULT_CALLER, FAULT_HARD, FAULT_TRANSIENT};
+    let v155 = |s: u16| {
+        if s == 401 || s == 403 {
+            FAULT_HARD // Auth
+        } else if s == 429 || s == 408 || s == 529 || (500..600).contains(&s) {
+            FAULT_TRANSIENT // RateLimit, Timeout, Overloaded, ServerError
+        } else {
+            FAULT_CALLER // ClientError, and any other status reaching the error path
+        }
+    };
+    for s in 100..=599u16 {
+        assert_eq!(fault_of_http(s), v155(s), "HTTP {s}");
+    }
+}
