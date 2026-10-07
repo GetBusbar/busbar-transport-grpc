@@ -639,12 +639,30 @@ fn advance(
                 Poll::Ready(r) => {
                     let r = r.map_err(|e| (e.to_string(), msg::UNAVAILABLE, false))?;
                     if r.status() != StatusCode::OK {
+                        // A BARE HTTP STATUS IS AN ANSWER: a member (or a proxy or auth wall in
+                        // front of it) answered the call without gRPC. Its status is the gRPC
+                        // status that HTTP status stands for (`http-grpc-status-mapping.md`),
+                        // handed up as a trailers-only answer is: the head, then the status
+                        // block and its text. A failed stream would read as no answer at all,
+                        // and a member refusing its credential would never trip hard.
                         let code = r.status().as_u16();
-                        return Err((
-                            format!("HTTP status {code}"),
-                            msg::status_of_http(code),
-                            false,
+                        out.push_back(Piece::fields(
+                            id,
+                            Bytes::from(field_block(r.headers(), STATUS_FIELDS)),
                         ));
+                        let mut status = HeaderMap::new();
+                        status.insert(
+                            msg::GRPC_STATUS,
+                            HeaderValue::from(msg::status_of_http(code)),
+                        );
+                        status.insert(
+                            msg::GRPC_MESSAGE,
+                            HeaderValue::from_str(&format!("HTTP status {code}"))
+                                .expect("digits and spaces are a field value"),
+                        );
+                        out.extend(trailers(id, &HeaderMap::new(), &status));
+                        s.stage = DStage::Done;
+                        return Ok(());
                     }
                     let ct = r.headers().get(http::header::CONTENT_TYPE);
                     if !ct.is_some_and(|v| msg::is_grpc_content_type(v.as_bytes())) {
