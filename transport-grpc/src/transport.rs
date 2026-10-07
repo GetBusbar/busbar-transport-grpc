@@ -31,6 +31,11 @@
 //! messages; `refuse` with the trailer block (`grpc-status`, `grpc-message`, ...) ends the call —
 //! trailers-only when nothing was emitted first. A call that is not gRPC is answered `415` here and
 //! never reaches the host.
+//!
+//! A STREAM ENDS ONCE. A far end that resets an accepted call (before or after its last message,
+//! before or after the host's answer began) fails the stream `CANCELLED`, and nothing more is
+//! queued for it. A dialled stream that ended is remembered: an `emit` that arrives after its
+//! terminal piece is dropped, never a second call on the same stream.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -80,6 +85,9 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 struct ChanState {
     frames: VecDeque<Frame<Bytes>>,
     ended: bool,
+    /// The connection let go of the body before its end: the far end reset the stream. Nothing is
+    /// queued for it again.
+    gone: bool,
     waker: Option<Waker>,
 }
 
@@ -90,7 +98,7 @@ struct Chan(Arc<Mutex<ChanState>>);
 impl Chan {
     fn push(&self, f: Frame<Bytes>) {
         let mut s = self.0.lock().expect("chan");
-        if s.ended {
+        if s.ended || s.gone {
             return;
         }
         s.frames.push_back(f);
@@ -107,6 +115,18 @@ impl Chan {
     }
     fn ended(&self) -> bool {
         self.0.lock().expect("chan").ended
+    }
+    /// The body was let go of before its end (see [`ChanState::gone`]).
+    fn gone(&self) -> bool {
+        self.0.lock().expect("chan").gone
+    }
+    /// Nobody will read this body again: drop what is queued and take no more.
+    fn let_go(&self) {
+        let mut s = self.0.lock().expect("chan");
+        if !(s.ended && s.frames.is_empty()) {
+            s.gone = true;
+            s.frames.clear();
+        }
     }
     fn body(&self) -> ChanBody {
         ChanBody(self.clone())
@@ -136,6 +156,14 @@ impl Body for ChanBody {
     fn is_end_stream(&self) -> bool {
         let s = self.0 .0.lock().expect("chan");
         s.ended && s.frames.is_empty()
+    }
+}
+
+impl Drop for ChanBody {
+    /// The connection drops a body it read to its end, or one whose stream the far end reset; the
+    /// second is the one the host has to hear about.
+    fn drop(&mut self) {
+        self.0.let_go();
     }
 }
 
@@ -236,6 +264,7 @@ impl Conn {
                 sender: None,
                 base,
                 calls: Vec::new(),
+                ended: Ended::default(),
             }),
         })
     }
@@ -256,7 +285,10 @@ impl Conn {
                 let id = a.next;
                 a.new.push_back((id, req, reply.clone()));
             }
-            ReplyFut(reply)
+            ReplyFut {
+                reply,
+                answered: false,
+            }
         });
         let mut b = server::Builder::new(io.exec());
         b.timer(io.timer()).adaptive_window(posture.adaptive_window);
@@ -300,6 +332,11 @@ impl Conn {
         let max = self.posture.max_message_bytes.saturating_add(64 * 1024);
         match &mut self.side {
             Side::Dial(d) => {
+                if d.ended.contains(stream) {
+                    // LATE: the stream already ended (an early answer, a failure, its deadline).
+                    // Its terminal piece is out; these bytes have nowhere to go.
+                    return Ok(());
+                }
                 let timer = self.io.timer();
                 let fallback = now_ns.saturating_add(
                     u64::try_from(self.posture.timeout.as_nanos()).unwrap_or(u64::MAX),
@@ -326,7 +363,7 @@ impl Conn {
                         ..Piece::failure(stream, &why)
                     });
                 }
-                d.calls.retain(|(_, s)| !s.over());
+                d.sweep();
                 Ok(())
             }
             Side::Accept(a) => {
@@ -444,6 +481,61 @@ struct Dial {
     sender: Option<client::SendRequest<ChanBody>>,
     base: String,
     calls: Vec<(u64, DialStream)>,
+    /// Streams that have ended (their terminal piece is out). An `emit` on one is late and is
+    /// dropped: it never opens a second call under the same stream.
+    ended: Ended,
+}
+
+/// A set of stream ids kept as runs: `start -> end` (inclusive) for each run of consecutive ids. A
+/// host that numbers a connection's streams in order (the connector's lines do) leaves one run, so
+/// remembering every ended stream costs nothing per call.
+#[derive(Default)]
+struct Ended(std::collections::BTreeMap<u64, u64>);
+
+impl Ended {
+    fn contains(&self, id: u64) -> bool {
+        self.0
+            .range(..=id)
+            .next_back()
+            .is_some_and(|(_, &end)| id <= end)
+    }
+
+    fn insert(&mut self, id: u64) {
+        if self.contains(id) {
+            return;
+        }
+        let before = self
+            .0
+            .range(..id)
+            .next_back()
+            .filter(|(_, &end)| end.checked_add(1) == Some(id))
+            .map(|(&start, _)| start);
+        let after = id
+            .checked_add(1)
+            .and_then(|next| self.0.get(&next).copied().map(|end| (next, end)));
+        let start = before.unwrap_or(id);
+        let end = match after {
+            Some((next, end)) => {
+                self.0.remove(&next);
+                end
+            }
+            None => id,
+        };
+        self.0.insert(start, end);
+    }
+}
+
+impl Dial {
+    /// Drop the streams that are over, remembering each one's id.
+    fn sweep(&mut self) {
+        let ended = &mut self.ended;
+        self.calls.retain(|(id, s)| {
+            if s.over() {
+                ended.insert(*id);
+            }
+            !s.over()
+        });
+    }
 }
 
 enum DStage {
@@ -599,7 +691,7 @@ impl Dial {
                 });
             }
         }
-        self.calls.retain(|(_, s)| !s.over());
+        self.sweep();
         Ok(())
     }
 }
@@ -783,20 +875,36 @@ impl Reply {
 }
 
 /// The service's answer: ready once the host has stated the head.
-struct ReplyFut(Reply);
+struct ReplyFut {
+    reply: Reply,
+    /// The head went out, and the body with it: from here the body says when it is let go of.
+    answered: bool,
+}
 
 impl Future for ReplyFut {
     type Output = Result<Response<ChanBody>, Infallible>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut s = self.0.state.lock().expect("reply");
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut s = self.reply.state.lock().expect("reply");
         let Some((status, fields)) = s.head.take() else {
             s.waker = Some(cx.waker().clone());
             return Poll::Pending;
         };
-        let mut r = Response::new(self.0.chan.body());
+        drop(s);
+        let mut r = Response::new(self.reply.chan.body());
         *r.status_mut() = status;
         *r.headers_mut() = fields;
+        self.answered = true;
         Poll::Ready(Ok(r))
+    }
+}
+
+impl Drop for ReplyFut {
+    /// Dropped before the head went out: the far end reset the call while the host was still
+    /// working on it.
+    fn drop(&mut self) {
+        if !self.answered {
+            self.reply.chan.let_go();
+        }
     }
 }
 
@@ -928,6 +1036,20 @@ impl Accept {
             ));
         }
         for (id, s) in &mut self.calls {
+            if !s.reply_over && s.reply.chan.gone() {
+                // THE FAR END CANCELLED THE CALL: it reset the stream, and the connection let go
+                // of the answer. Before the far end's last message its body says so too; after it
+                // (a call the far end half-closed, then cancelled) this is the only sign, and the
+                // host must hear it or it keeps answering into a stream nobody reads.
+                s.body = None;
+                s.reply_over = true;
+                s.reply.chan.end();
+                out.push_back(Piece {
+                    status: Some(msg::CANCELLED),
+                    ..Piece::failure(*id, "the far end cancelled the call")
+                });
+                continue;
+            }
             if !s.reply_over {
                 if let Some(sl) = s.sleep.as_mut() {
                     if sl.as_mut().poll(cx).is_ready() {
