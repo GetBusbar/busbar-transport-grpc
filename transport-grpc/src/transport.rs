@@ -24,7 +24,7 @@
 //!
 //! ACCEPTED. Each call the far end opens is a stream: its head (a field block, with the call's
 //! method, target and authority in the stream's head slots, never as fields), one frame per
-//! message, and the empty piece when the far end has sent its last. `te` is checked as 1.5.5's
+//! message, and the end piece (`PIECE_END`) when the far end has sent its last. `te` is checked as 1.5.5's
 //! server checked it, by HTTP/2 itself: a `te` other than `trailers` resets the stream with
 //! `PROTOCOL_ERROR` before it is a call, and a missing one is served; it is then dropped as
 //! hop-by-hop. The host answers on the same stream: `emit` a head block (the answer's metadata) and
@@ -639,12 +639,37 @@ fn advance(
                 Poll::Ready(r) => {
                     let r = r.map_err(|e| (e.to_string(), msg::UNAVAILABLE, false))?;
                     if r.status() != StatusCode::OK {
+                        // A BARE HTTP STATUS IS AN ANSWER: a member (or a proxy or auth wall in
+                        // front of it) answered the call without gRPC. Its status is the gRPC
+                        // status that HTTP status stands for (`http-grpc-status-mapping.md`),
+                        // handed up as a trailers-only answer is: the head, then the status
+                        // block and its text. A failed stream would read as no answer at all,
+                        // and a member refusing its credential would never trip hard.
                         let code = r.status().as_u16();
-                        return Err((
-                            format!("HTTP status {code}"),
-                            msg::status_of_http(code),
-                            false,
+                        out.push_back(Piece::fields(
+                            id,
+                            Bytes::from(field_block(r.headers(), STATUS_FIELDS)),
                         ));
+                        let mut status = HeaderMap::new();
+                        status.insert(
+                            msg::GRPC_STATUS,
+                            HeaderValue::from(msg::status_of_http(code)),
+                        );
+                        status.insert(
+                            msg::GRPC_MESSAGE,
+                            HeaderValue::from_str(&format!("HTTP status {code}"))
+                                .expect("digits and spaces are a field value"),
+                        );
+                        // Its fault is the HTTP status's own reading (1.5.5's bands), not the
+                        // mapped code's: a bare 400 maps to INTERNAL but is the caller's.
+                        let [block, text] = trailers(id, &HeaderMap::new(), &status);
+                        out.push_back(Piece {
+                            fault: Some(crate::meta::fault_of_http(code)),
+                            ..block
+                        });
+                        out.push_back(text);
+                        s.stage = DStage::Done;
+                        return Ok(());
                     }
                     let ct = r.headers().get(http::header::CONTENT_TYPE);
                     if !ct.is_some_and(|v| msg::is_grpc_content_type(v.as_bytes())) {
@@ -710,7 +735,7 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
         ..Piece::fields(id, Bytes::from(field_block(fields, STATUS_FIELDS)))
     };
     if code == msg::OK {
-        return [block, Piece::data(id, Bytes::new())];
+        return [block, Piece::end(id)];
     }
     let text = status
         .get(msg::GRPC_MESSAGE)
@@ -940,8 +965,8 @@ impl Accept {
                         let whole = msgs.end();
                         s.body = None;
                         match whole {
-                            // The far end sent its last: the empty piece.
-                            Ok(()) => out.push_back(Piece::data(*id, Bytes::new())),
+                            // The far end sent its last: the stream's end (`PIECE_END`).
+                            Ok(()) => out.push_back(Piece::end(*id)),
                             Err(e) => {
                                 let why = e.to_string();
                                 s.fail_reply(msg::INTERNAL, why.as_bytes());

@@ -82,7 +82,7 @@ pub struct Instance {
     posture: Posture,
     framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
-    streams: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
+    calls: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
     next: AtomicU64,
 }
 
@@ -170,7 +170,7 @@ slot!(
                 instance.open(Instance {
                     posture,
                     framings: Mutex::new(HashMap::new()),
-                    streams: Mutex::new(HashMap::new()),
+                    calls: Mutex::new(HashMap::new()),
                     next: AtomicU64::new(1),
                 });
                 Outcome::Ready
@@ -294,9 +294,9 @@ slot!(
             let token = inst.next.fetch_add(1, Ordering::Relaxed);
             o.set(|x| &x.framing, token);
             fill(&mut call, i.field(|x| &x.sink), &mut o, class_of, fault_of);
-            inst.streams
+            inst.calls
                 .lock()
-                .expect("streams")
+                .expect("calls")
                 .insert(token, Arc::new(Mutex::new(call)));
             return Outcome::Ready;
         }
@@ -407,7 +407,7 @@ slot!(
     Finish, FinishIn, FramerOut, |p, i, o| {
         let call = p
             .get()
-            .and_then(|inst| inst.streams.lock().expect("streams").remove(&i.framing));
+            .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing));
         if let Some(call) = call {
             let all = i.final_bytes();
             let at = |s: busbar_contract::abi::mechanism::call::Span| {
@@ -423,7 +423,7 @@ slot!(
             // A close the sink could not take whole stays until the host's re-call drains it.
             if call.lock().expect("stream").wire_pending() {
                 if let Some(inst) = p.get() {
-                    inst.streams.lock().expect("streams").insert(i.framing, call);
+                    inst.calls.lock().expect("calls").insert(i.framing, call);
                 }
             }
             return answered;
@@ -484,7 +484,7 @@ slot!(
 /// The one-stream framing `token` names, where it names one.
 fn one_stream(p: &sdk::Instance<'_, Instance>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
     p.get()
-        .and_then(|inst| inst.streams.lock().expect("streams").get(&token).cloned())
+        .and_then(|inst| inst.calls.lock().expect("calls").get(&token).cloned())
 }
 
 /// Run `f` on a one-stream framing, then fill the sink with what it owes.

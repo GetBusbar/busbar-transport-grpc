@@ -36,7 +36,7 @@ use busbar_contract::abi::transport::check::{
 };
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FinishIn, FramePiece, FrameSpan, FramerOut,
-    FramerSink, FramingIn, HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn,
+    FramerSink, FramingIn, HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn, PIECE_END,
     PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, SIDE_ACCEPT_STREAM,
     YIELD_HAS_DEADLINE, YIELD_MORE,
 };
@@ -179,6 +179,10 @@ impl Got {
     /// A field block: the head, or the trailers.
     pub fn fields(&self) -> bool {
         self.flags & PIECE_FIELDS != 0
+    }
+    /// The stream's end (`PIECE_END`): no piece of it follows.
+    pub fn end(&self) -> bool {
+        self.flags & PIECE_END != 0
     }
 }
 
