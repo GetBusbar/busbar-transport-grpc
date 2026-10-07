@@ -17,9 +17,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # THE LOGIC, same repo: its `door::door` is the door this image exports.
 busbar-transport-grpc = { path = "../transport-grpc" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7008c5fc6fecaea49b4e4170268c1c4bed395c25" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "c52ba30d15317b9f00e53a06ccccfea9495fb5ed" }
 
 [dev-dependencies]
 # The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
 # dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "7008c5fc6fecaea49b4e4170268c1c4bed395c25" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "c52ba30d15317b9f00e53a06ccccfea9495fb5ed" }
