@@ -17,7 +17,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-// THE KIND'S SKELETON (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
+// THE KIND'S SHAPE (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
 // (`claims`), the entry (`transport`: the sans-IO gRPC framer), and the door that states them.
 mod claims;
 pub mod door;
