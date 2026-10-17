@@ -896,7 +896,7 @@ fn advance(
                     Ok(d) => {
                         let got = msgs
                             .push(&d)
-                            .map_err(|e| (e.to_string(), msg::INTERNAL, false))?;
+                            .map_err(|e| (e.to_string(), e.status(), false))?;
                         out.extend(got.into_iter().map(|m| Piece::data(id, m)));
                     }
                     Err(other) => {
@@ -1181,11 +1181,11 @@ impl Accept {
                             match msgs.push(&d) {
                                 Ok(got) => out.extend(got.into_iter().map(|m| Piece::data(*id, m))),
                                 Err(e) => {
-                                    let why = e.to_string();
+                                    let (why, code) = (e.to_string(), e.status());
                                     s.body = None;
-                                    s.fail_reply(msg::INTERNAL, why.as_bytes());
+                                    s.fail_reply(code, why.as_bytes());
                                     out.push_back(Piece {
-                                        status: Some(msg::INTERNAL),
+                                        status: Some(code),
                                         ..Piece::failure(*id, &why)
                                     });
                                 }
