@@ -275,24 +275,11 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `text` as a `grpc-message` value: every byte outside printable ASCII, and `%`, percent-encoded.
-#[must_use]
-pub fn encode_message(text: &[u8]) -> String {
-    let mut out = String::with_capacity(text.len());
-    for &b in text {
-        if (0x20..=0x7e).contains(&b) && b != b'%' {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 // ── one stream's close (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────
 
 /// `text` as a `grpc-message` value in 1.5.5's bytes (tonic 0.14's `Status`, which 1.5.5's gRPC
-/// line answered with): every control byte, every byte past ASCII, and each of `` "#%<>`?{}`` and
+/// line answered with), for every `grpc-message` this door writes, on either accept side (spec
+/// ruling 2026-09-30: a refusal's trailers byte-equal to predev): every control byte, every byte past ASCII, and each of `` "#%<>`?{}`` and
 /// the space percent-encoded, upper-case hex; every other byte as it is.
 #[must_use]
 pub fn encode_status_message(text: &[u8]) -> String {

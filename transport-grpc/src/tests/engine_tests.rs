@@ -775,6 +775,55 @@ fn an_answer_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
     assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
 }
 
+/// A FULL STREAM IS SAID, AND SO IS ITS DRAIN. The host emits an answer the far end grants no room
+/// for, until an emit leaves the queue at its high-water mark: that emit is answered full
+/// (`YIELD_STREAM_FULL`, which the door sets from [`Conn::announce_full`]), and nothing fails. Once
+/// the far end opens its windows and the queue drains to its low-water mark, the stream hands one
+/// writable piece (`PIECE_WRITABLE`), and only then.
+#[test]
+fn a_full_answer_is_announced_and_its_drain_hands_one_writable_piece() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    let m = msg::frame(&[7u8; 60_000]);
+    let mut got = Vec::new();
+    let mut full = false;
+    for _ in 0..40 {
+        a.emit(1, &m, false, 0, 5 * SEC).expect("a message");
+        a.drive(5 * SEC);
+        drop(a.take_wire(usize::MAX));
+        got.extend(a.pieces().drain(..));
+        if a.announce_full(1) {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "the queue reached its high-water mark");
+    assert!(
+        queued_answer(&a, 1) >= super::STREAM_HIGH_WATER,
+        "full means at the mark"
+    );
+    assert!(
+        got.iter().all(|p| !p.writable && !p.failed),
+        "no writable piece and no failure before the drain: {got:?}"
+    );
+    // The far end opens the connection's window and the stream's.
+    let room = (1u32 << 30).to_be_bytes();
+    let mut wire = h2(8, 0, 0, &room);
+    wire.extend(h2(8, 0, 1, &room));
+    a.ingest(&wire, false);
+    for _ in 0..100 {
+        a.drive(5 * SEC);
+        drop(a.take_wire(usize::MAX));
+        got.extend(a.pieces().drain(..));
+    }
+    assert!(queued_answer(&a, 1) <= super::STREAM_LOW_WATER, "drained");
+    let writable: Vec<_> = got.iter().filter(|p| p.writable).collect();
+    assert_eq!(writable.len(), 1, "one writable piece: {got:?}");
+    assert_eq!(writable[0].stream, 1);
+    assert!(writable[0].bytes.is_empty());
+    assert!(!a.announce_full(1), "no longer full");
+}
+
 /// The request bytes a dialled call still queues for the far end, framer-side.
 fn queued_request(c: &Conn, stream: u64) -> usize {
     let super::Side::Dial(d) = &c.side else {
