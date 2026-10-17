@@ -60,10 +60,22 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 pub enum Bad {
     /// A message is compressed, and no compression was agreed.
     Compressed,
-    /// A message is larger than the ceiling.
-    TooLarge(usize),
+    /// A message is larger than the ceiling: its stated length, and the ceiling.
+    TooLarge(usize, usize),
     /// The stream ended inside a message.
     Truncated,
+}
+
+impl Bad {
+    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message, as
+    /// predev's gRPC line answered it (ARCHITECT ruling: byte-equal to predev); `INTERNAL` else.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::TooLarge(..) => OUT_OF_RANGE,
+            Self::Compressed | Self::Truncated => INTERNAL,
+        }
+    }
 }
 
 impl std::fmt::Display for Bad {
@@ -72,7 +84,12 @@ impl std::fmt::Display for Bad {
             Self::Compressed => {
                 f.write_str("a message is compressed and no compression was agreed")
             }
-            Self::TooLarge(n) => write!(f, "a message of {n} bytes is over the ceiling"),
+            // Predev's words for it, byte-equal (tonic 0.14 `codec/decode.rs`), the limit being
+            // this door's ceiling (`limits.request_body_max_bytes`).
+            Self::TooLarge(n, limit) => write!(
+                f,
+                "Error, decoded message length too large: found {n} bytes, the limit is: {limit} bytes"
+            ),
             Self::Truncated => f.write_str("the stream ended inside a message"),
         }
     }
@@ -110,7 +127,7 @@ impl Messages {
             let n =
                 u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
             if n > self.max {
-                return Err(Bad::TooLarge(n));
+                return Err(Bad::TooLarge(n, self.max));
             }
             if self.buf.len() < PREFIX + n {
                 break;
@@ -201,6 +218,8 @@ pub const DEADLINE_EXCEEDED: u16 = 4;
 pub const PERMISSION_DENIED: u16 = 7;
 /// `RESOURCE_EXHAUSTED`.
 pub const RESOURCE_EXHAUSTED: u16 = 8;
+/// `OUT_OF_RANGE`.
+pub const OUT_OF_RANGE: u16 = 11;
 /// `UNIMPLEMENTED`.
 pub const UNIMPLEMENTED: u16 = 12;
 /// `INTERNAL`.
