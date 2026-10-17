@@ -721,3 +721,159 @@ fn ended_streams_are_remembered_as_runs() {
     e.insert(u64::MAX);
     assert!(e.contains(u64::MAX) && !e.contains(u64::MAX - 1));
 }
+
+// ── a stream's own backpressure ──────────────────────────────────────────────────────────────────
+
+/// The answer bytes an accepted call still queues for the far end, framer-side (not yet taken by
+/// the HTTP/2 connection, which takes them only as the far end grants room).
+fn queued_answer(c: &Conn, stream: u64) -> usize {
+    let super::Side::Accept(a) = &c.side else {
+        panic!("an accepted connection");
+    };
+    a.calls
+        .iter()
+        .find(|(id, _)| *id == stream)
+        .map_or(0, |(_, s)| {
+            s.reply
+                .chan
+                .0
+                .lock()
+                .expect("chan")
+                .frames
+                .iter()
+                .filter_map(|f| f.data_ref().map(bytes::Bytes::len))
+                .sum()
+        })
+}
+
+/// AN ANSWER THE FAR END NEVER READS IS BOUNDED. The client half-closed its call and then grants
+/// no room (no WINDOW_UPDATE), while the host keeps emitting the answer: the framer holds at most
+/// its bound for the stream, and a host that emits past it hears the stream fail
+/// `RESOURCE_EXHAUSTED` (the transport ABI's "A STREAM'S OWN BACKPRESSURE": "A host that keeps
+/// emitting past the mark is the framer's to bound: it may fail the stream"). RED before the fix:
+/// every emitted message waited in an unbounded queue behind the shut window.
+#[test]
+fn an_answer_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    let m = msg::frame(&[7u8; 60_000]);
+    let (mut most, mut got) = (0, Vec::new());
+    for _ in 0..200 {
+        // Once the stream failed, an emit on it is the host's late one: dropped or refused.
+        let _ = a.emit(1, &m, false, 0, 5 * SEC);
+        a.drive(5 * SEC);
+        drop(a.take_wire(usize::MAX));
+        got.extend(a.pieces().drain(..));
+        most = most.max(queued_answer(&a, 1));
+    }
+    assert!(
+        most <= 3 << 20,
+        "the framer held {most} bytes for a stream nobody reads"
+    );
+    let t = terminal(&got, 1).expect("the host hears the stream fail");
+    assert!(t.failed, "the stream failed: {t:?}");
+    assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
+}
+
+/// The request bytes a dialled call still queues for the far end, framer-side.
+fn queued_request(c: &Conn, stream: u64) -> usize {
+    let super::Side::Dial(d) = &c.side else {
+        panic!("a dialled connection");
+    };
+    d.calls
+        .iter()
+        .find(|(id, _)| *id == stream)
+        .map_or(0, |(_, s)| {
+            s.chan
+                .0
+                .lock()
+                .expect("chan")
+                .frames
+                .iter()
+                .filter_map(|f| f.data_ref().map(bytes::Bytes::len))
+                .sum()
+        })
+}
+
+/// The same bound on a dialled call: an upload whose far end grants no room (its SETTINGS and
+/// nothing more) is held to the bound, and fails `RESOURCE_EXHAUSTED` past it. RED before the fix.
+#[test]
+fn an_upload_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Upload")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"first"));
+    d.emit(1, &c, false, 0, now).expect("open the call");
+    let (mut most, mut got) = (0, Vec::new());
+    let turn = |d: &mut Conn, got: &mut Vec<Piece>| {
+        d.drive(now);
+        drop(d.take_wire(usize::MAX));
+        got.extend(d.pieces().drain(..));
+    };
+    turn(&mut d, &mut got);
+    // The far end's SETTINGS and the ACK of ours: the call goes out, and no window ever opens.
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut got);
+    let m = msg::frame(&[7u8; 60_000]);
+    for _ in 0..200 {
+        let _ = d.emit(1, &m, false, 0, now);
+        turn(&mut d, &mut got);
+        most = most.max(queued_request(&d, 1));
+    }
+    assert!(
+        most <= 3 << 20,
+        "the framer held {most} bytes for an upload nobody reads"
+    );
+    let t = terminal(&got, 1).expect("the host hears the stream fail");
+    assert!(t.failed, "the stream failed: {t:?}");
+    assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
+}
+
+// ── a refusal's bytes ────────────────────────────────────────────────────────────────────────────
+
+/// The `grpc-message` an accepted call's end carries, as it goes on the wire: in the head of a
+/// trailers-only answer, or in the trailers after one.
+fn sent_message(c: &Conn, stream: u64) -> Option<Vec<u8>> {
+    let super::Side::Accept(a) = &c.side else {
+        panic!("an accepted connection");
+    };
+    let (_, s) = a.calls.iter().find(|(id, _)| *id == stream)?;
+    if let Some((_, h)) = s.reply.state.lock().expect("reply").head.as_ref() {
+        if let Some(v) = h.get(msg::GRPC_MESSAGE) {
+            return Some(v.as_bytes().to_vec());
+        }
+    }
+    let st = s.reply.chan.0.lock().expect("chan");
+    st.frames
+        .iter()
+        .filter_map(|f| f.trailers_ref())
+        .find_map(|t| t.get(msg::GRPC_MESSAGE))
+        .map(|v| v.as_bytes().to_vec())
+}
+
+/// A REFUSAL'S `grpc-message` IS PREDEV'S BYTES. A refusal naming no `grpc-status` ends the call
+/// with its neutral status mapped and predev's words, percent-encoded as predev's gRPC line
+/// (tonic 0.14's `Status`) encoded them: the space and each of `"#%<>`?{}` beside the controls
+/// (spec ruling 2026-09-30: "the grpc transport maps it to grpc-status/trailers byte-equal to
+/// predev"). Both shapes: trailers-only, and trailers after the answer's head. RED before the fix:
+/// the space went out as it was.
+#[test]
+fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
+    let mut a = half_closed();
+    a.end_call(1, b"", 413).expect("refuse");
+    assert_eq!(
+        sent_message(&a, 1).as_deref(),
+        Some(&b"busbar%20answered%20HTTP%20413"[..]),
+        "trailers-only"
+    );
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    a.end_call(1, b"", 401).expect("refuse");
+    assert_eq!(
+        sent_message(&a, 1).as_deref(),
+        Some(&b"busbar%20answered%20HTTP%20401"[..]),
+        "trailers after the head"
+    );
+}
