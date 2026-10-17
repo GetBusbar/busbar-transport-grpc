@@ -15,8 +15,10 @@
 //!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in 1.5.5's
 //!   bytes and order ([`msg::status_lines`]), the host's trailers;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
-//!   mapped ([`msg::status_of_refusal`], predev's words); before any message went out the block is
-//!   the whole answer (trailers-only: `:status: 200`, `content-type`, then the status lines).
+//!   mapped ([`msg::status_of_refusal`], predev's words); a body whose message was over the ceiling
+//!   closes `OUT_OF_RANGE` in predev's words for it, whatever the refusal; before any message went
+//!   out the block is the whole answer (trailers-only: `:status: 200`, `content-type`, then the
+//!   status lines).
 //!
 //! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
 
@@ -38,6 +40,9 @@ pub struct StreamCall {
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
     closed: bool,
+    /// The body's message was over the ceiling: the call closes with predev's status and words
+    /// for it (`OUT_OF_RANGE`), whatever refusal the host then closes it with.
+    oversize: Option<msg::Bad>,
 }
 
 impl StreamCall {
@@ -64,6 +69,7 @@ impl StreamCall {
             out: VecDeque::new(),
             answered: false,
             closed: false,
+            oversize: None,
         })
     }
 
@@ -74,7 +80,12 @@ impl StreamCall {
     /// A message is compressed or over the ceiling, or the body ended inside one.
     pub fn ingest(&mut self, bytes: &[u8], end: bool) -> Result<(), Failure> {
         let bad = |e: msg::Bad| Failure(e.to_string());
-        for m in self.messages.push(bytes).map_err(bad)? {
+        let got = self.messages.push(bytes).inspect_err(|e| {
+            if matches!(e, msg::Bad::TooLarge(..)) {
+                self.oversize = Some(e.clone());
+            }
+        });
+        for m in got.map_err(bad)? {
             self.out.push_back(Piece::data(STREAM, m.slice(PREFIX..)));
         }
         if end {
@@ -111,23 +122,29 @@ impl StreamCall {
             }
             block.extend_from_slice(b"\r\n");
         }
-        let lines = match msg::read_head(&block, usize::MAX) {
-            Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => {
-                let pairs: Vec<(&str, &[u8])> = h
-                    .fields
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), v.as_slice()))
-                    .collect();
-                let mut lines = msg::render_head(&pairs, None).map_err(|e| Failure(e.into()))?;
-                lines.truncate(lines.len() - 2);
-                lines
+        let lines = if let Some(e) = &self.oversize {
+            msg::status_lines(u32::from(e.status()), e.to_string().as_bytes(), &[])
+                .map_err(|e| Failure(e.into()))?
+        } else {
+            match msg::read_head(&block, usize::MAX) {
+                Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => {
+                    let pairs: Vec<(&str, &[u8])> = h
+                        .fields
+                        .iter()
+                        .map(|(n, v)| (n.as_str(), v.as_slice()))
+                        .collect();
+                    let mut lines =
+                        msg::render_head(&pairs, None).map_err(|e| Failure(e.into()))?;
+                    lines.truncate(lines.len() - 2);
+                    lines
+                }
+                _ => msg::status_lines(
+                    u32::from(msg::status_of_refusal(status)),
+                    msg::refusal_message(status).as_bytes(),
+                    &[],
+                )
+                .map_err(|e| Failure(e.into()))?,
             }
-            _ => msg::status_lines(
-                u32::from(msg::status_of_refusal(status)),
-                msg::refusal_message(status).as_bytes(),
-                &[],
-            )
-            .map_err(|e| Failure(e.into()))?,
         };
         if !self.answered {
             self.wire.extend(b":status: 200\r\n");

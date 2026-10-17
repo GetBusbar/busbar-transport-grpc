@@ -57,7 +57,7 @@ fn a_compressed_flag_is_refused() {
 #[test]
 fn an_oversize_length_is_refused_before_the_body_arrives() {
     let mut m = Messages::new(4);
-    assert_eq!(m.push(&[0, 0, 0, 0, 5]), Err(Bad::TooLarge(5)));
+    assert_eq!(m.push(&[0, 0, 0, 0, 5]), Err(Bad::TooLarge(5, 4)));
     // exactly the ceiling is fine
     let mut ok = Messages::new(4);
     assert_eq!(ok.push(&frame(b"abcd")).unwrap().len(), 1);
