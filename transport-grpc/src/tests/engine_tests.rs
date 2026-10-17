@@ -926,3 +926,35 @@ fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
         "trailers after the head"
     );
 }
+
+// ── an oversize message ──────────────────────────────────────────────────────────────────────────
+
+/// AN OVERSIZE MESSAGE FAILS `OUT_OF_RANGE` IN PREDEV'S WORDS. A call whose message states a length
+/// past the ceiling (`limits.request_body_max_bytes`) fails `OUT_OF_RANGE` (code 11) with tonic
+/// 0.14's text, the limit it reports being that ceiling: predev's gRPC line answered it so, and a
+/// gRPC line's refusal is byte-equal to predev (ARCHITECT ruling on this finding). Both ends see
+/// it: the accepted side's failure piece, and the dialled side's trailers and decoded message. RED
+/// before the fix: INTERNAL, with this framer's own words.
+#[test]
+fn an_oversize_message_fails_out_of_range_in_predevs_words() {
+    let mut p = Pair::new();
+    let limit = posture().max_message_bytes;
+    let over = u32::try_from(limit + 1).expect("small");
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Big")], Some(5)).expect("head");
+    c.push(0);
+    c.extend_from_slice(&over.to_be_bytes());
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    p.settle();
+    let words = format!(
+        "Error, decoded message length too large: found {over} bytes, the limit is: {limit} bytes"
+    );
+    let a = terminal(&p.got_a, 1).expect("the accepted side fails it");
+    assert!(a.failed, "{a:?}");
+    assert_eq!(a.status, Some(11), "OUT_OF_RANGE");
+    assert_eq!(a.bytes.as_ref(), words.as_bytes());
+    let t = terminal(&p.got_d, 1).expect("the dialled side's trailers");
+    assert_eq!(t.status, Some(11), "OUT_OF_RANGE");
+    let end = last(&p.got_d, 1).expect("terminal");
+    assert!(end.failed);
+    assert_eq!(end.bytes.as_ref(), words.as_bytes());
+}
