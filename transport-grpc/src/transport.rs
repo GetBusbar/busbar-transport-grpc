@@ -88,8 +88,28 @@ struct ChanState {
     /// The connection let go of the body before its end: the far end reset the stream. Nothing is
     /// queued for it again.
     gone: bool,
+    /// The stream was failed: the connection resets it rather than end it, so a far end never
+    /// takes a cut-short body for a whole one.
+    reset: bool,
+    /// The payload bytes queued and not yet taken by the connection.
+    queued: usize,
+    /// An `emit` was answered `YIELD_STREAM_FULL` for this stream, and no writable piece has
+    /// followed yet.
+    announced: bool,
     waker: Option<Waker>,
 }
+
+/// A STREAM'S OWN BACKPRESSURE (the transport ABI): the payload bytes one stream may queue for
+/// the far end, framer-side, before the `emit` that reaches it is answered `YIELD_STREAM_FULL`.
+pub(crate) const STREAM_HIGH_WATER: usize = 1 << 20;
+
+/// A stream answered full that has drained to this many queued bytes is writable again
+/// (`PIECE_WRITABLE`).
+pub(crate) const STREAM_LOW_WATER: usize = 256 * 1024;
+
+/// Why a stream whose host emitted past its bound (the high-water mark and one whole message
+/// more) failed: the framer bounds what it holds for a far end that is not reading.
+const OVER_BOUND: &str = "the stream's queue is past its bound: the far end is not reading";
 
 /// The feeding end of a [`ChanBody`].
 #[derive(Clone, Default)]
@@ -101,10 +121,50 @@ impl Chan {
         if s.ended || s.gone {
             return;
         }
+        if let Some(d) = f.data_ref() {
+            s.queued += d.len();
+        }
         s.frames.push_back(f);
         if let Some(w) = s.waker.take() {
             w.wake();
         }
+    }
+    /// The payload bytes queued and not yet taken.
+    fn queued(&self) -> usize {
+        self.0.lock().expect("chan").queued
+    }
+    /// Drop every frame queued and not yet taken.
+    fn drop_queued(&self) {
+        let mut s = self.0.lock().expect("chan");
+        s.frames.clear();
+        s.queued = 0;
+    }
+    /// Fail the stream: drop what is queued, and have the connection reset it.
+    fn reset(&self) {
+        let mut s = self.0.lock().expect("chan");
+        s.reset = true;
+        s.frames.clear();
+        s.queued = 0;
+        if let Some(w) = s.waker.take() {
+            w.wake();
+        }
+    }
+    /// Whether the queue stands at its high-water mark; if so, the host is being told (the
+    /// stream is answered full), and it hears when the queue drains ([`Chan::take_writable`]).
+    fn announce_full(&self) -> bool {
+        let mut s = self.0.lock().expect("chan");
+        let full = s.queued >= STREAM_HIGH_WATER;
+        s.announced |= full;
+        full
+    }
+    /// Whether a stream answered full has drained to its low-water mark: once per announcement.
+    fn take_writable(&self) -> bool {
+        let mut s = self.0.lock().expect("chan");
+        let writable = s.announced && s.queued <= STREAM_LOW_WATER;
+        if writable {
+            s.announced = false;
+        }
+        writable
     }
     fn end(&self) {
         let mut s = self.0.lock().expect("chan");
@@ -126,6 +186,7 @@ impl Chan {
         if !(s.ended && s.frames.is_empty()) {
             s.gone = true;
             s.frames.clear();
+            s.queued = 0;
         }
     }
     fn body(&self) -> ChanBody {
@@ -138,13 +199,20 @@ struct ChanBody(Chan);
 
 impl Body for ChanBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = std::io::Error;
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let mut s = self.0 .0.lock().expect("chan");
+        if s.reset {
+            // The connection resets the stream on a body's error.
+            return Poll::Ready(Some(Err(std::io::Error::other(OVER_BOUND))));
+        }
         if let Some(f) = s.frames.pop_front() {
+            if let Some(d) = f.data_ref() {
+                s.queued -= d.len();
+            }
             return Poll::Ready(Some(Ok(f)));
         }
         if s.ended {
@@ -330,6 +398,9 @@ impl Conn {
         // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
         // the bytes: every step below is idempotent on it.
         let max = self.posture.max_message_bytes.saturating_add(64 * 1024);
+        // A host that keeps emitting past the high-water mark (one whole message more) has the
+        // stream failed: the framer bounds what it holds for a far end that is not reading.
+        let bound = STREAM_HIGH_WATER.saturating_add(max);
         match &mut self.side {
             Side::Dial(d) => {
                 if d.ended.contains(stream) {
@@ -361,6 +432,14 @@ impl Conn {
                     self.out.push_back(Piece {
                         status: Some(msg::INTERNAL),
                         ..Piece::failure(stream, &why)
+                    });
+                } else if s.chan.queued() > bound {
+                    // Reset, never ended: the far end must not take the cut upload for a whole one.
+                    s.chan.reset();
+                    s.stage = DStage::Done;
+                    self.out.push_back(Piece {
+                        status: Some(msg::RESOURCE_EXHAUSTED),
+                        ..Piece::failure(stream, OVER_BOUND)
                     });
                 }
                 d.sweep();
@@ -395,8 +474,36 @@ impl Conn {
                         .chan
                         .push(Frame::data(Bytes::copy_from_slice(bytes)));
                 }
+                if s.reply.chan.queued() > bound {
+                    s.reply.chan.drop_queued();
+                    s.body = None;
+                    s.fail_reply(msg::RESOURCE_EXHAUSTED, OVER_BOUND.as_bytes());
+                    self.out.push_back(Piece {
+                        status: Some(msg::RESOURCE_EXHAUSTED),
+                        ..Piece::failure(stream, OVER_BOUND)
+                    });
+                }
                 Ok(())
             }
+        }
+    }
+
+    /// Whether `stream`'s queue stands at its high-water mark after an `emit`: the answer is then
+    /// `YIELD_STREAM_FULL`, and the stream hands a writable piece once it drains to its low-water
+    /// mark (the transport ABI's "A STREAM'S OWN BACKPRESSURE").
+    #[must_use]
+    pub fn announce_full(&self, stream: u64) -> bool {
+        match &self.side {
+            Side::Dial(d) => d
+                .calls
+                .iter()
+                .find(|(id, _)| *id == stream)
+                .is_some_and(|(_, s)| !s.over() && s.chan.announce_full()),
+            Side::Accept(a) => a
+                .calls
+                .iter()
+                .find(|(id, _)| *id == stream)
+                .is_some_and(|(_, s)| !s.reply_over && s.reply.chan.announce_full()),
         }
     }
 
@@ -689,6 +796,8 @@ impl Dial {
                     status: Some(code),
                     ..Piece::failure(*id, &why)
                 });
+            } else if !s.over() && s.chan.take_writable() {
+                out.push_back(Piece::writable(*id));
             }
         }
         self.sweep();
@@ -971,7 +1080,7 @@ impl AStream {
                 (msg::GRPC_STATUS.into(), code.to_string().into_bytes()),
                 (
                     msg::GRPC_MESSAGE.into(),
-                    msg::encode_message(why).into_bytes(),
+                    msg::encode_status_message(why).into_bytes(),
                 ),
             ],
             content_length: None,
@@ -1110,6 +1219,11 @@ impl Accept {
                         });
                     }
                 }
+            }
+        }
+        for (id, s) in &self.calls {
+            if !s.reply_over && s.reply.chan.take_writable() {
+                out.push_back(Piece::writable(*id));
             }
         }
         self.calls
