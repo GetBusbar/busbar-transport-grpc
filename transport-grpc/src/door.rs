@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::hyper_io::{fill, Owed};
+use crate::hyper_io::{fill, mark_stream_full, Owed};
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
@@ -367,9 +367,21 @@ slot!(
                 Ok(())
             });
         }
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| {
-            c.emit(i.stream, bytes, end, deadline, now)
-        })
+        // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
+        // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
+        let stream = i.stream;
+        with_then(
+            &p,
+            i.framing,
+            i.field(|x| &x.sink),
+            &mut o,
+            |c| c.emit(stream, bytes, end, deadline, now),
+            |c, o| {
+                if c.announce_full(stream) {
+                    mark_stream_full(o);
+                }
+            },
+        )
     }
 );
 
@@ -510,6 +522,18 @@ fn with(
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
+    with_then(p, token, sink, o, f, |_, _| {})
+}
+
+/// [`with`], then `then` on the framing and the answer, where the op answered READY.
+fn with_then(
+    p: &sdk::Instance<'_, Instance>,
+    token: u64,
+    sink: Lent<'_, FramerSink>,
+    o: &mut Out<'_, FramerOut>,
+    f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
+    then: impl FnOnce(&Conn, &mut Out<'_, FramerOut>),
+) -> Outcome {
     let held = p
         .get()
         .and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
@@ -518,7 +542,11 @@ fn with(
         return Outcome::Failed;
     };
     let mut h = held.lock().expect("framing");
-    step(&mut h, sink, o, f)
+    let outcome = step(&mut h, sink, o, f);
+    if matches!(outcome, Outcome::Ready) {
+        then(&h.conn, o);
+    }
+    outcome
 }
 
 fn step(

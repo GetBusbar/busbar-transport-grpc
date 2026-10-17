@@ -193,18 +193,18 @@ fn a_malformed_or_cut_escape_stays_as_sent() {
 }
 
 #[test]
-fn encoding_escapes_controls_percent_and_non_ascii() {
-    assert_eq!(encode_message(b"plain text"), "plain text");
-    assert_eq!(encode_message(b"a\r\nb"), "a%0D%0Ab");
-    assert_eq!(encode_message(b"100%"), "100%25");
-    assert_eq!(encode_message("é".as_bytes()), "%C3%A9");
-    assert_eq!(encode_message(&[0x7f]), "%7F");
+fn encoding_escapes_controls_percent_space_and_non_ascii() {
+    assert_eq!(encode_status_message(b"plain text"), "plain%20text");
+    assert_eq!(encode_status_message(b"a\r\nb"), "a%0D%0Ab");
+    assert_eq!(encode_status_message(b"100%"), "100%25");
+    assert_eq!(encode_status_message("é".as_bytes()), "%C3%A9");
+    assert_eq!(encode_status_message(&[0x7f]), "%7F");
 }
 
 #[test]
 fn an_encoded_message_decodes_back_to_the_original() {
     let text = "bad \"req\": 100% \u{1F600} é\r\n\t\0".as_bytes();
-    assert_eq!(decode_message(encode_message(text).as_bytes()), text);
+    assert_eq!(decode_message(encode_status_message(text).as_bytes()), text);
 }
 
 // ── content type ─────────────────────────────────────────────────────────────────────────────────
