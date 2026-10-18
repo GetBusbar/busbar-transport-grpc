@@ -114,7 +114,6 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        self.closed = true;
         let mut block = bytes.to_vec();
         if !block.ends_with(b"\r\n\r\n") {
             if !block.is_empty() && !block.ends_with(b"\r\n") {
@@ -146,6 +145,9 @@ impl StreamCall {
                 .map_err(|e| Failure(e.into()))?,
             }
         };
+        // Closed only once the lines are rendered: a refusal that cannot be written leaves the call
+        // open for the host's fallback close.
+        self.closed = true;
         if !self.answered {
             self.wire.extend(b":status: 200\r\n");
             self.wire
@@ -165,8 +167,10 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        self.closed = true;
+        // Rendered first, closed after: a final status that cannot be written leaves the call
+        // open, so the host's fallback refusal can still close it with a `grpc-status`.
         let lines = msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?;
+        self.closed = true;
         self.wire.extend(lines);
         Ok(())
     }
