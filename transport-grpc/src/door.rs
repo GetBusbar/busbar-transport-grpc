@@ -286,6 +286,7 @@ slot!(
                     .iter()
                     .map(|f| (f.field(|x| &x.name).bytes(), f.field(|x| &x.value).bytes())),
                 inst.posture.max_message_bytes,
+                i.sink.now_monotonic_ns,
             );
             let mut call = match opened {
                 Ok(call) => call,
@@ -407,7 +408,11 @@ slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
         if let Some(call) = one_stream(&p, i.framing) {
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+            let now = i.sink.now_monotonic_ns;
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+                c.expire(now);
+                Ok(())
+            });
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }

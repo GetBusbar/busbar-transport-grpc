@@ -43,20 +43,33 @@ pub struct StreamCall {
     /// The body's message was over the ceiling: the call closes with predev's status and words
     /// for it (`OUT_OF_RANGE`), whatever refusal the host then closes it with.
     oversize: Option<msg::Bad>,
+    /// The instant (host monotonic ns) the caller's `grpc-timeout` runs out, when it stated one.
+    deadline: Option<u64>,
 }
 
 impl StreamCall {
-    /// The call that arrived with `fields`, its messages at most `max` payload bytes.
+    /// The call that arrived with `fields` at host monotonic `now_ns`, its messages at most `max`
+    /// payload bytes; a `grpc-timeout` it states runs from `now_ns`, as the dedicated listener's
+    /// accept path runs it.
     ///
     /// # Errors
     ///
     /// The call is not gRPC: its `content-type` is none of gRPC's.
     pub fn open<'f>(
-        mut fields: impl Iterator<Item = (&'f [u8], &'f [u8])>,
+        fields: impl Iterator<Item = (&'f [u8], &'f [u8])>,
         max: usize,
+        now_ns: u64,
     ) -> Result<Self, Failure> {
-        let grpc = fields
-            .any(|(n, v)| n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v));
+        let (mut grpc, mut deadline) = (false, None);
+        for (n, v) in fields {
+            if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
+                grpc = true;
+            } else if n.eq_ignore_ascii_case(msg::GRPC_TIMEOUT.as_bytes()) {
+                deadline = msg::parse_timeout(v).map(|d| {
+                    now_ns.saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+                });
+            }
+        }
         if !grpc {
             return Err(Failure(
                 "begin: the stream is not a gRPC call (its content-type)".into(),
@@ -70,7 +83,31 @@ impl StreamCall {
             answered: false,
             closed: false,
             oversize: None,
+            deadline,
         })
+    }
+
+    /// The host's timer at monotonic `now_ns`: a call past its `grpc-timeout` closes
+    /// `DEADLINE_EXCEEDED`, and the host learns the stream failed.
+    pub fn expire(&mut self, now_ns: u64) {
+        if self.closed || self.deadline.is_none_or(|d| now_ns < d) {
+            return;
+        }
+        self.deadline = None;
+        let code = u32::from(msg::DEADLINE_EXCEEDED);
+        if let Ok(lines) = msg::status_lines(code, b"deadline exceeded", &[]) {
+            if !self.answered {
+                self.wire.extend(b":status: 200\r\n");
+                self.wire
+                    .extend(format!("content-type: {}\r\n", msg::CONTENT_TYPE).as_bytes());
+            }
+            self.closed = true;
+            self.wire.extend(lines);
+        }
+        self.out.push_back(Piece {
+            status: Some(msg::DEADLINE_EXCEEDED),
+            ..Piece::failure(STREAM, "deadline exceeded")
+        });
     }
 
     /// The call's body bytes (`end` = its last): each message they complete is a piece.
@@ -188,7 +225,7 @@ impl Owed for StreamCall {
         &mut self.out
     }
     fn next_deadline(&self) -> Option<u64> {
-        None
+        self.deadline.filter(|_| !self.closed)
     }
     fn ended(&self) -> bool {
         self.closed && self.wire.is_empty()
