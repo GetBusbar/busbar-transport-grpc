@@ -10,6 +10,7 @@ fn grpc() -> StreamCall {
     StreamCall::open(
         [(&b"content-type"[..], &b"application/grpc+proto"[..])].into_iter(),
         1024,
+        0,
     )
     .expect("a gRPC call")
 }
@@ -67,8 +68,13 @@ fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
 
 #[test]
 fn a_call_that_is_not_grpc_is_refused_before_it_is_one() {
-    assert!(StreamCall::open([(&b"content-type"[..], &b"text/plain"[..])].into_iter(), 1).is_err());
-    assert!(StreamCall::open(std::iter::empty(), 1).is_err());
+    assert!(StreamCall::open(
+        [(&b"content-type"[..], &b"text/plain"[..])].into_iter(),
+        1,
+        0
+    )
+    .is_err());
+    assert!(StreamCall::open(std::iter::empty(), 1, 0).is_err());
 }
 
 #[test]
@@ -111,4 +117,32 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
     assert!(!c.ended(), "the call is still open");
     c.refuse(&[], 0).expect("the fallback refusal closes it");
     assert!(wire(&mut c).contains("grpc-status:"));
+}
+
+/// THE CALLER'S `grpc-timeout` HOLDS ON THE SHARED LISTENER TOO: the deadline runs from the call's
+/// arrival, the framer asks the host for its timer, and past it the call closes
+/// `DEADLINE_EXCEEDED` with a failure piece, as the dedicated listener's accept path closes it.
+/// RED before the fix: the stream path read only `content-type` and never asked for a timer.
+#[test]
+fn a_stated_grpc_timeout_closes_the_call_deadline_exceeded() {
+    let mut c = StreamCall::open(
+        [
+            (&b"content-type"[..], &b"application/grpc"[..]),
+            (&b"grpc-timeout"[..], &b"5m"[..]),
+        ]
+        .into_iter(),
+        1024,
+        1_000,
+    )
+    .expect("a gRPC call");
+    assert_eq!(c.next_deadline(), Some(1_000 + 5_000_000));
+    c.expire(1_000 + 4_999_999);
+    assert!(c.pieces().is_empty(), "not yet");
+    c.expire(1_000 + 5_000_000);
+    assert!(wire(&mut c).contains("grpc-status: 4"));
+    assert!(c
+        .pieces()
+        .drain(..)
+        .any(|p| p.status == Some(msg::DEADLINE_EXCEEDED)));
+    assert_eq!(c.next_deadline(), None);
 }
