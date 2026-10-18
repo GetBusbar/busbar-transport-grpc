@@ -286,6 +286,7 @@ slot!(
                     .iter()
                     .map(|f| (f.field(|x| &x.name).bytes(), f.field(|x| &x.value).bytes())),
                 inst.posture.max_message_bytes,
+                i.sink.now_monotonic_ns,
             );
             let mut call = match opened {
                 Ok(call) => call,
@@ -396,8 +397,8 @@ slot!(
         }
         let bytes = i.bytes();
         if let Some(call) = one_stream(&p, i.framing) {
-            let status = i.status;
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status));
+            let (status, head_sent) = (i.status, i.head_sent != 0);
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status, head_sent));
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| c.end_call(i.stream, bytes, i.status))
     }
@@ -407,7 +408,11 @@ slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
         if let Some(call) = one_stream(&p, i.framing) {
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+            let now = i.sink.now_monotonic_ns;
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+                c.expire(now);
+                Ok(())
+            });
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }
@@ -432,8 +437,13 @@ slot!(
             let answered = on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
                 c.finish(status, message, details)
             });
-            // A close the sink could not take whole stays until the host's re-call drains it.
-            if call.lock().expect("stream").wire_pending() {
+            // A close the sink could not take whole stays until the host's re-call drains it, and a
+            // close that failed stays for the host's fallback refusal to close the call.
+            let keep = {
+                let c = call.lock().expect("stream");
+                c.wire_pending() || !c.ended()
+            };
+            if keep {
                 if let Some(inst) = p.get() {
                     inst.calls.lock().expect("calls").insert(i.framing, call);
                 }
