@@ -99,3 +99,16 @@ fn an_oversize_message_closes_the_stream_out_of_range_in_predevs_words() {
          %20the%20limit%20is:%201024%20bytes\r\n"
     );
 }
+
+/// A FINAL STATUS THAT CANNOT BE RENDERED LEAVES THE CALL OPEN for the host's fallback refusal: a
+/// details value with a byte no field line may carry fails `finish`, writes nothing, and the
+/// refusal that follows still closes the call with a `grpc-status`. RED before the fix: `finish`
+/// marked the call closed first, so the refusal wrote nothing and the client saw no status.
+#[test]
+fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
+    let mut c = grpc();
+    assert!(c.finish(0, b"ok", b"\x01").is_err());
+    assert!(!c.ended(), "the call is still open");
+    c.refuse(&[], 0).expect("the fallback refusal closes it");
+    assert!(wire(&mut c).contains("grpc-status:"));
+}

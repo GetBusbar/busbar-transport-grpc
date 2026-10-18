@@ -183,6 +183,8 @@ fn a_percent_escape_is_decoded() {
     assert_eq!(decode_message(b"a%20b"), b"a b");
     assert_eq!(decode_message(b"%20"), b" ");
     assert_eq!(decode_message(b"%C3%A9"), "é".as_bytes());
+    // A signed escape is malformed and stays as it was sent.
+    assert_eq!(decode_message(b"a%+fb"), b"a%+fb");
 }
 
 #[test]
