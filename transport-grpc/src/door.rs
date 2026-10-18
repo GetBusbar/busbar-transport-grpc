@@ -432,8 +432,13 @@ slot!(
             let answered = on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
                 c.finish(status, message, details)
             });
-            // A close the sink could not take whole stays until the host's re-call drains it.
-            if call.lock().expect("stream").wire_pending() {
+            // A close the sink could not take whole stays until the host's re-call drains it, and a
+            // close that failed stays for the host's fallback refusal to close the call.
+            let keep = {
+                let c = call.lock().expect("stream");
+                c.wire_pending() || !c.ended()
+            };
+            if keep {
                 if let Some(inst) = p.get() {
                     inst.calls.lock().expect("calls").insert(i.framing, call);
                 }
