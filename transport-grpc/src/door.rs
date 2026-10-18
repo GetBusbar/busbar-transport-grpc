@@ -398,7 +398,7 @@ slot!(
         let bytes = i.bytes();
         if let Some(call) = one_stream(&p, i.framing) {
             let status = i.status;
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status));
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status, false));
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| c.end_call(i.stream, bytes, i.status))
     }

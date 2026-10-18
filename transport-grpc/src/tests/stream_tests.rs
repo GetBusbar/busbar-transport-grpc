@@ -46,18 +46,18 @@ fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
         "grpc-status: 5\r\ngrpc-message: no%20such\r\ngrpc-status-details-bin: AAEC\r\n"
     );
     assert!(c.ended());
-    c.refuse(b"", 500).unwrap();
+    c.refuse(b"", 500, false).unwrap();
     assert_eq!(wire(&mut c), "", "a closed call owes nothing more");
 
     let mut c = grpc();
-    c.refuse(b"", 429).unwrap();
+    c.refuse(b"", 429, false).unwrap();
     assert_eq!(
         wire(&mut c),
         ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 14\r\n\
          grpc-message: busbar%20answered%20HTTP%20429\r\n"
     );
     let mut c = grpc();
-    c.refuse(b"grpc-status: 7\r\ngrpc-message: no\r\n", 0)
+    c.refuse(b"grpc-status: 7\r\ngrpc-message: no\r\n", 0, false)
         .unwrap();
     assert_eq!(
         wire(&mut c),
@@ -97,7 +97,7 @@ fn an_oversize_message_closes_the_stream_out_of_range_in_predevs_words() {
     let mut body = vec![0u8];
     body.extend_from_slice(&1025u32.to_be_bytes());
     let why = c.ingest(&body, false).expect_err("over the ceiling");
-    c.refuse(why.0.as_bytes(), 400).unwrap();
+    c.refuse(why.0.as_bytes(), 400, false).unwrap();
     assert_eq!(
         wire(&mut c),
         ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 11\r\n\
@@ -115,7 +115,8 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
     let mut c = grpc();
     assert!(c.finish(0, b"ok", b"\x01").is_err());
     assert!(!c.ended(), "the call is still open");
-    c.refuse(&[], 0).expect("the fallback refusal closes it");
+    c.refuse(&[], 0, false)
+        .expect("the fallback refusal closes it");
     assert!(wire(&mut c).contains("grpc-status:"));
 }
 
@@ -145,4 +146,22 @@ fn a_stated_grpc_timeout_closes_the_call_deadline_exceeded() {
         .drain(..)
         .any(|p| p.status == Some(msg::DEADLINE_EXCEEDED)));
     assert_eq!(c.next_deadline(), None);
+}
+
+/// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN (Q128 grpc L1, ruling (a)): when the host states
+/// `RefuseIn::head_sent`, the refusal is the call's closing lines only, the trailers after the
+/// head it answered. RED before the fix: the framer judged by its own state alone and wrote a
+/// second `:status: 200` head.
+#[test]
+fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
+    let mut c = grpc();
+    c.refuse(b"", 429, true).unwrap();
+    assert_eq!(
+        wire(&mut c),
+        "grpc-status: 14\r\ngrpc-message: busbar%20answered%20HTTP%20429\r\n"
+    );
+    let mut c = grpc();
+    c.refuse(b"grpc-status: 7\r\ngrpc-message: no\r\n", 0, true)
+        .unwrap();
+    assert_eq!(wire(&mut c), "grpc-status: 7\r\ngrpc-message: no\r\n");
 }
