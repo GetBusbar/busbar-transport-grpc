@@ -148,7 +148,7 @@ impl StreamCall {
     /// # Errors
     ///
     /// The block cannot be written as field lines.
-    pub fn refuse(&mut self, bytes: &[u8], status: u32, _head_sent: bool) -> Result<(), Failure> {
+    pub fn refuse(&mut self, bytes: &[u8], status: u32, head_sent: bool) -> Result<(), Failure> {
         if self.closed {
             return Ok(());
         }
@@ -186,7 +186,7 @@ impl StreamCall {
         // Closed only once the lines are rendered: a refusal that cannot be written leaves the call
         // open for the host's fallback close.
         self.closed = true;
-        if !self.answered {
+        if !self.answered && !head_sent {
             self.wire.extend(b":status: 200\r\n");
             self.wire
                 .extend(format!("content-type: {}\r\n", msg::CONTENT_TYPE).as_bytes());
