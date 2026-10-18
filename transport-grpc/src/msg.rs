@@ -280,7 +280,12 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len());
     let mut i = 0;
     while i < v.len() {
-        if v[i] == b'%' && i + 2 < v.len() {
+        // Two ASCII hex digits, nothing else (`from_str_radix` alone also takes a sign).
+        if v[i] == b'%'
+            && i + 2 < v.len()
+            && v[i + 1].is_ascii_hexdigit()
+            && v[i + 2].is_ascii_hexdigit()
+        {
             let hex = std::str::from_utf8(&v[i + 1..i + 3]).ok();
             if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(b);

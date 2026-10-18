@@ -458,6 +458,12 @@ impl Conn {
                         Ok(None) => return Ok(()),
                         Err(why) => {
                             s.fail_reply(msg::INTERNAL, why.as_bytes());
+                            // The stream ends once, and the host learns it, as the over-bound
+                            // branch below tells it.
+                            self.out.push_back(Piece {
+                                status: Some(msg::INTERNAL),
+                                ..Piece::failure(stream, &why)
+                            });
                             return Ok(());
                         }
                         Ok(Some((head, took))) => {
