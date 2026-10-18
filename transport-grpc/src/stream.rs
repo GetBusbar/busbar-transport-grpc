@@ -142,12 +142,13 @@ impl StreamCall {
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
-    /// neutral `status` mapped.
+    /// neutral `status` mapped. `head_sent`: the host already sent the call's response head
+    /// (`RefuseIn::head_sent`), so the refusal is its closing lines only.
     ///
     /// # Errors
     ///
     /// The block cannot be written as field lines.
-    pub fn refuse(&mut self, bytes: &[u8], status: u32) -> Result<(), Failure> {
+    pub fn refuse(&mut self, bytes: &[u8], status: u32, _head_sent: bool) -> Result<(), Failure> {
         if self.closed {
             return Ok(());
         }
