@@ -1054,7 +1054,7 @@ fn an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire_and_nothing_mor
         ]))
     };
     assert_eq!(
-        p.d.emit_signed(1, &c, true, 0, p.now, &mut sign),
+        p.d.emit_signed(1, &c, true, 0, p.now, None, &mut sign),
         Poll::Ready(Ok(()))
     );
     p.settle();
@@ -1127,14 +1127,14 @@ fn an_auth_at_the_body_point_signs_the_whole_body_the_wire_carries() {
     // The head and the first message: the body is not whole, so nothing is signed or sent.
     let first = [head.as_slice(), &body[..8]].concat();
     assert_eq!(
-        p.d.emit_signed(1, &first, false, 0, p.now, &mut sign),
+        p.d.emit_signed(1, &first, false, 0, p.now, None, &mut sign),
         Poll::Ready(Ok(()))
     );
     p.settle();
     assert!(p.a.seen().is_empty(), "no HEADERS before the body is whole");
     // The rest: now the auth signs the whole body, and the request goes out.
     assert_eq!(
-        p.d.emit_signed(1, &body[8..], true, 0, p.now, &mut sign),
+        p.d.emit_signed(1, &body[8..], true, 0, p.now, None, &mut sign),
         Poll::Ready(Ok(()))
     );
     p.settle();
@@ -1151,6 +1151,154 @@ fn an_auth_at_the_body_point_signs_the_whole_body_the_wire_carries() {
     assert_eq!(
         got, body,
         "the far end receives exactly the body the auth signed"
+    );
+}
+
+/// THE HOST'S STATED LENGTH RULES (`EmitIn::body_len`, step 2): a head block that states no
+/// `content-length` still waits for the whole body when the host states its length on the emit
+/// carrying the head, and the auth signs exactly that body.
+#[test]
+fn the_body_point_waits_for_the_length_the_host_states() {
+    let mut p = Pair::signed(SignAt::HeadBody);
+    let body: Vec<u8> = msg::frame(b"stated");
+    let head = msg::render_head(&[("path", b"/pkg.Svc/Up")], None).expect("head");
+    let mut bodies = Vec::new();
+    let mut sign = |_: &RequestHead<'_>, b: Option<&[u8]>| -> Answer {
+        bodies.push(b.map(<[u8]>::to_vec));
+        Poll::Ready(Ok(vec![]))
+    };
+    let first = [head.as_slice(), &body[..4]].concat();
+    assert_eq!(
+        p.d.emit_signed(1, &first, false, 0, p.now, Some(body.len()), &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert!(p.a.seen().is_empty(), "the stated body is not whole yet");
+    assert_eq!(
+        p.d.emit_signed(1, &body[4..], false, 0, p.now, None, &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(
+        bodies,
+        vec![Some(body.clone())],
+        "signed once, over the stated body"
+    );
+    assert_eq!(frames(&p.got_a, 1).concat(), body, "and ended after it");
+}
+
+/// TE, TIMEOUT AND AUTHORITY ARE SHOWN TO THE AUTH BEFORE IT ANSWERS (ruling 23; Q128 arch u65):
+/// gRPC's own lines are finalised before the auth call, never added after it. The view the auth is
+/// called over already carries `te: trailers`, the default `content-type`, the `grpc-timeout` the
+/// attempt's deadline gives and the `:authority`, and the wire carries exactly those values.
+#[test]
+fn te_timeout_and_authority_are_shown_to_the_auth_before_it_answers() {
+    let mut p = Pair::signed(SignAt::Head);
+    let deadline = p.now + 7 * SEC;
+    let c = call("/pkg.Svc/Say", &[], &[b"q"]);
+    let timeout = msg::timeout_value(Duration::from_secs(7));
+    let mut shown = Vec::new();
+    let mut sign = |h: &RequestHead<'_>, _: Option<&[u8]>| -> Answer {
+        let value = |n: &str| {
+            h.fields
+                .iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| v.to_vec())
+        };
+        // Checked HERE, inside the call: before the auth's answer exists.
+        assert_eq!(value("te").as_deref(), Some(&b"trailers"[..]));
+        assert_eq!(
+            value("content-type").as_deref(),
+            Some(msg::CONTENT_TYPE.as_bytes())
+        );
+        assert_eq!(value("grpc-timeout").as_deref(), Some(timeout.as_bytes()));
+        assert_eq!(h.authority, "peer.test:50051");
+        shown.push(called(h));
+        Poll::Ready(Ok(vec![line("authorization", b"t")]))
+    };
+    assert_eq!(
+        p.d.emit_signed(1, &c, true, deadline, p.now, None, &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(shown.len(), 1, "the auth was called, over gRPC's own lines");
+    let wire = wire_lines(&p, 0);
+    for (name, value) in &shown[0].fields {
+        assert!(
+            wire.contains(&(name.clone(), value.clone())),
+            "{name} goes out as the auth saw it"
+        );
+    }
+    assert_eq!(
+        p.a.seen()[0].1.authority().map(|a| a.as_str()),
+        Some(shown[0].authority.as_str())
+    );
+}
+
+/// A HEAD LINE THAT CONFLICTS WITH GRPC'S OWN IS REFUSED, NEVER DROPPED (ruling 23; Q128 arch u65):
+/// a reserved or hop-by-hop line the plane's head block states other than gRPC writes it, or a
+/// content-length other than the host's stated length, fails the stream before any auth call and
+/// before any HEADERS; a line that states exactly what gRPC writes is that line, and goes on.
+#[test]
+fn a_head_line_that_conflicts_with_grpcs_own_is_refused_never_dropped() {
+    let conflicts: [&[(&str, &[u8])]; 7] = [
+        &[("grpc-timeout", b"1S")],
+        &[("host", b"elsewhere.test")],
+        &[("authority", b"elsewhere.test")],
+        &[("method", b"GET")],
+        &[("te", b"gzip")],
+        &[("connection", b"close")],
+        &[
+            ("content-type", b"application/grpc"),
+            ("content-type", b"application/grpc+proto"),
+        ],
+    ];
+    for (n, lines) in conflicts.into_iter().enumerate() {
+        let name = lines[lines.len() - 1].0;
+        let mut p = Pair::signed(SignAt::Head);
+        let mut calls = 0;
+        let mut sign = |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer {
+            calls += 1;
+            Poll::Ready(Ok(vec![]))
+        };
+        let c = call("/pkg.Svc/Say", lines, &[b"q"]);
+        assert_eq!(
+            p.d.emit_signed(1, &c, true, 0, p.now, None, &mut sign),
+            Poll::Ready(Ok(()))
+        );
+        p.settle();
+        assert_eq!(calls, 0, "case {n} ({name}): no auth call");
+        assert!(p.a.seen().is_empty(), "case {n} ({name}): no HEADERS");
+        let t = terminal(&p.got_d, 1).expect("the refused stream ends");
+        assert!(t.failed, "case {n} ({name}): refused");
+    }
+
+    // The head's own length against the host's stated one.
+    let mut p = Pair::signed(SignAt::Head);
+    let mut sign = |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer { Poll::Ready(Ok(vec![])) };
+    let c = call("/pkg.Svc/Say", &[], &[b"q"]);
+    assert_eq!(
+        p.d.emit_signed(1, &c, true, 0, p.now, Some(999), &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert!(p.a.seen().is_empty(), "a conflicting length: no HEADERS");
+    assert!(terminal(&p.got_d, 1).is_some_and(|t| t.failed));
+
+    // A line that states what gRPC writes anyway goes on.
+    let mut p = Pair::new();
+    let same: [(&str, &[u8]); 3] = [
+        ("te", b"trailers"),
+        ("method", b"POST"),
+        ("authority", b"peer.test:50051"),
+    ];
+    p.d.emit(1, &call("/pkg.Svc/Say", &same, &[b"q"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    assert_eq!(
+        p.a.seen().len(),
+        1,
+        "gRPC's own lines, stated as gRPC writes them, go on"
     );
 }
 
@@ -1171,7 +1319,7 @@ fn a_pending_auth_on_stream_1_does_not_block_stream_2() {
     };
     assert!(p
         .d
-        .emit_signed(1, &one, true, 0, p.now, &mut pending)
+        .emit_signed(1, &one, true, 0, p.now, None, &mut pending)
         .is_pending());
     p.settle();
     assert!(p.a.seen().is_empty(), "nothing of a parked stream goes out");
@@ -1180,7 +1328,7 @@ fn a_pending_auth_on_stream_1_does_not_block_stream_2() {
         Poll::Ready(Ok(vec![line("authorization", b"two")]))
     };
     assert_eq!(
-        p.d.emit_signed(2, &two, true, 0, p.now, &mut ready),
+        p.d.emit_signed(2, &two, true, 0, p.now, None, &mut ready),
         Poll::Ready(Ok(()))
     );
     p.settle();
@@ -1211,7 +1359,7 @@ fn a_pending_auth_on_stream_1_does_not_block_stream_2() {
         Poll::Ready(Ok(vec![line("authorization", b"one")]))
     };
     assert_eq!(
-        p.d.emit_signed(1, &one, true, 0, p.now, &mut resumed),
+        p.d.emit_signed(1, &one, true, 0, p.now, None, &mut resumed),
         Poll::Ready(Ok(()))
     );
     p.settle();
@@ -1264,7 +1412,7 @@ fn a_refused_auth_or_an_answer_the_request_cannot_carry_refuses_the_stream() {
             |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer { once.take().expect("called once") };
         let c = call("/pkg.Svc/Say", &[], &[b"q"]);
         assert_eq!(
-            p.d.emit_signed(1, &c, true, 0, p.now, &mut sign),
+            p.d.emit_signed(1, &c, true, 0, p.now, None, &mut sign),
             Poll::Ready(Ok(())),
             "case {n}"
         );
@@ -1281,7 +1429,7 @@ fn a_refused_auth_or_an_answer_the_request_cannot_carry_refuses_the_stream() {
         let mut fine =
             |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer { Poll::Ready(Ok(vec![])) };
         assert_eq!(
-            p.d.emit_signed(3, &c, true, 0, p.now, &mut fine),
+            p.d.emit_signed(3, &c, true, 0, p.now, None, &mut fine),
             Poll::Ready(Ok(()))
         );
         p.settle();
@@ -1321,7 +1469,7 @@ fn the_auth_lines_lead_the_field_lines_as_the_1_5_5_h2_golden_orders_them() {
         Poll::Ready(Ok(vec![line("authorization", b"Bearer t")]))
     };
     assert_eq!(
-        p.d.emit_signed(1, &c, true, 0, p.now, &mut sign),
+        p.d.emit_signed(1, &c, true, 0, p.now, None, &mut sign),
         Poll::Ready(Ok(()))
     );
     p.settle();

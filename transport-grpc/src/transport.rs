@@ -483,7 +483,7 @@ impl Conn {
                     "the binding's auth has no caller on this emit".into(),
                 )))
             };
-        match self.emit_signed(stream, bytes, end, deadline_ns, now_ns, &mut unsigned) {
+        match self.emit_signed(stream, bytes, end, deadline_ns, now_ns, None, &mut unsigned) {
             Poll::Ready(r) => r,
             Poll::Pending => Ok(()),
         }
@@ -497,9 +497,13 @@ impl Conn {
     /// connection keeps flowing, and the resumed `emit` on it (the same op, the same bytes)
     /// re-issues the same call.
     ///
+    /// `body_len` is the opening body's length the host states on the emit carrying the head
+    /// (`EmitIn::body_len`, when `body_len_known`); `None` = it states none.
+    ///
     /// # Errors
     ///
     /// As [`Conn::emit`].
+    #[allow(clippy::too_many_arguments)]
     pub fn emit_signed(
         &mut self,
         stream: u64,
@@ -507,6 +511,7 @@ impl Conn {
         end: bool,
         deadline_ns: u64,
         now_ns: u64,
+        body_len: Option<usize>,
         sign: Signer<'_>,
     ) -> Poll<Result<(), Failure>> {
         // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
@@ -542,7 +547,7 @@ impl Conn {
                 let base = d.base.clone();
                 let at = d.sign_at;
                 let s = &mut d.calls[idx].1;
-                let taken = match s.take(&base, bytes, end, now_ns, max, at, sign) {
+                let taken = match s.take(&base, bytes, end, now_ns, max, body_len, at, sign) {
                     // PARKED: this stream alone waits for its auth's answer.
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(taken) => taken,
@@ -822,11 +827,12 @@ struct DialStream {
     sleep: Pin<Box<dyn Sleep>>,
 }
 
-/// THE OPENING BODY'S LENGTH, where the emit carrying the head states it: the one place the
-/// framer reads it. The head block's `content-length` (`encode` writes the length of the message
-/// stream it renders); a streamed body states none.
-fn body_len(head: &Head) -> Option<usize> {
-    head.content_length
+/// THE OPENING BODY'S LENGTH: the one place the framer reads it. The host's, stated on the emit
+/// carrying the head (`EmitIn::body_len` with `body_len_known`); where it states none, the head
+/// block's `content-length` (`encode` writes the length of the message stream it renders). A
+/// streamed body states neither.
+fn body_len(head: &Head, stated: Option<usize>) -> Option<usize> {
+    stated.or(head.content_length)
 }
 
 impl DialStream {
@@ -854,6 +860,7 @@ impl DialStream {
         end: bool,
         now_ns: u64,
         max: usize,
+        stated: Option<usize>,
         at: Option<SignAt>,
         sign: Signer<'_>,
     ) -> Poll<Result<(), StreamFault>> {
@@ -875,7 +882,14 @@ impl DialStream {
                     Ok(built) => built,
                     Err(why) => return Poll::Ready(Err(internal(why))),
                 };
-                self.left = body_len(&head);
+                if let (Some(stated), Some(stated_in_head)) = (stated, head.content_length) {
+                    if stated != stated_in_head {
+                        return Poll::Ready(Err(internal(
+                            "the head's content-length conflicts with the host's stated length",
+                        )));
+                    }
+                }
+                self.left = body_len(&head, stated);
                 let Some(at) = at else {
                     self.stage = DStage::Queued(self.request(uri, lines));
                     return Poll::Ready(self.queue(rest, end));
@@ -1031,23 +1045,43 @@ impl DialStream {
             None => HeaderValue::from_static(msg::CONTENT_TYPE),
         };
         let mut lines = HeaderMap::new();
-        lines.append(http::header::CONTENT_TYPE, content_type);
+        lines.append(http::header::CONTENT_TYPE, content_type.clone());
         lines.append(http::header::TE, HeaderValue::from_static("trailers"));
         let left = Duration::from_nanos(self.deadline_ns.saturating_sub(now_ns));
+        let timeout = msg::timeout_value(left);
         lines.append(
             msg::GRPC_TIMEOUT,
-            HeaderValue::from_str(&msg::timeout_value(left))
-                .map_err(|_| "grpc-timeout is not a field value")?,
+            HeaderValue::from_str(&timeout).map_err(|_| "grpc-timeout is not a field value")?,
         );
+        let authority = uri.authority().map_or("", http::uri::Authority::as_str);
         for (name, value) in &head.fields {
-            if RESERVED_ON_REQUEST.contains(&name.as_str()) || hop_by_hop(name, []) {
-                continue;
+            // A LINE OF GRPC'S OWN IS REFUSED ON CONFLICT, NEVER DROPPED (ruling 23, u65): the
+            // head block's own words are read above (`path`, `content-type`; `content-length` is
+            // the body's length), and a line that states what gRPC writes anyway is that line. Any
+            // other reserved or hop-by-hop line would be a line dropped from the head the plane
+            // composed: the stream is refused instead.
+            let same = match name.as_str() {
+                "path" => value.as_slice() == path,
+                "content-type" => value.as_slice() == content_type.as_bytes(),
+                "method" => value.eq_ignore_ascii_case(b"POST"),
+                "authority" | "host" => value.as_slice() == authority.as_bytes(),
+                "te" => value.as_slice() == b"trailers",
+                n if n == msg::GRPC_TIMEOUT => value.as_slice() == timeout.as_bytes(),
+                n if RESERVED_ON_REQUEST.contains(&n) || hop_by_hop(n, []) => false,
+                _ => {
+                    let n = HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| format!("`{name}` is not a field name"))?;
+                    let v = HeaderValue::from_bytes(value)
+                        .map_err(|_| format!("`{name}`'s value is not a field value"))?;
+                    lines.append(n, v);
+                    continue;
+                }
+            };
+            if !same {
+                return Err(format!(
+                    "the head's `{name}` line conflicts with gRPC's own: refused, never dropped"
+                ));
             }
-            let n = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| format!("`{name}` is not a field name"))?;
-            let v = HeaderValue::from_bytes(value)
-                .map_err(|_| format!("`{name}`'s value is not a field value"))?;
-            lines.append(n, v);
         }
         Ok((uri, lines))
     }
@@ -1065,7 +1099,7 @@ impl DialStream {
 }
 
 /// Fields this layer owns on a request, beside the hop-by-hop ones HTTP/2 forbids: a head block's
-/// own are dropped.
+/// line of one of these names that states other than gRPC writes refuses the stream (never dropped).
 const RESERVED_ON_REQUEST: &[&str] = &[
     "path",
     "method",

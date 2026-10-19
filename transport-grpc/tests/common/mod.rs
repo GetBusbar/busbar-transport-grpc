@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use busbar_contract::abi::host::service::{AuthRef, UnitRef};
+use busbar_contract::abi::host::service::{AuthRef, UnitRef, SCHEME_PLAIN};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_JSON,
@@ -235,6 +235,8 @@ pub struct Host {
     pub ticket: Ticket,
     /// The unit a dialled stream's `emit` names (`EmitIn::unit`).
     pub unit: UnitRef,
+    /// The scheme the host declares at `begin` (`BeginIn::scheme`, `SCHEME_*`).
+    pub scheme: u8,
     // Kept alive while the framer may read it.
     facts_text: String,
 }
@@ -317,6 +319,7 @@ impl Host {
             auth: AuthRef::NONE,
             ticket: Ticket::NONE,
             unit: UnitRef::NONE,
+            scheme: SCHEME_PLAIN,
             facts_text: String::new(),
         }
     }
@@ -554,6 +557,7 @@ impl Host {
         i.facts = &facts;
         i.points = self.points;
         i.auth = self.auth;
+        i.scheme = self.scheme;
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);

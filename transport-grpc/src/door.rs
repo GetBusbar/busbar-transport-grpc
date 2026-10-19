@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
 use busbar_contract::abi::auth::{FIELD_QUERY, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
-use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE};
+use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE, SCHEME_UNDECLARED};
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
@@ -119,6 +119,9 @@ struct Held {
     conn: Conn,
     /// The binding's auth handle (`BeginIn::auth`); NONE when the binding has no auth at the head.
     auth: AuthRef,
+    /// The upstream's scheme as the host declared it at `begin` (`BeginIn::scheme`, `SCHEME_*`):
+    /// copied into every request view the auth is called over.
+    scheme: u8,
 }
 
 /// The auth-call handles a dial issues on its op's ticket: the peer point's at `begin`, a stream's
@@ -376,6 +379,12 @@ slot!(
             return Outcome::Refused;
         }
         let now = i.sink.now_monotonic_ns;
+        // THE SCHEME IS THE HOST'S (`BeginIn::scheme`): declared on both sides, never derived
+        // from the dial; an undeclared one refuses the framing.
+        if i.scheme == SCHEME_UNDECLARED {
+            o.error("begin: the host declared no scheme");
+            return Outcome::Refused;
+        }
         let mut token = None;
         // The handle each stream's head is signed with: NONE when the binding signs no head.
         let mut auth = AuthRef::NONE;
@@ -461,7 +470,11 @@ slot!(
             }
         };
         let token = token.unwrap_or_else(|| inst.next.fetch_add(1, Ordering::Relaxed));
-        let held = Arc::new(Mutex::new(Held { conn, auth }));
+        let held = Arc::new(Mutex::new(Held {
+            conn,
+            auth,
+            scheme: i.scheme,
+        }));
         inst.framings
             .lock()
             .expect("framings")
@@ -504,7 +517,10 @@ slot!(
         let held = p
             .get()
             .and_then(|inst| inst.framings.lock().expect("framings").get(&i.framing).cloned());
-        let auth = held.as_ref().map_or(AuthRef::NONE, |h| h.lock().expect("framing").auth);
+        let (auth, scheme) = held.as_ref().map_or((AuthRef::NONE, SCHEME_UNDECLARED), |h| {
+            let h = h.lock().expect("framing");
+            (h.auth, h.scheme)
+        });
         if auth.is_none() {
             return with_then(
                 &p,
@@ -533,6 +549,7 @@ slot!(
                 authority: head.authority,
                 query: head.query,
                 fields: head.fields,
+                scheme,
             };
             let point = if body.is_some() { POINT_HEAD_BODY } else { POINT_HEAD };
             let called = services.auth_call::<Own>(
@@ -569,7 +586,9 @@ slot!(
             return Outcome::Failed;
         };
         let mut h = held.lock().expect("framing");
-        let taken = match h.conn.emit_signed(stream, bytes, end, deadline, now, &mut sign) {
+        // The opening body's length, where the host states it on the emit carrying the head.
+        let stated = (i.body_len_known == 1).then(|| usize::try_from(i.body_len).unwrap_or(usize::MAX));
+        let taken = match h.conn.emit_signed(stream, bytes, end, deadline, now, stated, &mut sign) {
             // PARKED: this op yields nothing until its resume; the stream's bytes are held.
             Poll::Pending => return Outcome::Pending,
             Poll::Ready(taken) => taken,

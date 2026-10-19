@@ -13,15 +13,17 @@ mod common;
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use busbar_contract::abi::auth::{FieldSpan, FIELD_SENSITIVE, POINT_FRAME, POINT_HEAD, POINT_PEER};
 use busbar_contract::abi::host::service::{
-    AuthAnswer, AuthCallIn, AuthRef, HostSlots, ServiceOut, UnitRef, FLOW_CONTINUE, SERVICES,
+    AuthAnswer, AuthCallIn, AuthRef, HostSlots, ServiceOut, UnitRef, FLOW_CONTINUE, SCHEME_PLAIN,
+    SCHEME_SECURE, SCHEME_UNDECLARED, SERVICES,
 };
 use busbar_contract::abi::mechanism::call::{Outcome, RawOutcome, Span};
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
-use busbar_contract::abi::transport::SIDE_DIAL;
+use busbar_contract::abi::transport::{SIDE_ACCEPT, SIDE_DIAL};
 
 use common::{linked, Host, ROOMY, SEC};
 
@@ -42,10 +44,19 @@ struct Seen {
     unit: UnitRef,
     conn: u64,
     stream: u64,
+    scheme: u8,
     names: Vec<String>,
 }
 
 static SEEN: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
+
+/// The stream whose head the host answers NOT READY the first time its handle is called (`0` =
+/// none), and the handles it pended: a resume on the same handle reads the stored answer.
+static PEND_STREAM: AtomicU64 = AtomicU64::new(0);
+static PENDED: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+
+/// The tests share the host's statics: one at a time.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// The host's `auth.call`: the handle verified FIRST (a stale or foreign one is REFUSED before
 /// any work); at the peer point a bare continue; at the head one credential line.
@@ -74,11 +85,22 @@ extern "C" fn auth_call(_ctx: HostCtx, input: *const c_void, out: *mut ServiceOu
             unit: i.unit,
             conn: i.conn,
             stream: i.stream,
+            scheme: i.request.scheme,
             names,
         });
         if i.auth != BOUND {
             (*out).outcome = RawOutcome::of(Outcome::Refused);
             return RawOutcome::of(Outcome::Refused);
+        }
+        let h = i.head.handle;
+        let key = (h.ticket.slot, h.ticket.generation, h.seq);
+        if i.point != POINT_PEER && i.stream == PEND_STREAM.load(Ordering::SeqCst) {
+            let mut pended = PENDED.lock().expect("pended");
+            if !pended.contains(&key) {
+                pended.push(key);
+                (*out).outcome = RawOutcome::of(Outcome::Pending);
+                return RawOutcome::of(Outcome::Pending);
+            }
         }
         let peer = i.point == POINT_PEER;
         let (name, value): (&[u8], &[u8]) = (b"authorization", b"Bearer bound");
@@ -170,6 +192,9 @@ fn calls() -> Vec<Seen> {
 /// with the stream's unit and the framing's connection, over gRPC's own lines.
 #[test]
 fn a_stale_or_foreign_ref_is_refused_and_the_bound_one_signs() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = calls();
 
     // THE PEER POINT: a stale or foreign ref refuses the connection at `begin`.
@@ -242,6 +267,9 @@ fn a_stale_or_foreign_ref_is_refused_and_the_bound_one_signs() {
 /// unsigned request never leaves.
 #[test]
 fn an_unknown_point_or_no_host_service_refuses_the_dial() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut h = bound(POINT_HEAD | POINT_FRAME, BOUND);
     assert_eq!(
         h.try_begin(SIDE_DIAL, "http://peer.test:50051", "", None),
@@ -257,4 +285,102 @@ fn an_unknown_point_or_no_host_service_refuses_the_dial() {
         Outcome::Refused
     );
     h.close();
+}
+
+/// How many HEADERS frames went out.
+fn heads_sent(wire: &[u8]) -> usize {
+    frames(wire).iter().filter(|(t, _)| *t == HEADERS).count()
+}
+
+/// A PENDING ANSWER PARKS ONLY ITS OWN STREAM, THROUGH THE DOOR (THE DESIGN §6 item 7; step 2's
+/// per-stream tickets): stream 1's `emit` crosses on its own ticket and answers PENDING, nothing of
+/// it going out; stream 3's `emit`, on another ticket, is signed and its HEADERS go out meanwhile;
+/// stream 1's resume (its ticket, no new bytes) reads the stored answer and its HEADERS follow.
+#[test]
+fn a_pending_auth_on_one_stream_does_not_hold_another_through_the_door() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = calls();
+    PEND_STREAM.store(1, Ordering::SeqCst);
+    let mut h = bound(POINT_HEAD, BOUND);
+    h.begin(SIDE_DIAL, "http://peer.test:50051", "", None);
+    let one = h.encode("/t.T/One", &[], b"1");
+    let three = h.encode("/t.T/Three", &[], b"3");
+    let ticket = |slot| Ticket {
+        slot,
+        generation: 1,
+    };
+
+    h.ticket = ticket(2);
+    assert_eq!(h.emit(1, &one, true, 30 * SEC), Outcome::Pending);
+    assert_eq!(
+        heads_sent(&h.wire_log),
+        0,
+        "nothing of a parked stream goes out"
+    );
+
+    h.ticket = ticket(3);
+    assert_eq!(h.emit(3, &three, true, 30 * SEC), Outcome::Ready);
+    assert_eq!(
+        heads_sent(&h.wire_log),
+        1,
+        "stream 3 went out while stream 1 is parked"
+    );
+    assert!(h.terminal(3).is_none(), "stream 3 is not failed");
+
+    // THE RESUME: stream 1's own ticket, no new bytes.
+    h.ticket = ticket(2);
+    assert_eq!(h.emit(1, &[], true, 30 * SEC), Outcome::Ready);
+    assert_eq!(
+        heads_sent(&h.wire_log),
+        2,
+        "stream 1's HEADERS follow its answer"
+    );
+    assert!(h.terminal(1).is_none(), "stream 1 is not failed");
+    let seen = calls();
+    let ones: Vec<&Seen> = seen.iter().filter(|c| c.stream == 1).collect();
+    assert_eq!(ones.len(), 2, "the call and its resume, on one handle");
+    assert_eq!(
+        ones[0].names, ones[1].names,
+        "the resume is called over the same head"
+    );
+    PEND_STREAM.store(0, Ordering::SeqCst);
+    h.close();
+}
+
+/// THE SCHEME IS THE HOST'S (step 2, `BeginIn::scheme`): the view the auth is called over carries
+/// the code the host declared at `begin`, never one the framer derives from its own dial (a
+/// cleartext target the host declares secure is signed as secure); an undeclared scheme refuses
+/// `begin` on either side, before anything is called or written.
+#[test]
+fn the_view_carries_the_hosts_scheme_and_a_zero_scheme_is_refused() {
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = calls();
+    for declared in [SCHEME_PLAIN, SCHEME_SECURE] {
+        let mut h = bound(POINT_HEAD, BOUND);
+        h.scheme = declared;
+        h.begin(SIDE_DIAL, "http://peer.test:50051", "", None);
+        let c = h.encode("/t.T/Unary", &[], b"q");
+        assert_eq!(h.emit(1, &c, true, 30 * SEC), Outcome::Ready);
+        let seen = calls();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].scheme, declared, "the host's code, as declared");
+        h.close();
+    }
+
+    for side in [SIDE_DIAL, SIDE_ACCEPT] {
+        let mut h = bound(POINT_HEAD, BOUND);
+        h.scheme = SCHEME_UNDECLARED;
+        assert_eq!(
+            h.try_begin(side, "http://peer.test:50051", "", None),
+            Outcome::Refused,
+            "side {side}: a zero scheme is refused at begin"
+        );
+        assert!(h.wire_log.is_empty(), "side {side}: nothing is written");
+        h.close();
+    }
+    assert!(calls().is_empty(), "nothing is called on a refused begin");
 }
