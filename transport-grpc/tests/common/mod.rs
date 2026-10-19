@@ -64,6 +64,7 @@ pub fn s(text: &str) -> AbiStr {
     AbiStr {
         ptr: text.as_ptr(),
         len: text.len(),
+        ..AbiStr::ZERO
     }
 }
 
@@ -264,6 +265,7 @@ impl Host {
             len: settings.len(),
             fmt: BLOB_JSON,
             flags: 0,
+            ..Blob::ZERO
         };
         let mut o: OpenOut = z();
         assert_eq!(
@@ -483,10 +485,12 @@ impl Host {
         i.final_message = Span {
             offset: 0,
             len: message.len() as u32,
+            ..Span::ZERO
         };
         i.final_details = Span {
             offset: message.len() as u32,
             len: details.len() as u32,
+            ..Span::ZERO
         };
         i.final_bytes = bytes.as_ptr();
         i.final_bytes_len = bytes.len();

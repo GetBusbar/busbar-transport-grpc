@@ -7,6 +7,9 @@ rust-version = "1.97"
 description = "The gRPC transport: gRPC calls over HTTP/2, dialled and accepted, as a sans-IO framer."
 license = "Apache-2.0"
 
+[lints]
+workspace = true
+
 [lib]
 name = "busbar_transport_grpc"
 path = "src/lib.rs"

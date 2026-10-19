@@ -40,6 +40,7 @@ pub(crate) const fn bytes_str(b: &'static [u8]) -> AbiStr {
     AbiStr {
         ptr: b.as_ptr(),
         len: b.len(),
+        ..AbiStr::ZERO
     }
 }
 
@@ -60,4 +61,5 @@ pub(crate) const CLAIMS: &[Claim] = &[Claim {
     unit0_trigger: UNIT0_FIRST_MESSAGE,
     status_at: STATUS_AT_TERMINAL,
     _reserved: 0,
+    ..Claim::ZERO
 }];

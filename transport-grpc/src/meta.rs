@@ -57,6 +57,7 @@ pub(crate) const fn row(lo: u32, hi: u32, class: u8) -> StatusRow {
         lo,
         hi,
         class: class as u32,
+        ..StatusRow::ZERO
     }
 }
 
@@ -106,6 +107,7 @@ const fn fault_row(code: u32, fault: u8) -> FaultRow {
         lo: code,
         hi: code,
         fault: fault as u32,
+        ..FaultRow::ZERO
     }
 }
 
@@ -147,24 +149,28 @@ pub(crate) const SETTINGS: &[SettingDecl] = &[
         kind: SETTING_COUNT,
         _reserved: 0,
         default: abi_str("300"),
+        ..SettingDecl::ZERO
     },
     SettingDecl {
         path: abi_str(setting::BODY_MAX_BYTES),
         kind: SETTING_COUNT,
         _reserved: 0,
         default: abi_str("33554432"),
+        ..SettingDecl::ZERO
     },
 ];
 
 pub(crate) const NONE: AbiStr = AbiStr {
     ptr: std::ptr::null(),
     len: 0,
+    ..AbiStr::ZERO
 };
 
 pub(crate) const TAIL: TransportTail = TransportTail {
     head: KindTailHead {
         size: std::mem::size_of::<TransportTail>() as u32,
         _reserved: 0,
+        ..KindTailHead::ZERO
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
@@ -188,4 +194,5 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     settings_len: SETTINGS.len(),
     fault_rows: FAULT_ROWS.as_ptr(),
     fault_rows_len: FAULT_ROWS.len(),
+    ..TransportTail::ZERO
 };

@@ -75,6 +75,7 @@ fn open(p: &Plugin<Transport>) {
         len: settings.len(),
         fmt: BLOB_JSON,
         flags: 0,
+        ..Blob::ZERO
     };
     let mut o: OpenOut = z();
     o.head = out_head();
@@ -94,6 +95,7 @@ fn script(p: &Plugin<Transport>) -> Script {
     i.target = AbiStr {
         ptr: target.as_ptr(),
         len: target.len(),
+        ..AbiStr::ZERO
     };
     (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
     (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
@@ -127,6 +129,7 @@ fn script(p: &Plugin<Transport>) -> Script {
     i.target = AbiStr {
         ptr: target.as_ptr(),
         len: target.len(),
+        ..AbiStr::ZERO
     };
     i.sink = FramerSink {
         wire: wire.as_mut_ptr(),
