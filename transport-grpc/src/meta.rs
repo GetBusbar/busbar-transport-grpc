@@ -11,8 +11,8 @@ use busbar_contract::abi::mechanism::door::KindTailHead;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::transport::{
     FaultRow, SettingDecl, StatusRow, TransportTail, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
-    FAULT_TRANSIENT, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT, STATUS_CALLER_FAULT,
-    STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
+    STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
 };
 
 /// This transport's key: the scheme it claims.
@@ -170,6 +170,8 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
+    frame_piece_size: FRAME_PIECE_SIZE,
+    _reserved: 0,
     composes_over: COMPOSES_OVER.as_ptr(),
     composes_over_len: COMPOSES_OVER.len(),
     claim_rows: crate::claims::CLAIMS.as_ptr(),

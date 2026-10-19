@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::hyper_io::{fill, Owed};
+use crate::hyper_io::{fill, mark_stream_full, Owed};
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
@@ -286,6 +286,7 @@ slot!(
                     .iter()
                     .map(|f| (f.field(|x| &x.name).bytes(), f.field(|x| &x.value).bytes())),
                 inst.posture.max_message_bytes,
+                i.sink.now_monotonic_ns,
             );
             let mut call = match opened {
                 Ok(call) => call,
@@ -367,9 +368,21 @@ slot!(
                 Ok(())
             });
         }
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| {
-            c.emit(i.stream, bytes, end, deadline, now)
-        })
+        // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
+        // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
+        let stream = i.stream;
+        with_then(
+            &p,
+            i.framing,
+            i.field(|x| &x.sink),
+            &mut o,
+            |c| c.emit(stream, bytes, end, deadline, now),
+            |c, o| {
+                if c.announce_full(stream) {
+                    mark_stream_full(o);
+                }
+            },
+        )
     }
 );
 
@@ -384,8 +397,8 @@ slot!(
         }
         let bytes = i.bytes();
         if let Some(call) = one_stream(&p, i.framing) {
-            let status = i.status;
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status));
+            let (status, head_sent) = (i.status, i.head_sent != 0);
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status, head_sent));
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| c.end_call(i.stream, bytes, i.status))
     }
@@ -395,7 +408,11 @@ slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
         if let Some(call) = one_stream(&p, i.framing) {
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+            let now = i.sink.now_monotonic_ns;
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+                c.expire(now);
+                Ok(())
+            });
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }
@@ -420,8 +437,13 @@ slot!(
             let answered = on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
                 c.finish(status, message, details)
             });
-            // A close the sink could not take whole stays until the host's re-call drains it.
-            if call.lock().expect("stream").wire_pending() {
+            // A close the sink could not take whole stays until the host's re-call drains it, and a
+            // close that failed stays for the host's fallback refusal to close the call.
+            let keep = {
+                let c = call.lock().expect("stream");
+                c.wire_pending() || !c.ended()
+            };
+            if keep {
                 if let Some(inst) = p.get() {
                     inst.calls.lock().expect("calls").insert(i.framing, call);
                 }
@@ -510,6 +532,18 @@ fn with(
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
+    with_then(p, token, sink, o, f, |_, _| {})
+}
+
+/// [`with`], then `then` on the framing and the answer, where the op answered READY.
+fn with_then(
+    p: &sdk::Instance<'_, Instance>,
+    token: u64,
+    sink: Lent<'_, FramerSink>,
+    o: &mut Out<'_, FramerOut>,
+    f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
+    then: impl FnOnce(&Conn, &mut Out<'_, FramerOut>),
+) -> Outcome {
     let held = p
         .get()
         .and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
@@ -518,7 +552,11 @@ fn with(
         return Outcome::Failed;
     };
     let mut h = held.lock().expect("framing");
-    step(&mut h, sink, o, f)
+    let outcome = step(&mut h, sink, o, f);
+    if matches!(outcome, Outcome::Ready) {
+        then(&h.conn, o);
+    }
+    outcome
 }
 
 fn step(

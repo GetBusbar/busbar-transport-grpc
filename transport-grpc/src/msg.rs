@@ -60,10 +60,22 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 pub enum Bad {
     /// A message is compressed, and no compression was agreed.
     Compressed,
-    /// A message is larger than the ceiling.
-    TooLarge(usize),
+    /// A message is larger than the ceiling: its stated length, and the ceiling.
+    TooLarge(usize, usize),
     /// The stream ended inside a message.
     Truncated,
+}
+
+impl Bad {
+    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message, as
+    /// predev's gRPC line answered it (ARCHITECT ruling: byte-equal to predev); `INTERNAL` else.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::TooLarge(..) => OUT_OF_RANGE,
+            Self::Compressed | Self::Truncated => INTERNAL,
+        }
+    }
 }
 
 impl std::fmt::Display for Bad {
@@ -72,7 +84,12 @@ impl std::fmt::Display for Bad {
             Self::Compressed => {
                 f.write_str("a message is compressed and no compression was agreed")
             }
-            Self::TooLarge(n) => write!(f, "a message of {n} bytes is over the ceiling"),
+            // Predev's words for it, byte-equal (tonic 0.14 `codec/decode.rs`), the limit being
+            // this door's ceiling (`limits.request_body_max_bytes`).
+            Self::TooLarge(n, limit) => write!(
+                f,
+                "Error, decoded message length too large: found {n} bytes, the limit is: {limit} bytes"
+            ),
             Self::Truncated => f.write_str("the stream ended inside a message"),
         }
     }
@@ -110,7 +127,7 @@ impl Messages {
             let n =
                 u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
             if n > self.max {
-                return Err(Bad::TooLarge(n));
+                return Err(Bad::TooLarge(n, self.max));
             }
             if self.buf.len() < PREFIX + n {
                 break;
@@ -201,6 +218,8 @@ pub const DEADLINE_EXCEEDED: u16 = 4;
 pub const PERMISSION_DENIED: u16 = 7;
 /// `RESOURCE_EXHAUSTED`.
 pub const RESOURCE_EXHAUSTED: u16 = 8;
+/// `OUT_OF_RANGE`.
+pub const OUT_OF_RANGE: u16 = 11;
 /// `UNIMPLEMENTED`.
 pub const UNIMPLEMENTED: u16 = 12;
 /// `INTERNAL`.
@@ -261,7 +280,12 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len());
     let mut i = 0;
     while i < v.len() {
-        if v[i] == b'%' && i + 2 < v.len() {
+        // Two ASCII hex digits, nothing else (`from_str_radix` alone also takes a sign).
+        if v[i] == b'%'
+            && i + 2 < v.len()
+            && v[i + 1].is_ascii_hexdigit()
+            && v[i + 2].is_ascii_hexdigit()
+        {
             let hex = std::str::from_utf8(&v[i + 1..i + 3]).ok();
             if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(b);
@@ -275,24 +299,11 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `text` as a `grpc-message` value: every byte outside printable ASCII, and `%`, percent-encoded.
-#[must_use]
-pub fn encode_message(text: &[u8]) -> String {
-    let mut out = String::with_capacity(text.len());
-    for &b in text {
-        if (0x20..=0x7e).contains(&b) && b != b'%' {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 // ── one stream's close (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────
 
 /// `text` as a `grpc-message` value in 1.5.5's bytes (tonic 0.14's `Status`, which 1.5.5's gRPC
-/// line answered with): every control byte, every byte past ASCII, and each of `` "#%<>`?{}`` and
+/// line answered with), for every `grpc-message` this door writes, on either accept side (spec
+/// ruling 2026-09-30: a refusal's trailers byte-equal to predev): every control byte, every byte past ASCII, and each of `` "#%<>`?{}`` and
 /// the space percent-encoded, upper-case hex; every other byte as it is.
 #[must_use]
 pub fn encode_status_message(text: &[u8]) -> String {

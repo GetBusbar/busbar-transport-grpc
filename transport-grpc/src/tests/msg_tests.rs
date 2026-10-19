@@ -57,7 +57,7 @@ fn a_compressed_flag_is_refused() {
 #[test]
 fn an_oversize_length_is_refused_before_the_body_arrives() {
     let mut m = Messages::new(4);
-    assert_eq!(m.push(&[0, 0, 0, 0, 5]), Err(Bad::TooLarge(5)));
+    assert_eq!(m.push(&[0, 0, 0, 0, 5]), Err(Bad::TooLarge(5, 4)));
     // exactly the ceiling is fine
     let mut ok = Messages::new(4);
     assert_eq!(ok.push(&frame(b"abcd")).unwrap().len(), 1);
@@ -183,6 +183,8 @@ fn a_percent_escape_is_decoded() {
     assert_eq!(decode_message(b"a%20b"), b"a b");
     assert_eq!(decode_message(b"%20"), b" ");
     assert_eq!(decode_message(b"%C3%A9"), "é".as_bytes());
+    // A signed escape is malformed and stays as it was sent.
+    assert_eq!(decode_message(b"a%+fb"), b"a%+fb");
 }
 
 #[test]
@@ -193,18 +195,18 @@ fn a_malformed_or_cut_escape_stays_as_sent() {
 }
 
 #[test]
-fn encoding_escapes_controls_percent_and_non_ascii() {
-    assert_eq!(encode_message(b"plain text"), "plain text");
-    assert_eq!(encode_message(b"a\r\nb"), "a%0D%0Ab");
-    assert_eq!(encode_message(b"100%"), "100%25");
-    assert_eq!(encode_message("é".as_bytes()), "%C3%A9");
-    assert_eq!(encode_message(&[0x7f]), "%7F");
+fn encoding_escapes_controls_percent_space_and_non_ascii() {
+    assert_eq!(encode_status_message(b"plain text"), "plain%20text");
+    assert_eq!(encode_status_message(b"a\r\nb"), "a%0D%0Ab");
+    assert_eq!(encode_status_message(b"100%"), "100%25");
+    assert_eq!(encode_status_message("é".as_bytes()), "%C3%A9");
+    assert_eq!(encode_status_message(&[0x7f]), "%7F");
 }
 
 #[test]
 fn an_encoded_message_decodes_back_to_the_original() {
     let text = "bad \"req\": 100% \u{1F600} é\r\n\t\0".as_bytes();
-    assert_eq!(decode_message(encode_message(text).as_bytes()), text);
+    assert_eq!(decode_message(encode_status_message(text).as_bytes()), text);
 }
 
 // ── content type ─────────────────────────────────────────────────────────────────────────────────

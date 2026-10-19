@@ -721,3 +721,240 @@ fn ended_streams_are_remembered_as_runs() {
     e.insert(u64::MAX);
     assert!(e.contains(u64::MAX) && !e.contains(u64::MAX - 1));
 }
+
+// ── a stream's own backpressure ──────────────────────────────────────────────────────────────────
+
+/// The answer bytes an accepted call still queues for the far end, framer-side (not yet taken by
+/// the HTTP/2 connection, which takes them only as the far end grants room).
+fn queued_answer(c: &Conn, stream: u64) -> usize {
+    let super::Side::Accept(a) = &c.side else {
+        panic!("an accepted connection");
+    };
+    a.calls
+        .iter()
+        .find(|(id, _)| *id == stream)
+        .map_or(0, |(_, s)| {
+            s.reply
+                .chan
+                .0
+                .lock()
+                .expect("chan")
+                .frames
+                .iter()
+                .filter_map(|f| f.data_ref().map(bytes::Bytes::len))
+                .sum()
+        })
+}
+
+/// AN ANSWER THE FAR END NEVER READS IS BOUNDED. The client half-closed its call and then grants
+/// no room (no WINDOW_UPDATE), while the host keeps emitting the answer: the framer holds at most
+/// its bound for the stream, and a host that emits past it hears the stream fail
+/// `RESOURCE_EXHAUSTED` (the transport ABI's "A STREAM'S OWN BACKPRESSURE": "A host that keeps
+/// emitting past the mark is the framer's to bound: it may fail the stream"). RED before the fix:
+/// every emitted message waited in an unbounded queue behind the shut window.
+#[test]
+fn an_answer_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    let m = msg::frame(&[7u8; 60_000]);
+    let (mut most, mut got) = (0, Vec::new());
+    for _ in 0..200 {
+        // Once the stream failed, an emit on it is the host's late one: dropped or refused.
+        let _ = a.emit(1, &m, false, 0, 5 * SEC);
+        a.drive(5 * SEC);
+        drop(a.take_wire(usize::MAX));
+        got.extend(a.pieces().drain(..));
+        most = most.max(queued_answer(&a, 1));
+    }
+    assert!(
+        most <= 3 << 20,
+        "the framer held {most} bytes for a stream nobody reads"
+    );
+    let t = terminal(&got, 1).expect("the host hears the stream fail");
+    assert!(t.failed, "the stream failed: {t:?}");
+    assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
+}
+
+/// A FULL STREAM IS SAID, AND SO IS ITS DRAIN. The host emits an answer the far end grants no room
+/// for, until an emit leaves the queue at its high-water mark: that emit is answered full
+/// (`YIELD_STREAM_FULL`, which the door sets from [`Conn::announce_full`]), and nothing fails. Once
+/// the far end opens its windows and the queue drains to its low-water mark, the stream hands one
+/// writable piece (`PIECE_WRITABLE`), and only then.
+#[test]
+fn a_full_answer_is_announced_and_its_drain_hands_one_writable_piece() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    let m = msg::frame(&[7u8; 60_000]);
+    let mut got = Vec::new();
+    let mut full = false;
+    for _ in 0..40 {
+        a.emit(1, &m, false, 0, 5 * SEC).expect("a message");
+        a.drive(5 * SEC);
+        drop(a.take_wire(usize::MAX));
+        got.extend(a.pieces().drain(..));
+        if a.announce_full(1) {
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "the queue reached its high-water mark");
+    assert!(
+        queued_answer(&a, 1) >= super::STREAM_HIGH_WATER,
+        "full means at the mark"
+    );
+    assert!(
+        got.iter().all(|p| !p.writable && !p.failed),
+        "no writable piece and no failure before the drain: {got:?}"
+    );
+    // The far end opens the connection's window and the stream's.
+    let room = (1u32 << 30).to_be_bytes();
+    let mut wire = h2(8, 0, 0, &room);
+    wire.extend(h2(8, 0, 1, &room));
+    a.ingest(&wire, false);
+    for _ in 0..100 {
+        a.drive(5 * SEC);
+        drop(a.take_wire(usize::MAX));
+        got.extend(a.pieces().drain(..));
+    }
+    assert!(queued_answer(&a, 1) <= super::STREAM_LOW_WATER, "drained");
+    let writable: Vec<_> = got.iter().filter(|p| p.writable).collect();
+    assert_eq!(writable.len(), 1, "one writable piece: {got:?}");
+    assert_eq!(writable[0].stream, 1);
+    assert!(writable[0].bytes.is_empty());
+    assert!(!a.announce_full(1), "no longer full");
+}
+
+/// The request bytes a dialled call still queues for the far end, framer-side.
+fn queued_request(c: &Conn, stream: u64) -> usize {
+    let super::Side::Dial(d) = &c.side else {
+        panic!("a dialled connection");
+    };
+    d.calls
+        .iter()
+        .find(|(id, _)| *id == stream)
+        .map_or(0, |(_, s)| {
+            s.chan
+                .0
+                .lock()
+                .expect("chan")
+                .frames
+                .iter()
+                .filter_map(|f| f.data_ref().map(bytes::Bytes::len))
+                .sum()
+        })
+}
+
+/// The same bound on a dialled call: an upload whose far end grants no room (its SETTINGS and
+/// nothing more) is held to the bound, and fails `RESOURCE_EXHAUSTED` past it. RED before the fix.
+#[test]
+fn an_upload_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Upload")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"first"));
+    d.emit(1, &c, false, 0, now).expect("open the call");
+    let (mut most, mut got) = (0, Vec::new());
+    let turn = |d: &mut Conn, got: &mut Vec<Piece>| {
+        d.drive(now);
+        drop(d.take_wire(usize::MAX));
+        got.extend(d.pieces().drain(..));
+    };
+    turn(&mut d, &mut got);
+    // The far end's SETTINGS and the ACK of ours: the call goes out, and no window ever opens.
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut got);
+    let m = msg::frame(&[7u8; 60_000]);
+    for _ in 0..200 {
+        let _ = d.emit(1, &m, false, 0, now);
+        turn(&mut d, &mut got);
+        most = most.max(queued_request(&d, 1));
+    }
+    assert!(
+        most <= 3 << 20,
+        "the framer held {most} bytes for an upload nobody reads"
+    );
+    let t = terminal(&got, 1).expect("the host hears the stream fail");
+    assert!(t.failed, "the stream failed: {t:?}");
+    assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
+}
+
+// ── a refusal's bytes ────────────────────────────────────────────────────────────────────────────
+
+/// The `grpc-message` an accepted call's end carries, as it goes on the wire: in the head of a
+/// trailers-only answer, or in the trailers after one.
+fn sent_message(c: &Conn, stream: u64) -> Option<Vec<u8>> {
+    let super::Side::Accept(a) = &c.side else {
+        panic!("an accepted connection");
+    };
+    let (_, s) = a.calls.iter().find(|(id, _)| *id == stream)?;
+    if let Some((_, h)) = s.reply.state.lock().expect("reply").head.as_ref() {
+        if let Some(v) = h.get(msg::GRPC_MESSAGE) {
+            return Some(v.as_bytes().to_vec());
+        }
+    }
+    let st = s.reply.chan.0.lock().expect("chan");
+    st.frames
+        .iter()
+        .filter_map(|f| f.trailers_ref())
+        .find_map(|t| t.get(msg::GRPC_MESSAGE))
+        .map(|v| v.as_bytes().to_vec())
+}
+
+/// A REFUSAL'S `grpc-message` IS PREDEV'S BYTES. A refusal naming no `grpc-status` ends the call
+/// with its neutral status mapped and predev's words, percent-encoded as predev's gRPC line
+/// (tonic 0.14's `Status`) encoded them: the space and each of `"#%<>`?{}` beside the controls
+/// (spec ruling 2026-09-30: "the grpc transport maps it to grpc-status/trailers byte-equal to
+/// predev"). Both shapes: trailers-only, and trailers after the answer's head. RED before the fix:
+/// the space went out as it was.
+#[test]
+fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
+    let mut a = half_closed();
+    a.end_call(1, b"", 413).expect("refuse");
+    assert_eq!(
+        sent_message(&a, 1).as_deref(),
+        Some(&b"busbar%20answered%20HTTP%20413"[..]),
+        "trailers-only"
+    );
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    a.end_call(1, b"", 401).expect("refuse");
+    assert_eq!(
+        sent_message(&a, 1).as_deref(),
+        Some(&b"busbar%20answered%20HTTP%20401"[..]),
+        "trailers after the head"
+    );
+}
+
+// ── an oversize message ──────────────────────────────────────────────────────────────────────────
+
+/// AN OVERSIZE MESSAGE FAILS `OUT_OF_RANGE` IN PREDEV'S WORDS. A call whose message states a length
+/// past the ceiling (`limits.request_body_max_bytes`) fails `OUT_OF_RANGE` (code 11) with tonic
+/// 0.14's text, the limit it reports being that ceiling: predev's gRPC line answered it so, and a
+/// gRPC line's refusal is byte-equal to predev (ARCHITECT ruling on this finding). Both ends see
+/// it: the accepted side's failure piece, and the dialled side's trailers and decoded message. RED
+/// before the fix: INTERNAL, with this framer's own words.
+#[test]
+fn an_oversize_message_fails_out_of_range_in_predevs_words() {
+    let mut p = Pair::new();
+    let limit = posture().max_message_bytes;
+    let over = u32::try_from(limit + 1).expect("small");
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Big")], Some(5)).expect("head");
+    c.push(0);
+    c.extend_from_slice(&over.to_be_bytes());
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    p.settle();
+    let words = format!(
+        "Error, decoded message length too large: found {over} bytes, the limit is: {limit} bytes"
+    );
+    let a = terminal(&p.got_a, 1).expect("the accepted side fails it");
+    assert!(a.failed, "{a:?}");
+    assert_eq!(a.status, Some(11), "OUT_OF_RANGE");
+    assert_eq!(a.bytes.as_ref(), words.as_bytes());
+    let t = terminal(&p.got_d, 1).expect("the dialled side's trailers");
+    assert_eq!(t.status, Some(11), "OUT_OF_RANGE");
+    let end = last(&p.got_d, 1).expect("terminal");
+    assert!(end.failed);
+    assert_eq!(end.bytes.as_ref(), words.as_bytes());
+}
