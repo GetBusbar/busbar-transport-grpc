@@ -347,7 +347,7 @@ impl Host {
         let mut o: LocateOut = z();
         let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
         let offer = p[..o.alpn_written as usize].to_vec();
-        check_locate(r, &o, 256, 256, 64, &offer).expect("locate passes the kind's check");
+        check_locate(r, &o, 256, 256, 64, &offer, 0).expect("locate passes the kind's check");
         if r != Outcome::Ready {
             return Err(r);
         }
