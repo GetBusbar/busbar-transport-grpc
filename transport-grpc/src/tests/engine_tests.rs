@@ -8,8 +8,11 @@ use std::time::Duration;
 
 use crate::hyper_io::{Owed, Piece};
 
-use super::{Conn, Posture};
+use std::task::Poll;
+
+use super::{AuthLine, Conn, Failure, Posture, RequestHead, SignAt};
 use crate::msg;
+use zeroize::Zeroizing;
 
 const SEC: u64 = 1_000_000_000;
 
@@ -957,4 +960,370 @@ fn an_oversize_message_fails_out_of_range_in_predevs_words() {
     let end = last(&p.got_d, 1).expect("terminal");
     assert!(end.failed);
     assert_eq!(end.bytes.as_ref(), words.as_bytes());
+}
+
+// ── the binding's auth (ruling 23) ───────────────────────────────────────────────────────────────
+
+/// What the binding's auth answers.
+type Answer = Poll<Result<Vec<AuthLine>, Failure>>;
+
+/// A field line the auth answers.
+fn line(name: &str, value: &[u8]) -> AuthLine {
+    AuthLine {
+        name: name.into(),
+        value: Zeroizing::new(value.to_vec()),
+        query: false,
+    }
+}
+
+/// A query key the auth answers.
+fn key(name: &str, value: &[u8]) -> AuthLine {
+    AuthLine {
+        query: true,
+        ..line(name, value)
+    }
+}
+
+/// What the auth was called over, owned: method, path, query, authority, and the field lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Called {
+    method: String,
+    target: String,
+    query: Option<String>,
+    authority: String,
+    fields: Vec<(String, Vec<u8>)>,
+}
+
+fn called(h: &RequestHead<'_>) -> Called {
+    Called {
+        method: h.method.into(),
+        target: h.target.into(),
+        query: h.query.map(Into::into),
+        authority: h.authority.into(),
+        fields: h
+            .fields
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), v.to_vec()))
+            .collect(),
+    }
+}
+
+impl Pair {
+    /// A pair whose dialled side's binding has an auth at `at`.
+    fn signed(at: SignAt) -> Self {
+        let mut p = Self::new();
+        p.d = Conn::dial("http://peer.test:50051", posture(), p.now)
+            .expect("dial")
+            .signing(at);
+        p
+    }
+}
+
+/// Every field line the far end's HTTP/2 decoded off request `n`'s HEADERS frame, in order.
+fn wire_lines(p: &Pair, n: usize) -> Vec<(String, Vec<u8>)> {
+    p.a.seen()[n]
+        .2
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_vec()))
+        .collect()
+}
+
+/// RULING 23 (nothing is added to a head after its auth runs): the binding's auth is called ONCE
+/// per stream over the request exactly as HTTP/2 encodes it — its pseudo-fields and every line,
+/// gRPC's own (`content-type`, `te`, `grpc-timeout`) among them — and what the far end decodes off
+/// the wire is exactly that head with the auth's answer applied: its lines FIRST among the field
+/// lines (the 1.5.5 HTTP/2 egress head's order), replacing every line of their name, its query key
+/// joining `:path`'s query. Nothing the auth did not see goes out, and the auth sees nothing that
+/// does not. RED before the fix: the auth was never called, and its answer never reached the wire.
+#[test]
+fn an_auth_that_signs_the_whole_head_sees_every_byte_on_the_wire_and_nothing_more() {
+    let mut p = Pair::signed(SignAt::Head);
+    let c = call(
+        "/pkg.Svc/Say?a=1&sig=old",
+        &[("x-plane", b"1"), ("x-sig", b"stale"), ("x-plane", b"2")],
+        &[b"hello"],
+    );
+    let mut seen = Vec::new();
+    let mut sign = |h: &RequestHead<'_>, body: Option<&[u8]>| -> Answer {
+        assert!(body.is_none(), "the head point signs no body");
+        seen.push(called(h));
+        Poll::Ready(Ok(vec![
+            line("Authorization", b"Bearer t"),
+            line("x-sig", b"signed"),
+            key("sig", b"q1"),
+        ]))
+    };
+    assert_eq!(
+        p.d.emit_signed(1, &c, true, 0, p.now, &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(seen.len(), 1, "the auth is called once");
+    let auth = &seen[0];
+    assert_eq!(auth.method, "POST");
+    assert_eq!(auth.target, "/pkg.Svc/Say");
+    assert_eq!(auth.query.as_deref(), Some("a=1&sig=old"));
+    assert_eq!(auth.authority, "peer.test:50051");
+    let names: Vec<&str> = auth.fields.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "content-type",
+            "te",
+            "grpc-timeout",
+            "x-plane",
+            "x-plane",
+            "x-sig"
+        ],
+        "gRPC's own lines are signed with the head block's"
+    );
+
+    // The far end decoded exactly one request: the signed head.
+    assert_eq!(p.a.seen().len(), 1);
+    let (method, uri, _) = &p.a.seen()[0];
+    assert_eq!(method.as_str(), auth.method);
+    assert_eq!(uri.scheme_str(), Some("http"), "the dial's own scheme");
+    assert_eq!(
+        uri.authority().map(|a| a.as_str()),
+        Some(auth.authority.as_str())
+    );
+    assert_eq!(uri.path(), auth.target);
+    assert_eq!(
+        uri.query(),
+        Some("a=1&sig=q1"),
+        "the auth's key replaced its pair"
+    );
+    let mut expected = vec![
+        ("authorization".to_owned(), b"Bearer t".to_vec()),
+        ("x-sig".to_owned(), b"signed".to_vec()),
+    ];
+    expected.extend(auth.fields.iter().filter(|(n, _)| n != "x-sig").cloned());
+    assert_eq!(
+        wire_lines(&p, 0),
+        expected,
+        "every line on the wire is one the auth signed, or its own answer, first"
+    );
+
+    // The call goes on: its message reaches the far end whole.
+    let a = frames(&p.got_a, 1);
+    assert_eq!(a[0], msg::frame(b"hello").as_slice());
+}
+
+/// AT THE BODY POINT the head waits for the whole body (its length from the head: `body_len`), and
+/// the auth signs exactly the body the far end receives.
+#[test]
+fn an_auth_at_the_body_point_signs_the_whole_body_the_wire_carries() {
+    let mut p = Pair::signed(SignAt::HeadBody);
+    let body: Vec<u8> = [&b"one"[..], b"two"]
+        .iter()
+        .flat_map(|m| msg::frame(m))
+        .collect();
+    let head = msg::render_head(&[("path", b"/pkg.Svc/Up")], Some(body.len())).expect("head");
+    let mut bodies = Vec::new();
+    let mut sign = |_: &RequestHead<'_>, b: Option<&[u8]>| -> Answer {
+        bodies.push(b.map(<[u8]>::to_vec));
+        Poll::Ready(Ok(vec![line("x-body-sig", b"s")]))
+    };
+    // The head and the first message: the body is not whole, so nothing is signed or sent.
+    let first = [head.as_slice(), &body[..8]].concat();
+    assert_eq!(
+        p.d.emit_signed(1, &first, false, 0, p.now, &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert!(p.a.seen().is_empty(), "no HEADERS before the body is whole");
+    // The rest: now the auth signs the whole body, and the request goes out.
+    assert_eq!(
+        p.d.emit_signed(1, &body[8..], true, 0, p.now, &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(
+        bodies,
+        vec![Some(body.clone())],
+        "called once, over the whole body"
+    );
+    assert_eq!(
+        wire_lines(&p, 0)[0],
+        ("x-body-sig".to_owned(), b"s".to_vec())
+    );
+    let got: Vec<u8> = frames(&p.got_a, 1).concat();
+    assert_eq!(
+        got, body,
+        "the far end receives exactly the body the auth signed"
+    );
+}
+
+/// A PENDING ANSWER PARKS ONLY ITS OWN STREAM (THE DESIGN §6 item 7): stream 1's auth pends and
+/// nothing of it goes out; stream 2, on the same connection, is signed, sent and answered
+/// meanwhile; stream 1's resume (the same op, the same bytes, later on the clock) re-issues the
+/// call over the SAME head, and its request goes out once, its body taken once.
+#[test]
+fn a_pending_auth_on_stream_1_does_not_block_stream_2() {
+    let mut p = Pair::signed(SignAt::Head);
+    let one = call("/pkg.Svc/One", &[], &[b"1"]);
+    let two = call("/pkg.Svc/Two", &[], &[b"2"]);
+
+    let mut heads = Vec::new();
+    let mut pending = |h: &RequestHead<'_>, _: Option<&[u8]>| -> Answer {
+        heads.push(called(h));
+        Poll::Pending
+    };
+    assert!(p
+        .d
+        .emit_signed(1, &one, true, 0, p.now, &mut pending)
+        .is_pending());
+    p.settle();
+    assert!(p.a.seen().is_empty(), "nothing of a parked stream goes out");
+
+    let mut ready = |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer {
+        Poll::Ready(Ok(vec![line("authorization", b"two")]))
+    };
+    assert_eq!(
+        p.d.emit_signed(2, &two, true, 0, p.now, &mut ready),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(
+        p.a.seen().len(),
+        1,
+        "stream 2 went out while stream 1 is parked"
+    );
+    assert_eq!(p.a.seen()[0].1.path(), "/pkg.Svc/Two");
+    // The far end answers stream 2 (its first call), and the dialled side hears it whole.
+    p.a.emit(1, b"\r\n", false, 0, p.now).expect("answer head");
+    p.a.end_call(1, b"grpc-status: 0\r\n", 0).expect("end");
+    p.settle();
+    assert_eq!(
+        terminal(&p.got_d, 2).and_then(|t| t.status),
+        Some(0),
+        "stream 2 completed while stream 1 is parked"
+    );
+    assert!(
+        terminal(&p.got_d, 1).is_none(),
+        "stream 1 is parked, not failed"
+    );
+
+    // THE RESUME: later on the clock, the same bytes; the same head is offered.
+    p.now += SEC;
+    let mut resumed = |h: &RequestHead<'_>, _: Option<&[u8]>| -> Answer {
+        heads.push(called(h));
+        Poll::Ready(Ok(vec![line("authorization", b"one")]))
+    };
+    assert_eq!(
+        p.d.emit_signed(1, &one, true, 0, p.now, &mut resumed),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(heads.len(), 2);
+    assert_eq!(heads[0], heads[1], "the resume signs the same head");
+    assert_eq!(p.a.seen().len(), 2);
+    assert_eq!(p.a.seen()[1].1.path(), "/pkg.Svc/One");
+    assert_eq!(
+        wire_lines(&p, 1)[0],
+        ("authorization".to_owned(), b"one".to_vec())
+    );
+    let a = frames(&p.got_a, 2);
+    assert_eq!(
+        a,
+        vec![msg::frame(b"1").as_slice(), &b""[..]],
+        "its message once, then its end"
+    );
+}
+
+/// A REFUSED HANDLE (a stale or foreign ref the host refuses), a stop, or an answer the request
+/// cannot carry refuses THE STREAM: it fails, its HEADERS never go out, and the connection carries
+/// its other streams on.
+#[test]
+fn a_refused_auth_or_an_answer_the_request_cannot_carry_refuses_the_stream() {
+    let refusals: Vec<(Answer, u16)> = vec![
+        (
+            Poll::Ready(Err(Failure("the host refused a stale ref".into()))),
+            16,
+        ),
+        (
+            Poll::Ready(Err(Failure("the auth stopped the request".into()))),
+            16,
+        ),
+        (Poll::Ready(Ok(vec![line("x-sig", b"a\r\nx-evil: 1")])), 13),
+        (Poll::Ready(Ok(vec![line("te", b"gzip")])), 13),
+        (
+            Poll::Ready(Ok(vec![line("content-type", b"text/plain")])),
+            13,
+        ),
+        (Poll::Ready(Ok(vec![line("grpc-timeout", b"1S")])), 13),
+        (Poll::Ready(Ok(vec![line(":path", b"/elsewhere")])), 13),
+        (Poll::Ready(Ok(vec![line("connection", b"close")])), 13),
+        (Poll::Ready(Ok(vec![key("sig", b"a#b")])), 13),
+        (Poll::Ready(Ok(vec![key("a=b", b"c")])), 13),
+    ];
+    for (n, (answer, code)) in refusals.into_iter().enumerate() {
+        let mut p = Pair::signed(SignAt::Head);
+        let mut once = Some(answer);
+        let mut sign =
+            |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer { once.take().expect("called once") };
+        let c = call("/pkg.Svc/Say", &[], &[b"q"]);
+        assert_eq!(
+            p.d.emit_signed(1, &c, true, 0, p.now, &mut sign),
+            Poll::Ready(Ok(())),
+            "case {n}"
+        );
+        p.settle();
+        assert!(
+            p.a.seen().is_empty(),
+            "case {n}: no HEADERS for a refused stream"
+        );
+        let t = terminal(&p.got_d, 1).expect("the refused stream ends");
+        assert!(t.failed, "case {n}");
+        assert_eq!(t.status, Some(code), "case {n}");
+
+        // The connection carries on.
+        let mut fine =
+            |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer { Poll::Ready(Ok(vec![])) };
+        assert_eq!(
+            p.d.emit_signed(3, &c, true, 0, p.now, &mut fine),
+            Poll::Ready(Ok(()))
+        );
+        p.settle();
+        assert_eq!(p.a.seen().len(), 1, "case {n}: the next stream goes out");
+    }
+}
+
+/// THE AUTH'S PLACE IS THE 1.5.5 HTTP/2 EGRESS HEAD'S (busbar's golden cell
+/// `egress.auth__h2__bearer`, read at the pin from `BUSBAR_GOLDEN_DIR`): the pseudo-fields, then
+/// the auth's line, then every other line. This framer's signed head puts it there too.
+#[test]
+fn the_auth_lines_lead_the_field_lines_as_the_1_5_5_h2_golden_orders_them() {
+    let dir = std::env::var("BUSBAR_GOLDEN_DIR")
+        .expect("BUSBAR_GOLDEN_DIR names busbar's golden cells at the pin");
+    let path = std::path::Path::new(&dir).join("1.5.5/cells/egress.auth__h2__bearer.json");
+    let cell: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("the golden cell")).expect("JSON");
+    let names: Vec<&str> = cell["body"]["json"]["upstream"][0]["headers"]
+        .as_array()
+        .expect("the upstream head's lines")
+        .iter()
+        .map(|l| l[0].as_str().expect("a name"))
+        .collect();
+    let first = names
+        .iter()
+        .position(|n| !n.starts_with(':'))
+        .expect("a field line");
+    assert!(names[..first].iter().all(|n| n.starts_with(':')));
+    assert_eq!(
+        names[first], "authorization",
+        "1.5.5: the auth's line leads the field lines: {names:?}"
+    );
+
+    let mut p = Pair::signed(SignAt::Head);
+    let c = call("/pkg.Svc/Say", &[("x-plane", b"1")], &[b"q"]);
+    let mut sign = |_: &RequestHead<'_>, _: Option<&[u8]>| -> Answer {
+        Poll::Ready(Ok(vec![line("authorization", b"Bearer t")]))
+    };
+    assert_eq!(
+        p.d.emit_signed(1, &c, true, 0, p.now, &mut sign),
+        Poll::Ready(Ok(()))
+    );
+    p.settle();
+    assert_eq!(wire_lines(&p, 0)[0].0, names[first]);
 }

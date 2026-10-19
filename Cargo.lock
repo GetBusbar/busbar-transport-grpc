@@ -152,7 +152,7 @@ dependencies = [
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=4aadbe5ec4d49d24caf1da663e1d6455cef328ec#4aadbe5ec4d49d24caf1da663e1d6455cef328ec"
+source = "git+https://github.com/GetBusbar/busbar?rev=958aa1e8834902035e117f6ebbf0590156fe8aca#958aa1e8834902035e117f6ebbf0590156fe8aca"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=4aadbe5ec4d49d24caf1da663e1d6455cef328ec#4aadbe5ec4d49d24caf1da663e1d6455cef328ec"
+source = "git+https://github.com/GetBusbar/busbar?rev=958aa1e8834902035e117f6ebbf0590156fe8aca#958aa1e8834902035e117f6ebbf0590156fe8aca"
 dependencies = [
  "busbar-contract",
  "ed25519-dalek",
@@ -211,6 +211,7 @@ dependencies = [
  "tokio-rustls",
  "tonic",
  "tower",
+ "zeroize",
 ]
 
 [[package]]
