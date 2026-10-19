@@ -116,3 +116,15 @@ fn a_bare_http_answers_fault_is_its_status_read_by_the_1_5_5_bands() {
         assert_eq!(fault_of_http(s), v155(s), "HTTP {s}");
     }
 }
+
+/// THE OPS IT DECLARES (L1): accept and dial, and nothing else. A zero declares nothing, so a
+/// tail that dropped a bit would stop declaring an op this framer serves; one that stated detach or
+/// adopt would declare a hand-off gRPC over HTTP/2 never makes (RFC 9113 §8.6).
+#[test]
+fn the_tail_declares_accept_and_dial_and_no_hand_off() {
+    use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
+    assert_eq!(TAIL.facts & FACT_ACCEPTS, FACT_ACCEPTS, "it accepts");
+    assert_eq!(TAIL.facts & FACT_DIALS, FACT_DIALS, "it dials");
+    assert_eq!(TAIL.facts & (FACT_DETACHES | FACT_ADOPTS), 0, "no hand-off");
+    assert_eq!(check_tail(&TAIL), Ok(()));
+}
