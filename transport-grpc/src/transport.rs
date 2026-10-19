@@ -22,6 +22,15 @@
 //! with its HTTP status mapped the way gRPC maps it. At the deadline the stream is reset and fails
 //! `DEADLINE_EXCEEDED`.
 //!
+//! SIGNED (ruling 23: nothing is added to a head after its auth runs). A dialled connection whose
+//! binding has an auth at the head ([`Conn::signing`]) builds each stream's request whole —
+//! `:method`, `:scheme`, `:authority`, `:path`, then `content-type`, `te`, `grpc-timeout` and the
+//! head block's lines — and calls the auth over exactly that ([`RequestHead`]; at
+//! [`SignAt::HeadBody`] over the whole body too, the head waiting for it). Its answer goes first
+//! among the field lines, replacing every line of its name, and its query keys join `:path`'s query
+//! ([`signed_request`]); the request goes to HTTP/2 as it stands, and nothing is added after. A
+//! pending answer parks that stream alone ([`Conn::emit_signed`]).
+//!
 //! ACCEPTED. Each call the far end opens is a stream: its head (a field block, with the call's
 //! method, target and authority in the stream's head slots, never as fields), one frame per
 //! message, and the end piece (`PIECE_END`) when the far end has sent its last. `te` is checked as 1.5.5's
@@ -56,6 +65,8 @@ use hyper::client::conn::http2 as client;
 use hyper::rt::{Executor, Sleep};
 use hyper::server::conn::http2 as server;
 
+use zeroize::Zeroizing;
+
 use crate::msg::{self, Head, Messages};
 
 /// The connection posture every framing carries.
@@ -76,6 +87,62 @@ pub struct Posture {
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure(pub String);
+
+// ── the binding's auth (ruling 23) ───────────────────────────────────────────────────────────────
+
+/// Where a dialled connection's binding auth is called on each stream's request
+/// (`BeginIn::points`): over the head, or over the head and the whole body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignAt {
+    /// `POINT_HEAD`.
+    Head,
+    /// `POINT_HEAD_BODY`.
+    HeadBody,
+}
+
+/// THE REQUEST HEAD AS IT GOES ON THE WIRE, before the auth's answer joins it: what the binding's
+/// auth is called over, borrowed from the request HTTP/2 encodes. `:method` is `method`, `:path`
+/// is `target` (and `?query`), `:authority` is `authority`; `fields` are every other line, in the
+/// order the HEADERS frame carries them. `:scheme` is the binding's target's own.
+pub struct RequestHead<'a> {
+    /// The method: gRPC's is always `POST`.
+    pub method: &'a str,
+    /// The path, without its query.
+    pub target: &'a str,
+    /// The query, without `?`; `None` = none.
+    pub query: Option<&'a str>,
+    /// The authority.
+    pub authority: &'a str,
+    /// Every field line, in wire order: gRPC's own (`content-type`, `te`, `grpc-timeout`), then
+    /// the head block's.
+    pub fields: &'a [(&'a str, &'a [u8])],
+}
+
+/// One line the binding's auth answered: a field line of the head, or (`query`) a key of the
+/// path's query. Its value is credential material, wiped when dropped.
+pub struct AuthLine {
+    /// The name.
+    pub name: String,
+    /// The value.
+    pub value: Zeroizing<Vec<u8>>,
+    /// A query key, never a field line.
+    pub query: bool,
+}
+
+/// The binding's auth, called once per stream over its request exactly as it goes on the wire
+/// (and, at [`SignAt::HeadBody`], its whole body). [`Poll::Pending`]: the answer is not ready (the
+/// host stores it on the call's handle); the stream parks and the same call is made again when the
+/// op resumes. An error refuses the stream.
+pub type Signer<'s> =
+    &'s mut dyn FnMut(&RequestHead<'_>, Option<&[u8]>) -> Poll<Result<Vec<AuthLine>, Failure>>;
+
+/// Why a dialled stream failed at its `emit`: the reason, and the gRPC status it ends with.
+type StreamFault = (String, u16);
+
+/// The framing's own failures end a stream `INTERNAL`.
+fn internal(why: impl Into<String>) -> StreamFault {
+    (why.into(), msg::INTERNAL)
+}
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -333,8 +400,20 @@ impl Conn {
                 base,
                 calls: Vec::new(),
                 ended: Ended::default(),
+                sign_at: None,
             }),
         })
+    }
+
+    /// This dialled connection's binding has an auth at the head (`BeginIn::points`): every
+    /// stream's request is signed at `at` before its HEADERS go out (ruling 23). A no-op on an
+    /// accepted connection.
+    #[must_use]
+    pub fn signing(mut self, at: SignAt) -> Self {
+        if let Side::Dial(d) = &mut self.side {
+            d.sign_at = Some(at);
+        }
+        self
     }
 
     /// Open an accepted connection, at host time `now_ns`.
@@ -372,6 +451,8 @@ impl Conn {
             side: Side::Accept(Accept {
                 arrivals,
                 calls: Vec::new(),
+                #[cfg(test)]
+                seen: Vec::new(),
             }),
         }
     }
@@ -395,6 +476,39 @@ impl Conn {
         deadline_ns: u64,
         now_ns: u64,
     ) -> Result<(), Failure> {
+        // A connection whose binding has no auth never calls one.
+        let mut unsigned =
+            |_: &RequestHead<'_>, _: Option<&[u8]>| -> Poll<Result<Vec<AuthLine>, Failure>> {
+                Poll::Ready(Err(Failure(
+                    "the binding's auth has no caller on this emit".into(),
+                )))
+            };
+        match self.emit_signed(stream, bytes, end, deadline_ns, now_ns, &mut unsigned) {
+            Poll::Ready(r) => r,
+            Poll::Pending => Ok(()),
+        }
+    }
+
+    /// [`Conn::emit`] on a connection whose binding may have an auth at the head
+    /// ([`Conn::signing`]): a dialled stream's request is built whole, `sign` is called over it
+    /// exactly as it goes on the wire, and only then is it queued (ruling 23). [`Poll::Pending`]:
+    /// the auth's answer is not ready; THIS STREAM parks (its bytes taken, its head built and
+    /// kept, so the answer that comes back signs these bytes), every other stream on the
+    /// connection keeps flowing, and the resumed `emit` on it (the same op, the same bytes)
+    /// re-issues the same call.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conn::emit`].
+    pub fn emit_signed(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        deadline_ns: u64,
+        now_ns: u64,
+        sign: Signer<'_>,
+    ) -> Poll<Result<(), Failure>> {
         // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
         // the bytes: every step below is idempotent on it.
         let max = self.posture.max_message_bytes.saturating_add(64 * 1024);
@@ -406,7 +520,7 @@ impl Conn {
                 if d.ended.contains(stream) {
                     // LATE: the stream already ended (an early answer, a failure, its deadline).
                     // Its terminal piece is out; these bytes have nowhere to go.
-                    return Ok(());
+                    return Poll::Ready(Ok(()));
                 }
                 let timer = self.io.timer();
                 let fallback = now_ns.saturating_add(
@@ -426,11 +540,17 @@ impl Conn {
                     }
                 };
                 let base = d.base.clone();
+                let at = d.sign_at;
                 let s = &mut d.calls[idx].1;
-                if let Err(why) = s.take(&base, bytes, end, now_ns, max) {
+                let taken = match s.take(&base, bytes, end, now_ns, max, at, sign) {
+                    // PARKED: this stream alone waits for its auth's answer.
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(taken) => taken,
+                };
+                if let Err((why, code)) = taken {
                     s.stage = DStage::Done;
                     self.out.push_back(Piece {
-                        status: Some(msg::INTERNAL),
+                        status: Some(code),
                         ..Piece::failure(stream, &why)
                     });
                 } else if s.chan.queued() > bound {
@@ -443,19 +563,19 @@ impl Conn {
                     });
                 }
                 d.sweep();
-                Ok(())
+                Poll::Ready(Ok(()))
             }
             Side::Accept(a) => {
                 let Some((_, s)) = a.calls.iter_mut().find(|(s, _)| *s == stream) else {
-                    return Err(Failure(format!("no such stream: {stream}")));
+                    return Poll::Ready(Err(Failure(format!("no such stream: {stream}"))));
                 };
                 if bytes.is_empty() || s.reply_over {
-                    return Ok(());
+                    return Poll::Ready(Ok(()));
                 }
                 if !s.head_sent {
                     s.head_buf.extend_from_slice(bytes);
                     match msg::read_head(&s.head_buf, max) {
-                        Ok(None) => return Ok(()),
+                        Ok(None) => return Poll::Ready(Ok(())),
                         Err(why) => {
                             s.fail_reply(msg::INTERNAL, why.as_bytes());
                             // The stream ends once, and the host learns it, as the over-bound
@@ -464,7 +584,7 @@ impl Conn {
                                 status: Some(msg::INTERNAL),
                                 ..Piece::failure(stream, &why)
                             });
-                            return Ok(());
+                            return Poll::Ready(Ok(()));
                         }
                         Ok(Some((head, took))) => {
                             let rest = s.head_buf.split_off(took);
@@ -489,7 +609,7 @@ impl Conn {
                         ..Piece::failure(stream, OVER_BOUND)
                     });
                 }
-                Ok(())
+                Poll::Ready(Ok(()))
             }
         }
     }
@@ -580,6 +700,15 @@ impl Conn {
         }
     }
 
+    /// Every request an accepted connection's far end sent, as HTTP/2 decoded it off the wire.
+    #[cfg(test)]
+    pub(crate) fn seen(&self) -> &[(http::Method, http::Uri, HeaderMap)] {
+        match &self.side {
+            Side::Accept(a) => &a.seen,
+            Side::Dial(_) => &[],
+        }
+    }
+
     /// Why this framing failed, once it has.
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
@@ -597,6 +726,8 @@ struct Dial {
     /// Streams that have ended (their terminal piece is out). An `emit` on one is late and is
     /// dropped: it never opens a second call under the same stream.
     ended: Ended,
+    /// Where the binding's auth signs each stream's request; `None` = the binding has none.
+    sign_at: Option<SignAt>,
 }
 
 /// A set of stream ids kept as runs: `start -> end` (inclusive) for each run of consecutive ids. A
@@ -654,6 +785,8 @@ impl Dial {
 enum DStage {
     /// The head block, still arriving.
     Head(Vec<u8>),
+    /// The request built whole, waiting for the binding's auth (ruling 23).
+    Signing(Box<Signing>),
     /// A request, waiting for the connection to take it.
     Queued(Request<ChanBody>),
     /// Sent; waiting for the answer's head.
@@ -664,6 +797,22 @@ enum DStage {
     Done,
 }
 
+/// A dialled stream's request, built whole and waiting for its binding's auth: the head exactly as
+/// it goes on the wire, and the body taken meanwhile.
+struct Signing {
+    /// `:scheme`, `:authority` and `:path` (with its query).
+    uri: http::Uri,
+    /// Every other line, in the order the HEADERS frame carries them.
+    lines: HeaderMap,
+    /// The body taken while the head waits (at [`SignAt::HeadBody`], the whole of it).
+    body: Vec<u8>,
+    /// The body is whole: its stated length is in, or a frame ended a body of none.
+    whole: bool,
+    /// The auth's answer pended: the next `emit` on this stream is the op's resume, re-issuing the
+    /// same call; its bytes were taken already.
+    parked: bool,
+}
+
 struct DialStream {
     stage: DStage,
     chan: Chan,
@@ -671,6 +820,13 @@ struct DialStream {
     left: Option<usize>,
     deadline_ns: u64,
     sleep: Pin<Box<dyn Sleep>>,
+}
+
+/// THE OPENING BODY'S LENGTH, where the emit carrying the head states it: the one place the
+/// framer reads it. The head block's `content-length` (`encode` writes the length of the message
+/// stream it renders); a streamed body states none.
+fn body_len(head: &Head) -> Option<usize> {
+    head.content_length
 }
 
 impl DialStream {
@@ -688,7 +844,9 @@ impl DialStream {
         matches!(self.stage, DStage::Done)
     }
 
-    /// Take `bytes` the host emitted on this stream.
+    /// Take `bytes` the host emitted on this stream. With `at` (the binding's auth at the head),
+    /// the request's HEADERS wait for `sign`'s answer; [`Poll::Pending`] parks this stream.
+    #[allow(clippy::too_many_arguments)]
     fn take(
         &mut self,
         base: &str,
@@ -696,29 +854,68 @@ impl DialStream {
         end: bool,
         now_ns: u64,
         max: usize,
-    ) -> Result<(), String> {
+        at: Option<SignAt>,
+        sign: Signer<'_>,
+    ) -> Poll<Result<(), StreamFault>> {
         let body: Vec<u8> = match &mut self.stage {
             DStage::Head(buf) => {
                 buf.extend_from_slice(bytes);
-                let Some((head, took)) = msg::read_head(buf, max)? else {
+                let read = match msg::read_head(buf, max) {
+                    Ok(read) => read,
+                    Err(why) => return Poll::Ready(Err(internal(why))),
+                };
+                let Some((head, took)) = read else {
                     if end {
-                        return Err("the frame ended inside the head block".into());
+                        return Poll::Ready(Err(internal("the frame ended inside the head block")));
                     }
-                    return Ok(());
+                    return Poll::Ready(Ok(()));
                 };
                 let rest = buf.split_off(took);
-                let req = self.request(base, &head, now_ns)?;
-                self.left = head.content_length;
-                self.stage = DStage::Queued(req);
-                rest
+                let (uri, lines) = match self.head_lines(base, &head, now_ns) {
+                    Ok(built) => built,
+                    Err(why) => return Poll::Ready(Err(internal(why))),
+                };
+                self.left = body_len(&head);
+                let Some(at) = at else {
+                    self.stage = DStage::Queued(self.request(uri, lines));
+                    return Poll::Ready(self.queue(rest, end));
+                };
+                self.stage = DStage::Signing(Box::new(Signing {
+                    uri,
+                    lines,
+                    body: Vec::new(),
+                    whole: false,
+                    parked: false,
+                }));
+                if let Err(fault) = self.hold(&rest, end, max) {
+                    return Poll::Ready(Err(fault));
+                }
+                return self.sign(at, sign);
             }
-            DStage::Done => return Ok(()),
+            DStage::Signing(s) => {
+                // A PARKED stream's emit is its op's resume: the same bytes, taken already.
+                if !s.parked {
+                    if let Err(fault) = self.hold(bytes, end, max) {
+                        return Poll::Ready(Err(fault));
+                    }
+                }
+                return self.sign(at.unwrap_or(SignAt::Head), sign);
+            }
+            DStage::Done => return Poll::Ready(Ok(())),
             _ => bytes.to_vec(),
         };
+        Poll::Ready(self.queue(body, end))
+    }
+
+    /// Queue body bytes for the far end, counting them against the head's stated length; the
+    /// last one ends the request.
+    fn queue(&mut self, body: Vec<u8>, end: bool) -> Result<(), StreamFault> {
         if !body.is_empty() {
             if let Some(left) = self.left.as_mut() {
                 if body.len() > *left {
-                    return Err("more message bytes than the head's content-length".into());
+                    return Err(internal(
+                        "more message bytes than the head's content-length",
+                    ));
                 }
                 *left -= body.len();
             }
@@ -731,12 +928,101 @@ impl DialStream {
         Ok(())
     }
 
-    fn request(&self, base: &str, head: &Head, now_ns: u64) -> Result<Request<ChanBody>, String> {
+    /// Hold body bytes that arrive while the head waits for its auth, counted as [`Self::queue`]
+    /// counts them, and bounded: a body the auth signs is held whole.
+    fn hold(&mut self, bytes: &[u8], end: bool, max: usize) -> Result<(), StreamFault> {
+        let DStage::Signing(s) = &mut self.stage else {
+            return Ok(());
+        };
+        if let Some(left) = self.left.as_mut() {
+            if bytes.len() > *left {
+                return Err(internal(
+                    "more message bytes than the head's content-length",
+                ));
+            }
+            *left -= bytes.len();
+        }
+        s.body.extend_from_slice(bytes);
+        if s.body.len() > max {
+            return Err((
+                "the body the binding's auth signs is past its bound".into(),
+                msg::RESOURCE_EXHAUSTED,
+            ));
+        }
+        s.whole |= self.left == Some(0) || (end && self.left.is_none());
+        Ok(())
+    }
+
+    /// CALL THE BINDING'S AUTH over the request as built (ruling 23): once the body it signs is
+    /// whole, over exactly the lines HTTP/2 encodes; its answer joins the head
+    /// ([`signed_request`]) and the request is queued, the body held meanwhile behind it. Nothing
+    /// is added after. A pending answer parks this stream; a stop, a refusal, or an answer the
+    /// request cannot carry fails it, and its HEADERS never go out.
+    fn sign(&mut self, at: SignAt, sign: Signer<'_>) -> Poll<Result<(), StreamFault>> {
+        let DStage::Signing(s) = &mut self.stage else {
+            return Poll::Ready(Ok(()));
+        };
+        if at == SignAt::HeadBody && !s.whole {
+            // The auth signs the whole body: the head waits for the rest of it.
+            return Poll::Ready(Ok(()));
+        }
+        let called = {
+            let fields: Vec<(&str, &[u8])> = s
+                .lines
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_bytes()))
+                .collect();
+            let head = RequestHead {
+                method: "POST",
+                target: s.uri.path(),
+                query: s.uri.query(),
+                authority: s.uri.authority().map_or("", http::uri::Authority::as_str),
+                fields: &fields,
+            };
+            let body = (at == SignAt::HeadBody).then_some(s.body.as_slice());
+            sign(&head, body)
+        };
+        let answer = match called {
+            Poll::Pending => {
+                s.parked = true;
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(Failure(why))) => {
+                return Poll::Ready(Err((why, msg::UNAUTHENTICATED)));
+            }
+            Poll::Ready(Ok(answer)) => answer,
+        };
+        let (uri, lines) = match signed_request(&s.uri, &s.lines, &answer) {
+            Ok(signed) => signed,
+            Err(why) => return Poll::Ready(Err(internal(why))),
+        };
+        let held = std::mem::take(&mut s.body);
+        let whole = s.whole;
+        self.stage = DStage::Queued(self.request(uri, lines));
+        if !held.is_empty() {
+            self.chan.push(Frame::data(Bytes::from(held)));
+        }
+        if whole {
+            // The request's last byte: END_STREAM follows it.
+            self.chan.end();
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// The request's target and lines, gRPC's own first, as HTTP/2 encodes them.
+    fn head_lines(
+        &self,
+        base: &str,
+        head: &Head,
+        now_ns: u64,
+    ) -> Result<(http::Uri, HeaderMap), String> {
         let path = head.get("path").ok_or("the head names no path")?;
         if !path.starts_with(b"/") {
             return Err("the head's path is not absolute".into());
         }
-        let uri = format!("{base}{}", String::from_utf8_lossy(path));
+        let uri: http::Uri = format!("{base}{}", String::from_utf8_lossy(path))
+            .parse()
+            .map_err(|_| "request: the head's path is not a target")?;
         let content_type = match head.get("content-type") {
             Some(ct) if msg::is_grpc_content_type(ct) => {
                 HeaderValue::from_bytes(ct).map_err(|_| "content-type is not a field value")?
@@ -744,14 +1030,15 @@ impl DialStream {
             Some(_) => return Err("content-type is not a gRPC content type".into()),
             None => HeaderValue::from_static(msg::CONTENT_TYPE),
         };
-        let mut b = Request::builder()
-            .method(http::Method::POST)
-            .uri(uri)
-            .version(http::Version::HTTP_2)
-            .header(http::header::CONTENT_TYPE, content_type)
-            .header(http::header::TE, "trailers");
+        let mut lines = HeaderMap::new();
+        lines.append(http::header::CONTENT_TYPE, content_type);
+        lines.append(http::header::TE, HeaderValue::from_static("trailers"));
         let left = Duration::from_nanos(self.deadline_ns.saturating_sub(now_ns));
-        b = b.header(msg::GRPC_TIMEOUT, msg::timeout_value(left));
+        lines.append(
+            msg::GRPC_TIMEOUT,
+            HeaderValue::from_str(&msg::timeout_value(left))
+                .map_err(|_| "grpc-timeout is not a field value")?,
+        );
         for (name, value) in &head.fields {
             if RESERVED_ON_REQUEST.contains(&name.as_str()) || hop_by_hop(name, []) {
                 continue;
@@ -760,10 +1047,20 @@ impl DialStream {
                 .map_err(|_| format!("`{name}` is not a field name"))?;
             let v = HeaderValue::from_bytes(value)
                 .map_err(|_| format!("`{name}`'s value is not a field value"))?;
-            b = b.header(n, v);
+            lines.append(n, v);
         }
-        b.body(self.chan.body())
-            .map_err(|e| format!("request: {e}"))
+        Ok((uri, lines))
+    }
+
+    /// The request HTTP/2 encodes: `:method` `POST`, `:scheme`, `:authority` and `:path` from
+    /// `uri`, then `lines` in their order, and nothing else.
+    fn request(&self, uri: http::Uri, lines: HeaderMap) -> Request<ChanBody> {
+        let mut req = Request::new(self.chan.body());
+        *req.method_mut() = http::Method::POST;
+        *req.uri_mut() = uri;
+        *req.version_mut() = http::Version::HTTP_2;
+        *req.headers_mut() = lines;
+        req
     }
 }
 
@@ -778,6 +1075,98 @@ const RESERVED_ON_REQUEST: &[&str] = &[
     "content-length",
     "host",
 ];
+
+/// Whether an auth's answer may carry a field line of `name` (lowercase): never one of gRPC's own
+/// (its pseudo-fields, `content-type`, `te`, a `grpc-` line), nor one HTTP/2 forbids.
+fn auth_may_carry(name: &str) -> bool {
+    !(name.starts_with(':')
+        || name == "te"
+        || name.starts_with("grpc-")
+        || RESERVED_ON_REQUEST.contains(&name)
+        || hop_by_hop(name, []))
+}
+
+/// A query key or value an auth answered: visible ASCII that neither ends the path (`#`, a space)
+/// nor splits its pairs (`&`); a key carries no `=` and is not empty.
+fn query_safe(bytes: &[u8], key: bool) -> bool {
+    (!key || !bytes.is_empty())
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_graphic() && b != b'#' && b != b'&' && !(key && b == b'='))
+}
+
+/// THE SIGNED REQUEST (ruling 23): `uri` and `lines` are the request exactly as the auth was
+/// called over it; each field line it answers goes FIRST among the field lines (the 1.5.5 HTTP/2
+/// egress head's order, `egress.auth__h2__bearer`: the pseudo-fields, the auth's lines, then the
+/// rest), replacing every line of the same name; each query key it answers joins the path's query,
+/// replacing any pair of the same key. Nothing else is added. A line or key the request cannot
+/// carry refuses the stream.
+fn signed_request(
+    uri: &http::Uri,
+    lines: &HeaderMap,
+    answer: &[AuthLine],
+) -> Result<(http::Uri, HeaderMap), String> {
+    let cannot =
+        |what: &str| format!("the binding's auth answered {what} the request cannot carry");
+    let mut signed = HeaderMap::new();
+    let mut keys: Vec<(&str, &[u8])> = Vec::new();
+    for line in answer {
+        if line.query {
+            if !query_safe(line.name.as_bytes(), true) || !query_safe(&line.value, false) {
+                return Err(cannot("a query key"));
+            }
+            keys.push((line.name.as_str(), line.value.as_slice()));
+            continue;
+        }
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(line.name.as_bytes()),
+            HeaderValue::from_bytes(&line.value),
+        ) else {
+            return Err(cannot("a line"));
+        };
+        if !auth_may_carry(name.as_str()) {
+            return Err(cannot("a line of gRPC's own"));
+        }
+        signed.append(name, value);
+    }
+    for (name, value) in lines {
+        let replaced = answer
+            .iter()
+            .any(|l| !l.query && l.name.eq_ignore_ascii_case(name.as_str()));
+        if !replaced {
+            signed.append(name.clone(), value.clone());
+        }
+    }
+    if keys.is_empty() {
+        return Ok((uri.clone(), signed));
+    }
+    let mut target = uri.path().to_owned();
+    let mut sep = '?';
+    for pair in uri.query().into_iter().flat_map(|q| q.split('&')) {
+        let key = pair.split('=').next().unwrap_or(pair);
+        if keys.iter().any(|(k, _)| *k == key) {
+            continue;
+        }
+        target.push(sep);
+        target.push_str(pair);
+        sep = '&';
+    }
+    for (key, value) in &keys {
+        target.push(sep);
+        target.push_str(key);
+        target.push('=');
+        target.push_str(&String::from_utf8_lossy(value));
+        sep = '&';
+    }
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        target
+            .parse::<http::uri::PathAndQuery>()
+            .map_err(|_| cannot("a query key"))?,
+    );
+    let uri = http::Uri::from_parts(parts).map_err(|_| cannot("a query key"))?;
+    Ok((uri, signed))
+}
 
 impl Dial {
     fn step(
@@ -827,7 +1216,7 @@ fn advance(
     }
     loop {
         match &mut s.stage {
-            DStage::Head(_) | DStage::Done => return Ok(()),
+            DStage::Head(_) | DStage::Signing(_) | DStage::Done => return Ok(()),
             DStage::Queued(_) => {
                 let Some(snd) = sender.as_mut() else {
                     return Ok(());
@@ -1026,6 +1415,10 @@ impl Drop for ReplyFut {
 struct Accept {
     arrivals: Arc<Mutex<Arrivals>>,
     calls: Vec<(u64, AStream)>,
+    /// Every request the far end sent, as HTTP/2 decoded it off the wire: method, URI and every
+    /// field line in order (a test reads what a dialled head carried).
+    #[cfg(test)]
+    seen: Vec<(http::Method, http::Uri, HeaderMap)>,
 }
 
 struct AStream {
@@ -1107,6 +1500,12 @@ impl Accept {
             .drain(..)
             .collect();
         for (id, req, reply) in new {
+            #[cfg(test)]
+            self.seen.push((
+                req.method().clone(),
+                req.uri().clone(),
+                req.headers().clone(),
+            ));
             let ct = req.headers().get(http::header::CONTENT_TYPE).cloned();
             let Some(ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
                 // Not a gRPC call: answered here, never handed up.

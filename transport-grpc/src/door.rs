@@ -27,22 +27,40 @@
 //! What a stream carries each way, and how `grpc-status` reaches the host (the terminal piece's
 //! code, in the `grpc` numbering this door's status rows class), is the framer's module note (`transport.rs`).
 //!
-//! No op pends. Every slot is a `SafeSlot` on the SDK's safe surface: this crate holds no `unsafe`.
+//! THE BINDING'S AUTH (ruling 23; `BeginIn::points`, `BeginIn::auth`). A dial whose binding has an
+//! auth calls it through the host (`Services::auth_call`, the host services `open` was handed):
+//! at `POINT_PEER` once per connection, at `begin`, before any stream, where only a continue goes
+//! on; at `POINT_HEAD` / `POINT_HEAD_BODY` once per stream, at the `emit` that completes its
+//! request, over exactly the head HTTP/2 encodes, with the stream's unit (`EmitIn::unit`). Its answer
+//! joins the head and nothing is added after (`transport::signed_request`). An auth call that is
+//! not ready answers PENDING: `begin` keeps nothing but its framing's token, and an `emit` parks only
+//! its own stream (`transport::Conn::emit_signed`); the resumed op re-issues the same handle and
+//! reads the stored answer. A point this framer does not serve, a host that serves no auth call, a
+//! stop, a refused handle (a stale or foreign ref) or an answer the request cannot carry refuses the
+//! connection at `begin` or the stream at `emit`: an unsigned request never leaves.
+//!
+//! Only `begin` and `emit` pend, and only on that auth call. Every slot is a `SafeSlot` on the SDK's
+//! safe surface: this crate holds no `unsafe`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
+use busbar_contract::abi::auth::{FIELD_QUERY, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
+use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE};
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
 };
+use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::life::Refusal;
+use busbar_contract::abi::sdk::services::{HeadViewArgs, Services};
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -56,7 +74,11 @@ use busbar_contract::transport::registry::{
 
 use crate::msg;
 use crate::stream::StreamCall;
-use crate::transport::{self, Conn, Posture};
+use crate::transport::{self, AuthLine, Conn, Posture, RequestHead, SignAt};
+
+// This crate's own seal over what the binding's auth answers (`Services::auth_call`): the auth
+// fields joining a dialled head are credential material, held as this crate's own secret.
+busbar_contract::own_seal!(Own);
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
@@ -84,11 +106,51 @@ pub struct Instance {
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
     calls: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
     next: AtomicU64,
+    /// The host services `open` was handed (`OpenIn::host`): the binding's auth a dial calls.
+    /// `None`: the host offers none, and a dial whose binding has an auth is refused.
+    services: Option<Services>,
+    /// Dials whose peer-point auth call pended, by the op's ticket: the op's deadline and the
+    /// framing token the call named, so the resumed `begin` names the same connection.
+    begun: Mutex<HashMap<Ticket, (u64, u64)>>,
 }
 
 /// One framing.
 struct Held {
     conn: Conn,
+    /// The binding's auth handle (`BeginIn::auth`); NONE when the binding has no auth at the head.
+    auth: AuthRef,
+}
+
+/// The auth-call handles a dial issues on its op's ticket: the peer point's at `begin`, a stream's
+/// head at `emit` (each op's handles are its own: a new op on the ticket starts them again).
+const SEQ_PEER: u32 = 1;
+/// See [`SEQ_PEER`].
+const SEQ_HEAD: u32 = 2;
+
+/// The completion handle `seq` on `ticket`.
+const fn handle(ticket: Ticket, seq: u32) -> CompletionHandle {
+    CompletionHandle {
+        ticket,
+        seq,
+        _reserved: 0,
+    }
+}
+
+impl Instance {
+    /// The framing token a dial's `begin` names: the one its pended peer call named, on a resume;
+    /// a fresh one otherwise.
+    fn token_for(&self, ticket: Ticket) -> u64 {
+        let resumed = self.begun.lock().expect("begun").remove(&ticket);
+        resumed.map_or_else(|| self.next.fetch_add(1, Ordering::Relaxed), |(_, t)| t)
+    }
+
+    /// Keep a pended `begin`'s token under its ticket, dropping every one whose op's deadline has
+    /// passed (its op will never resume).
+    fn park_begin(&self, ticket: Ticket, deadline: u64, now: u64, token: u64) {
+        let mut begun = self.begun.lock().expect("begun");
+        begun.retain(|_, (d, _)| *d == 0 || *d > now);
+        begun.insert(ticket, (deadline, token));
+    }
 }
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
@@ -167,11 +229,14 @@ slot!(
     Open, OpenIn, OpenOut, |instance, i, o| {
         match read_settings(i.field(|x| &x.settings).bytes()) {
             Ok(posture) => {
+                let services = i.host().and_then(|h| Services::of(&h));
                 instance.open(Instance {
                     posture,
                     framings: Mutex::new(HashMap::new()),
                     calls: Mutex::new(HashMap::new()),
                     next: AtomicU64::new(1),
+                    services,
+                    begun: Mutex::new(HashMap::new()),
                 });
                 Outcome::Ready
             }
@@ -189,7 +254,8 @@ slot!(
 );
 
 slot!(
-    /// `cancel`: no framer op pends, so nothing is ever in flight to cancel.
+    /// `cancel`: only an auth call pends (a dial's `begin`, a stream's `emit`), and nothing of it
+    /// has moved: a parked stream's HEADERS never went out.
     Cancel, CancelIn, CancelOut, |_, _, o| {
         o.set(|x| &x.disposition, CANCEL_NOTHING_MOVED);
         Outcome::Ready
@@ -310,14 +376,78 @@ slot!(
             return Outcome::Refused;
         }
         let now = i.sink.now_monotonic_ns;
+        let mut token = None;
+        // The handle each stream's head is signed with: NONE when the binding signs no head.
+        let mut auth = AuthRef::NONE;
         let conn = match i.side {
             SIDE_DIAL => {
                 let Ok(target) = std::str::from_utf8(i.field(|x| &x.target).bytes()) else {
                     o.error("begin: the target is not text");
                     return Outcome::Failed;
                 };
+                let sign_at = if i.points == 0 {
+                    None
+                } else {
+                    // THE BINDING'S AUTH (ruling 23): its points, its handle, through the host.
+                    if i.points & !(POINT_PEER | POINT_HEAD | POINT_HEAD_BODY) != 0 {
+                        o.error("begin: the binding's auth needs a point this framer does not serve");
+                        return Outcome::Refused;
+                    }
+                    if i.auth.is_none() {
+                        o.error("begin: the binding names auth points and no auth handle");
+                        return Outcome::Refused;
+                    }
+                    let Some(services) = inst.services.as_ref() else {
+                        o.error("begin: the binding has an auth and the host serves no auth call");
+                        return Outcome::Refused;
+                    };
+                    let ticket = i.head.ticket;
+                    let t = inst.token_for(ticket);
+                    token = Some(t);
+                    if i.points & POINT_PEER != 0 {
+                        // ONCE PER CONNECTION, before any stream: only a continue goes on.
+                        let peer = services.auth_call::<Own>(
+                            handle(ticket, SEQ_PEER),
+                            i.auth,
+                            UnitRef::NONE,
+                            POINT_PEER,
+                            t,
+                            0,
+                            &HeadViewArgs::default(),
+                            None,
+                        );
+                        match peer {
+                            Poll::Pending => {
+                                inst.park_begin(ticket, i.head.deadline_ns, now, t);
+                                return Outcome::Pending;
+                            }
+                            // The peer rule: a continue with no field and no name beside it.
+                            Poll::Ready(Ok(called))
+                                if called.flow == FLOW_CONTINUE
+                                    && called.fields.is_empty()
+                                    && called.names.is_empty() => {}
+                            Poll::Ready(_) => {
+                                o.error("begin: the binding's auth refused the connection");
+                                return Outcome::Refused;
+                            }
+                        }
+                    }
+                    if i.points & POINT_HEAD_BODY != 0 {
+                        Some(SignAt::HeadBody)
+                    } else if i.points & POINT_HEAD != 0 {
+                        Some(SignAt::Head)
+                    } else {
+                        None
+                    }
+                };
                 match Conn::dial(target, inst.posture, now) {
-                    Ok(c) => c,
+                    Ok(c) => match sign_at {
+                        Some(at) => {
+                            auth = i.auth;
+                            c.signing(at)
+                        }
+                        None => c,
+                    },
                     Err(_) => {
                         o.error("begin: the target is not a URL");
                         return Outcome::Failed;
@@ -330,8 +460,8 @@ slot!(
                 return Outcome::Failed;
             }
         };
-        let token = inst.next.fetch_add(1, Ordering::Relaxed);
-        let held = Arc::new(Mutex::new(Held { conn }));
+        let token = token.unwrap_or_else(|| inst.next.fetch_add(1, Ordering::Relaxed));
+        let held = Arc::new(Mutex::new(Held { conn, auth }));
         inst.framings
             .lock()
             .expect("framings")
@@ -371,18 +501,84 @@ slot!(
         // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
         // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
         let stream = i.stream;
-        with_then(
-            &p,
-            i.framing,
-            i.field(|x| &x.sink),
-            &mut o,
-            |c| c.emit(stream, bytes, end, deadline, now),
-            |c, o| {
-                if c.announce_full(stream) {
-                    mark_stream_full(o);
-                }
-            },
-        )
+        let held = p
+            .get()
+            .and_then(|inst| inst.framings.lock().expect("framings").get(&i.framing).cloned());
+        let auth = held.as_ref().map_or(AuthRef::NONE, |h| h.lock().expect("framing").auth);
+        if auth.is_none() {
+            return with_then(
+                &p,
+                i.framing,
+                i.field(|x| &x.sink),
+                &mut o,
+                |c| c.emit(stream, bytes, end, deadline, now),
+                announce_full(stream),
+            );
+        }
+        // THE BINDING'S AUTH AT THE HEAD (ruling 23): called over this stream's request as it goes
+        // on the wire, with the stream's unit, on this op's ticket.
+        let services = p.get().and_then(|inst| inst.services);
+        let (ticket, unit, conn) = (i.head.ticket, i.unit, i.framing);
+        let mut sign = |head: &RequestHead<'_>,
+                        body: Option<&[u8]>|
+         -> Poll<Result<Vec<AuthLine>, transport::Failure>> {
+            let Some(services) = services.as_ref() else {
+                return Poll::Ready(Err(transport::Failure(
+                    "emit: the binding has an auth and the host serves no auth call".into(),
+                )));
+            };
+            let view = HeadViewArgs {
+                method: head.method,
+                target: head.target,
+                authority: head.authority,
+                query: head.query,
+                fields: head.fields,
+            };
+            let point = if body.is_some() { POINT_HEAD_BODY } else { POINT_HEAD };
+            let called = services.auth_call::<Own>(
+                handle(ticket, SEQ_HEAD),
+                auth,
+                unit,
+                point,
+                conn,
+                stream,
+                &view,
+                body,
+            );
+            match called {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(called)) if called.flow == FLOW_CONTINUE => Poll::Ready(Ok(called
+                    .fields
+                    .into_iter()
+                    .map(|f| AuthLine {
+                        query: f.flags & FIELD_QUERY != 0,
+                        value: zeroize::Zeroizing::new(f.value.expose_own(&Own::here()).clone()),
+                        name: f.name,
+                    })
+                    .collect())),
+                Poll::Ready(Ok(_)) => Poll::Ready(Err(transport::Failure(
+                    "emit: the binding's auth stopped the request".into(),
+                ))),
+                Poll::Ready(Err(_)) => Poll::Ready(Err(transport::Failure(
+                    "emit: the host refused the binding's auth call".into(),
+                ))),
+            }
+        };
+        let Some(held) = held else {
+            o.error("no such framing");
+            return Outcome::Failed;
+        };
+        let mut h = held.lock().expect("framing");
+        let taken = match h.conn.emit_signed(stream, bytes, end, deadline, now, &mut sign) {
+            // PARKED: this op yields nothing until its resume; the stream's bytes are held.
+            Poll::Pending => return Outcome::Pending,
+            Poll::Ready(taken) => taken,
+        };
+        let outcome = step(&mut h, i.field(|x| &x.sink), &mut o, |_| taken);
+        if matches!(outcome, Outcome::Ready) {
+            announce_full(stream)(&h.conn, &mut o);
+        }
+        outcome
     }
 );
 
@@ -502,6 +698,16 @@ slot!(
         Outcome::Ready
     }
 );
+
+/// A STREAM'S OWN BACKPRESSURE: after an `emit` answered READY, `stream` at its high-water mark is
+/// answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
+fn announce_full(stream: u64) -> impl FnOnce(&Conn, &mut Out<'_, FramerOut>) {
+    move |c, o| {
+        if c.announce_full(stream) {
+            mark_stream_full(o);
+        }
+    }
+}
 
 /// The one-stream framing `token` names, where it names one.
 fn one_stream(p: &sdk::Instance<'_, Instance>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {

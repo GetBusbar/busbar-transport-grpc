@@ -24,12 +24,14 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use busbar_contract::abi::host::service::{AuthRef, UnitRef};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_JSON,
 };
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::ticket::{HostTables, Ticket};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{
     check_framer, check_framer_fields, check_head_slots, check_locate,
@@ -226,6 +228,13 @@ pub struct Host {
     heads: Vec<HeadSlots>,
     /// Each accepted stream's head words: (stream, method, target, authority).
     pub words: Vec<(u64, String, String, String)>,
+    /// A dial's binding: its auth points and handle (`BeginIn::points`, `BeginIn::auth`).
+    pub points: u32,
+    pub auth: AuthRef,
+    /// The ticket the framing's ticketed ops run on (`begin`, `ingest`, `emit`); NONE = none.
+    pub ticket: Ticket,
+    /// The unit a dialled stream's `emit` names (`EmitIn::unit`).
+    pub unit: UnitRef,
     // Kept alive while the framer may read it.
     facts_text: String,
 }
@@ -258,7 +267,18 @@ pub struct Located {
 
 impl Host {
     pub fn open(ops: &'static Ops, settings: &'static str, caps: Caps) -> Self {
+        Self::open_with(ops, settings, caps, std::ptr::null())
+    }
+
+    /// [`Host::open`], handing the instance the host tables `host` (NULL: none).
+    pub fn open_with(
+        ops: &'static Ops,
+        settings: &'static str,
+        caps: Caps,
+        host: *const HostTables,
+    ) -> Self {
         let mut i: OpenIn = z();
+        i.host = host;
         i.settings = Blob {
             ptr: settings.as_ptr(),
             len: settings.len(),
@@ -293,6 +313,10 @@ impl Host {
             pieces: vec![z(); caps.2],
             heads: vec![HeadSlots::default(); 4],
             words: Vec::new(),
+            points: 0,
+            auth: AuthRef::NONE,
+            ticket: Ticket::NONE,
+            unit: UnitRef::NONE,
             facts_text: String::new(),
         }
     }
@@ -524,9 +548,12 @@ impl Host {
             facts.agreed_protocol = s(&self.facts_text);
         }
         let mut i: BeginIn = z();
+        i.head.ticket = self.ticket;
         i.side = side;
         i.target = s(target);
         i.facts = &facts;
+        i.points = self.points;
+        i.auth = self.auth;
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
@@ -567,6 +594,8 @@ impl Host {
     /// `emit` `bytes` on `stream`.
     pub fn emit(&mut self, stream: u64, bytes: &[u8], end: bool, deadline_ns: u64) -> Outcome {
         let mut i: EmitIn = z();
+        i.head.ticket = self.ticket;
+        i.unit = self.unit;
         i.framing = self.framing;
         i.stream = stream;
         i.bytes = bytes.as_ptr();

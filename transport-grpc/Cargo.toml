@@ -28,6 +28,8 @@ http-body = { workspace = true }
 bytes = { workspace = true }
 # The door's settings blob is JSON.
 serde_json = { workspace = true }
+# The binding's auth answers credential lines for a dialled head: this crate's copies are wiped.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # THE DOOR'S CONFORMANCE (`tests/conformance.rs`): the dropped-in image (`examples/grpc_door.rs`)
