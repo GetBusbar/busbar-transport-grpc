@@ -315,15 +315,18 @@ impl Host {
     /// `locate` `target`, judged by the kind's own check.
     pub fn locate(&mut self, target: &str) -> Result<Located, Outcome> {
         let (mut a, mut n, mut p) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
+        // The framer's own head lines for a request (`defaults`), offered as the host offers it.
+        let mut d = vec![0_u8; 256];
         let mut i: LocateIn = z();
         i.target = s(target);
         (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
         (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
         (i.alpn_buf, i.alpn_cap) = (p.as_mut_ptr(), p.len());
+        (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
         let mut o: LocateOut = z();
         let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
         let offer = p[..o.alpn_written as usize].to_vec();
-        check_locate(r, &o, 256, 256, 64, &offer).expect("locate passes the kind's check");
+        check_locate(r, &o, 256, 256, 64, &offer, 256).expect("locate passes the kind's check");
         if r != Outcome::Ready {
             return Err(r);
         }
