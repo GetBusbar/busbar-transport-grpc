@@ -20,24 +20,14 @@
 // THE KIND'S SHAPE (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
 // (`claims`), the entry (`transport`: the sans-IO gRPC framer), and the door that states them.
 mod claims;
-pub mod door;
+mod door;
 mod meta;
-pub mod msg;
+mod msg;
 mod stream;
 mod transport;
 
-/// THE TRANSPORT AXIS ENTRY: what the composition root folds for this transport — its key, the
-/// layers it declares and its door. The root names none of them.
-pub mod linked {
-    /// The row's registry key.
-    pub const KEY: &str = crate::door::KEY;
-    /// The layers this transport declares it can be built over: none, it frames the bytes the
-    /// connector hands it.
-    pub const COMPOSES_OVER: &[&str] = &[];
-    /// Whether this transport carries sessions: each call is one.
-    pub const SESSION: bool = true;
-    pub use crate::door::door;
-}
+/// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape).
+pub use door::door;
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK.
 busbar_contract::hyper_io!(::bytes::Bytes);
