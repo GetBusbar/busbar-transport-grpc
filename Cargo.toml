@@ -74,7 +74,6 @@ metrics-util = { version = "0.20.4", default-features = false }
 oauth-as = { version = "1.0.0", features = ["http", "jwt", "consent", "resource-metadata", "par", "dpop", "client-assertion"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-proptest = "1"
 prost = { version = "0.14", default-features = false, features = ["std"] }
 psl = "2.1"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
