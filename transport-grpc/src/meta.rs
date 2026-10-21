@@ -69,8 +69,16 @@ pub(crate) fn class_of(code: u16) -> u8 {
 
 /// What each `grpc-status` means to the BREAKER: the fault table, beside the status table and
 /// never folded into it (the status class is the fee decision's leg, and the two disagree where the
-/// money and the destination's health do). One row per code gRPC defines, 1.5.5's breaker table
-/// exactly, moved to the wire that owns the numbering (busbar ARCHITECT breaker ruling Q1):
+/// money and the destination's health do). One row per code gRPC defines, this wire's own reading,
+/// held by the wire that owns the numbering (busbar ARCHITECT breaker ruling Q1). It is not a 1.5.5
+/// table: v1.5.5 served no gRPC upstream and had no gRPC breaker table. Its one reading of gRPC's
+/// status names, the Gemini dialect's (`v1.5.5 crates/busbar/src/proto/gemini/mod.rs`,
+/// `gemini_error_status_class`), agrees with these rows on every code it names but two: it put
+/// `ABORTED` with the client errors (no breaker penalty), where this row reads it transient (a
+/// conflict the far end reports, which a retry may clear), and `UNIMPLEMENTED` with the server
+/// errors (transient), where this row reads it as the caller's (a method the far end does not serve
+/// is the caller's request, and costs the destination nothing). No customer-visible parity rides on
+/// either: no 1.5.5 customer ever reached a gRPC upstream.
 ///
 /// - `RESOURCE_EXHAUSTED` is the upstream's quota, not the caller's mistake: transient, and the
 ///   upstream's own wait is the cooldown floor.

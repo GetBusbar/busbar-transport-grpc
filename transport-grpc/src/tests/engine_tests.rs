@@ -415,7 +415,7 @@ fn a_compressed_message_from_the_far_end_fails_the_call() {
     assert_eq!(d.status, Some(msg::INTERNAL));
 }
 
-// ── te, as 1.5.5's server checked it (CORRECTION te) ─────────────────────────────────────────────
+// ── te, as predev's server checked it (CORRECTION te) ────────────────────────────────────────────
 
 /// One HTTP/2 frame.
 fn h2(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -474,7 +474,7 @@ fn resets(wire: &[u8]) -> Vec<(u32, u32)> {
 }
 
 /// RED: a `te` other than `trailers` is reset with HTTP/2 `PROTOCOL_ERROR` before it is a call,
-/// as 1.5.5's server (tonic 0.14 over h2 0.4) did; nothing is handed up.
+/// as predev's server (tonic 0.14 over h2 0.4; v1.5.5 served no gRPC) did; nothing is handed up.
 #[test]
 fn a_wrong_te_is_reset_protocol_error_and_never_handed_up() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -489,7 +489,7 @@ fn a_wrong_te_is_reset_protocol_error_and_never_handed_up() {
     assert!(a.pieces().is_empty(), "no call reached the host");
 }
 
-/// A missing `te` is served, as 1.5.5's server served it: the call is handed up.
+/// A missing `te` is served, as predev's server served it: the call is handed up.
 #[test]
 fn a_missing_te_is_served() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -957,4 +957,178 @@ fn an_oversize_message_fails_out_of_range_in_predevs_words() {
     let end = last(&p.got_d, 1).expect("terminal");
     assert!(end.failed);
     assert_eq!(end.bytes.as_ref(), words.as_bytes());
+}
+
+// ── a far end's reset, by its code ───────────────────────────────────────────────────────────────
+
+/// The far end resets dialled stream 1 with RST_STREAM `code`: before the answer's head
+/// (`after_head` false: the call is sent and unanswered) or after it (the head is in, the body
+/// still open). The dialled side's terminal piece.
+fn reset_by_far_end(code: u32, after_head: bool) -> Piece {
+    let mut p = Pair::new();
+    p.d.emit(1, &call("/pkg.Svc/Say", &[], &[b"q"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    if after_head {
+        p.a.emit(1, b"\r\n", false, 0, p.now).expect("answer head");
+        p.settle();
+        head(&p.got_d, 1);
+    }
+    assert!(terminal(&p.got_d, 1).is_none(), "the call is still open");
+    // The far end's frame, carried to the dialled side as the far end's own bytes.
+    p.d.ingest(&h2(3, 0, 1, &code.to_be_bytes()), false);
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
+    assert!(t.failed, "the reset fails the stream: {t:?}");
+    assert!(p.d.failure().is_none(), "the connection lives on");
+    t
+}
+
+/// The status a reset with `code` fails the dialled stream with, before and after the head.
+fn reset_status_both_ways(code: u32) -> [Option<u16>; 2] {
+    [
+        reset_by_far_end(code, false).status,
+        reset_by_far_end(code, true).status,
+    ]
+}
+
+/// A FAR END'S RST_STREAM `CANCEL` IS `CANCELLED` (gRPC over HTTP/2, "Errors"), before or after the
+/// answer's head: the caller's class, no penalty to the destination. RED before the fix: read as
+/// `UNAVAILABLE` before the head and `INTERNAL` after it, whatever the code.
+#[test]
+fn a_far_ends_cancel_reset_fails_the_call_cancelled() {
+    assert_eq!(reset_status_both_ways(0x8), [Some(msg::CANCELLED); 2]);
+}
+
+/// RST_STREAM `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`. RED before the fix, as above.
+#[test]
+fn a_far_ends_enhance_your_calm_reset_fails_the_call_resource_exhausted() {
+    assert_eq!(
+        reset_status_both_ways(0xb),
+        [Some(msg::RESOURCE_EXHAUSTED); 2]
+    );
+}
+
+/// RST_STREAM `INADEQUATE_SECURITY` is `PERMISSION_DENIED`. RED before the fix, as above.
+#[test]
+fn a_far_ends_inadequate_security_reset_fails_the_call_permission_denied() {
+    assert_eq!(
+        reset_status_both_ways(0xc),
+        [Some(msg::PERMISSION_DENIED); 2]
+    );
+}
+
+/// RST_STREAM `REFUSED_STREAM` is `UNAVAILABLE` (the far end processed nothing), after the head
+/// too. RED before the fix: `INTERNAL` after the head.
+#[test]
+fn a_far_ends_refused_stream_reset_fails_the_call_unavailable() {
+    assert_eq!(reset_status_both_ways(0x7), [Some(msg::UNAVAILABLE); 2]);
+}
+
+/// RST_STREAM `PROTOCOL_ERROR`, like every code the table does not name, is `INTERNAL`, before the
+/// head too. RED before the fix: `UNAVAILABLE` (a retryable status) before the head.
+#[test]
+fn a_far_ends_protocol_error_reset_fails_the_call_internal() {
+    assert_eq!(reset_status_both_ways(0x1), [Some(msg::INTERNAL); 2]);
+}
+
+/// RST_STREAM `INTERNAL_ERROR` is `INTERNAL`, before the head too. RED before the fix:
+/// `UNAVAILABLE` before the head.
+#[test]
+fn a_far_ends_internal_error_reset_fails_the_call_internal() {
+    assert_eq!(reset_status_both_ways(0x2), [Some(msg::INTERNAL); 2]);
+}
+
+/// RST_STREAM `FLOW_CONTROL_ERROR` is `INTERNAL`, before the head too. RED before the fix:
+/// `UNAVAILABLE` before the head.
+#[test]
+fn a_far_ends_flow_control_error_reset_fails_the_call_internal() {
+    assert_eq!(reset_status_both_ways(0x3), [Some(msg::INTERNAL); 2]);
+}
+
+// ── compression ──────────────────────────────────────────────────────────────────────────────────
+
+/// A COMPRESSION THE SERVER DOES NOT TAKE IS ANSWERED `UNIMPLEMENTED`, as predev's server (tonic
+/// 0.14, no compression enabled) answered it: trailers-only, before a message is read, with
+/// `grpc-accept-encoding: identity` and tonic's words, and never handed up. A call stating
+/// `identity` is no compressed call, and is served. RED before the fix: `grpc-encoding` was never
+/// read, the call was handed up, and its compressed message failed `INTERNAL` with no
+/// `grpc-accept-encoding` to fall back on.
+#[test]
+fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
+    let mut p = Pair::new();
+    let fields: [(&str, &[u8]); 2] = [("path", b"/pkg.Svc/Z"), ("grpc-encoding", b"gzip")];
+    let mut c = msg::render_head(&fields, Some(6)).expect("head");
+    c.extend_from_slice(&[1, 0, 0, 0, 1, b'z']);
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    p.settle();
+    assert!(of(&p.got_a, 1).is_empty(), "never handed up: {:?}", p.got_a);
+    let h = head(&p.got_d, 1);
+    assert_eq!(
+        field(&h.bytes, "grpc-accept-encoding").as_deref(),
+        Some(&b"identity"[..])
+    );
+    let t = terminal(&p.got_d, 1).expect("the trailers-only answer");
+    assert_eq!(t.status, Some(msg::UNIMPLEMENTED));
+    let end = last(&p.got_d, 1).expect("terminal");
+    assert!(end.failed);
+    assert_eq!(
+        end.bytes.as_ref(),
+        b"Content is compressed with `gzip` which isn't supported"
+    );
+
+    let mut p = Pair::new();
+    p.d.emit(
+        1,
+        &call("/pkg.Svc/Z", &[("grpc-encoding", b"identity")], &[b"z"]),
+        true,
+        0,
+        p.now,
+    )
+    .expect("emit");
+    p.settle();
+    assert_eq!(
+        frames(&p.got_a, 1)[0],
+        msg::frame(b"z").as_slice(),
+        "identity is served"
+    );
+}
+
+// ── the framer's own head lines ──────────────────────────────────────────────────────────────────
+
+/// THE HEAD'S OWN `grpc-timeout` GOES OUT AS SIGNED. The host puts the framer's own lines (stated
+/// at `locate`) in the head before the auth signs it; the dial sends the head's `grpc-timeout` as
+/// it stands, never one of its own written after the auth ran (THE DESIGN §6, step 5). A head
+/// stating none still carries the remaining deadline. RED before the fix: the head's value was
+/// dropped and the remaining deadline written in its place.
+#[test]
+fn a_grpc_timeout_the_head_states_goes_out_as_signed() {
+    let mut p = Pair::new();
+    let t0 = p.now;
+    // The head as the host hands it: the framer's own lines in it, added before the auth.
+    let signed: [(&str, &[u8]); 3] = [
+        ("content-type", b"application/grpc"),
+        ("te", b"trailers"),
+        ("grpc-timeout", b"7S"),
+    ];
+    p.d.emit(
+        1,
+        &call("/pkg.Svc/Say", &signed, &[b"q"]),
+        true,
+        t0 + 2 * SEC,
+        t0,
+    )
+    .expect("emit");
+    p.settle();
+    let h = head(&p.got_a, 1);
+    assert_eq!(field(&h.bytes, "grpc-timeout").as_deref(), Some(&b"7S"[..]));
+    assert_eq!(
+        field(&h.bytes, "content-type").as_deref(),
+        Some(&b"application/grpc"[..])
+    );
+    assert_eq!(
+        p.d.next_deadline(),
+        Some(t0 + 2 * SEC),
+        "the attempt's own deadline still holds the call"
+    );
 }

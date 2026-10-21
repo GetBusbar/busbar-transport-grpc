@@ -199,6 +199,7 @@ dependencies = [
  "busbar-contract",
  "bytes",
  "futures",
+ "h2",
  "http",
  "http-body",
  "hyper",

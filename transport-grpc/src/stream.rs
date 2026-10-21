@@ -6,19 +6,26 @@
 //! here alone. The gRPC layer is still this door's:
 //!
 //! * `begin` takes the call's head fields: a call that is not gRPC (its `content-type`) is refused
-//!   before it is one;
+//!   before it is one; a call whose `grpc-encoding` names a compression this door does not take
+//!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding`, as
+//!   predev's gRPC line (tonic 0.14) answered it;
 //! * `ingest` takes the call's body and yields each length-prefixed message's PAYLOAD as one piece
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
-//! * `emit` takes one reply message's payload and yields it length-prefixed, as body bytes;
+//! * `emit` takes one reply message's payload and yields it length-prefixed, as body bytes; once
+//!   the call is closed (or past its deadline) an `emit` writes nothing;
 //! * `finish` closes the call with the final status the unit stated: `grpc-status`, `grpc-message`
-//!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in 1.5.5's
-//!   bytes and order ([`msg::status_lines`]), the host's trailers;
+//!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in predev's
+//!   bytes and order, which are tonic 0.14's ([`msg::status_lines`]; v1.5.5 served no gRPC), the
+//!   host's trailers;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
 //!   mapped ([`msg::status_of_refusal`], predev's words); a body whose message was over the ceiling
 //!   closes `OUT_OF_RANGE` in predev's words for it, whatever the refusal; before any message went
 //!   out the block is the whole answer (trailers-only: `:status: 200`, `content-type`, then the
-//!   status lines).
+//!   status lines);
+//! * `timer` past the caller's `grpc-timeout` hands up a `DEADLINE_EXCEEDED` failure and writes
+//!   nothing: only the host knows whether it sent the head, so the close is its refusal's
+//!   (`RefuseIn::head_sent`), rendered `DEADLINE_EXCEEDED`.
 //!
 //! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
 
@@ -40,9 +47,13 @@ pub struct StreamCall {
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
     closed: bool,
-    /// The body's message was over the ceiling: the call closes with predev's status and words
-    /// for it (`OUT_OF_RANGE`), whatever refusal the host then closes it with.
+    /// The body was refused for what it is (a message over the ceiling, a compression the door
+    /// does not take): the call closes with predev's status and words for it (`OUT_OF_RANGE`,
+    /// `UNIMPLEMENTED`), whatever refusal the host then closes it with.
     oversize: Option<msg::Bad>,
+    /// The caller's `grpc-timeout` ran out: the close, whenever the host makes it, is
+    /// `DEADLINE_EXCEEDED`, and no reply message goes out after it.
+    expired: bool,
     /// The instant (host monotonic ns) the caller's `grpc-timeout` runs out, when it stated one.
     deadline: Option<u64>,
 }
@@ -52,6 +63,9 @@ impl StreamCall {
     /// payload bytes; a `grpc-timeout` it states runs from `now_ns`, as the dedicated listener's
     /// accept path runs it.
     ///
+    /// A `grpc-encoding` naming a compression the door does not take opens the call already
+    /// refused: its first `ingest` fails, and its close is `UNIMPLEMENTED`.
+    ///
     /// # Errors
     ///
     /// The call is not gRPC: its `content-type` is none of gRPC's.
@@ -60,10 +74,12 @@ impl StreamCall {
         max: usize,
         now_ns: u64,
     ) -> Result<Self, Failure> {
-        let (mut grpc, mut deadline) = (false, None);
+        let (mut grpc, mut deadline, mut refused) = (false, None, None);
         for (n, v) in fields {
             if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
                 grpc = true;
+            } else if n.eq_ignore_ascii_case(msg::GRPC_ENCODING.as_bytes()) {
+                refused = msg::unsupported_encoding(v);
             } else if n.eq_ignore_ascii_case(msg::GRPC_TIMEOUT.as_bytes()) {
                 deadline = msg::parse_timeout(v).map(|d| {
                     now_ns.saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
@@ -82,28 +98,22 @@ impl StreamCall {
             out: VecDeque::new(),
             answered: false,
             closed: false,
-            oversize: None,
+            oversize: refused,
+            expired: false,
             deadline,
         })
     }
 
-    /// The host's timer at monotonic `now_ns`: a call past its `grpc-timeout` closes
-    /// `DEADLINE_EXCEEDED`, and the host learns the stream failed.
+    /// The host's timer at monotonic `now_ns`: a call past its `grpc-timeout` fails
+    /// `DEADLINE_EXCEEDED`, and the host learns the stream failed. Nothing is written here: the
+    /// timer does not say whether the host sent the response head, so the closing lines are the
+    /// host's refusal's, which does ([`StreamCall::refuse`]), rendered `DEADLINE_EXCEEDED`.
     pub fn expire(&mut self, now_ns: u64) {
         if self.closed || self.deadline.is_none_or(|d| now_ns < d) {
             return;
         }
         self.deadline = None;
-        let code = u32::from(msg::DEADLINE_EXCEEDED);
-        if let Ok(lines) = msg::status_lines(code, b"deadline exceeded", &[]) {
-            if !self.answered {
-                self.wire.extend(b":status: 200\r\n");
-                self.wire
-                    .extend(format!("content-type: {}\r\n", msg::CONTENT_TYPE).as_bytes());
-            }
-            self.closed = true;
-            self.wire.extend(lines);
-        }
+        self.expired = true;
         self.out.push_back(Piece {
             status: Some(msg::DEADLINE_EXCEEDED),
             ..Piece::failure(STREAM, "deadline exceeded")
@@ -117,6 +127,9 @@ impl StreamCall {
     /// A message is compressed or over the ceiling, or the body ended inside one.
     pub fn ingest(&mut self, bytes: &[u8], end: bool) -> Result<(), Failure> {
         let bad = |e: msg::Bad| Failure(e.to_string());
+        if let Some(e @ msg::Bad::Encoding(_)) = &self.oversize {
+            return Err(bad(e.clone()));
+        }
         let got = self.messages.push(bytes).inspect_err(|e| {
             if matches!(e, msg::Bad::TooLarge(..)) {
                 self.oversize = Some(e.clone());
@@ -131,8 +144,12 @@ impl StreamCall {
         Ok(())
     }
 
-    /// One reply message's payload bytes (`ends` = they complete it).
+    /// One reply message's payload bytes (`ends` = they complete it). A call already closed, or
+    /// past its deadline, takes none: body bytes after the closing lines would follow the trailers.
     pub fn emit(&mut self, bytes: &[u8], ends: bool) {
+        if self.closed || self.expired {
+            return;
+        }
         self.writing.extend_from_slice(bytes);
         if ends {
             self.wire
@@ -160,8 +177,9 @@ impl StreamCall {
             block.extend_from_slice(b"\r\n");
         }
         let lines = if let Some(e) = &self.oversize {
-            msg::status_lines(u32::from(e.status()), e.to_string().as_bytes(), &[])
-                .map_err(|e| Failure(e.into()))?
+            e.close_lines().map_err(|e| Failure(e.into()))?
+        } else if self.expired {
+            deadline_lines()?
         } else {
             match msg::read_head(&block, usize::MAX) {
                 Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => {
@@ -206,12 +224,23 @@ impl StreamCall {
             return Ok(());
         }
         // Rendered first, closed after: a final status that cannot be written leaves the call
-        // open, so the host's fallback refusal can still close it with a `grpc-status`.
-        let lines = msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?;
+        // open, so the host's fallback refusal can still close it with a `grpc-status`. A call past
+        // its deadline closes `DEADLINE_EXCEEDED`, whatever the unit then stated.
+        let lines = if self.expired {
+            deadline_lines()?
+        } else {
+            msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?
+        };
         self.closed = true;
         self.wire.extend(lines);
         Ok(())
     }
+}
+
+/// The closing status lines of a call past its `grpc-timeout`.
+fn deadline_lines() -> Result<Vec<u8>, Failure> {
+    msg::status_lines(u32::from(msg::DEADLINE_EXCEEDED), b"deadline exceeded", &[])
+        .map_err(|e| Failure(e.into()))
 }
 
 impl Owed for StreamCall {

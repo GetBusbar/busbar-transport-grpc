@@ -12,25 +12,35 @@
 //!
 //! DIALLED. The host `emit`s a stream's head block and its messages; the head's `path` names the
 //! method. The request carries `content-type: application/grpc` (or the caller's `+proto`/`+json`
-//! form), `te: trailers` and the stream's remaining deadline as `grpc-timeout`, and its body ENDS
+//! form), `te: trailers` and a `grpc-timeout`. These are THE FRAMER'S OWN HEAD LINES, stated at
+//! `locate` (`LocateIn::defaults_buf`) so the host puts them in the head BEFORE the auth signs it
+//! (THE DESIGN §6, step 5: nothing is added to the head after the auth has run): the head's own
+//! `content-type` and `grpc-timeout` go out as they were signed. Only a head that states none (a
+//! host that predates the defaults) has them written here, the timeout as the stream's remaining
+//! deadline. The request's body ENDS
 //! (END_STREAM) once the head's `content-length` bytes are in, or on an `emit` that ends the frame:
 //! a unary server waits for exactly that. The answer comes back as frames (HEAD-FIELDS, GRPC-DOOR
 //! rulings): the HEAD, always first, a field block with no status code; one frame per message; the
 //! TRAILERS, a field block carrying `grpc-status` as its code; then the terminal piece, empty when
 //! the status is `OK`, else a failure whose bytes are the decoded `grpc-message`. A trailers-only
 //! answer (status in the head) yields the same three. An answer that is not gRPC fails the stream
-//! with its HTTP status mapped the way gRPC maps it. At the deadline the stream is reset and fails
-//! `DEADLINE_EXCEEDED`.
+//! with its HTTP status mapped the way gRPC maps it. A far end that resets the stream fails it with
+//! the status its RST_STREAM code stands for, before or after the answer's head alike
+//! ([`msg::status_of_reset`]); a connection lost before the answer is `UNAVAILABLE`. At the
+//! deadline the stream is reset and fails `DEADLINE_EXCEEDED`.
 //!
 //! ACCEPTED. Each call the far end opens is a stream: its head (a field block, with the call's
 //! method, target and authority in the stream's head slots, never as fields), one frame per
-//! message, and the end piece (`PIECE_END`) when the far end has sent its last. `te` is checked as 1.5.5's
-//! server checked it, by HTTP/2 itself: a `te` other than `trailers` resets the stream with
+//! message, and the end piece (`PIECE_END`) when the far end has sent its last. `te` is checked as
+//! predev's server (tonic 0.14 over h2 0.4; v1.5.5 served no gRPC) checked it, by HTTP/2 itself:
+//! a `te` other than `trailers` resets the stream with
 //! `PROTOCOL_ERROR` before it is a call, and a missing one is served; it is then dropped as
 //! hop-by-hop. The host answers on the same stream: `emit` a head block (the answer's metadata) and
 //! messages; `refuse` with the trailer block (`grpc-status`, `grpc-message`, ...) ends the call —
 //! trailers-only when nothing was emitted first. A call that is not gRPC is answered `415` here and
-//! never reaches the host.
+//! never reaches the host; nor does one whose `grpc-encoding` names a compression this door does
+//! not take, answered here trailers-only `UNIMPLEMENTED` with `grpc-accept-encoding: identity`, as
+//! predev's server (tonic 0.14, no compression enabled) answered it.
 //!
 //! A STREAM ENDS ONCE. A far end that resets an accepted call (before or after its last message,
 //! before or after the host's answer began) fails the stream `CANCELLED`, and nothing more is
@@ -750,8 +760,21 @@ impl DialStream {
             .version(http::Version::HTTP_2)
             .header(http::header::CONTENT_TYPE, content_type)
             .header(http::header::TE, "trailers");
-        let left = Duration::from_nanos(self.deadline_ns.saturating_sub(now_ns));
-        b = b.header(msg::GRPC_TIMEOUT, msg::timeout_value(left));
+        // The head's own `grpc-timeout` (the framer's line `locate` stated, which the auth signed)
+        // goes out as it is; only a head stating none has the remaining deadline written here.
+        b = match head
+            .get(msg::GRPC_TIMEOUT)
+            .filter(|v| msg::parse_timeout(v).is_some())
+        {
+            Some(stated) => b.header(
+                msg::GRPC_TIMEOUT,
+                HeaderValue::from_bytes(stated).map_err(|_| "grpc-timeout is not a field value")?,
+            ),
+            None => {
+                let left = Duration::from_nanos(self.deadline_ns.saturating_sub(now_ns));
+                b.header(msg::GRPC_TIMEOUT, msg::timeout_value(left))
+            }
+        };
         for (name, value) in &head.fields {
             if RESERVED_ON_REQUEST.contains(&name.as_str()) || hop_by_hop(name, []) {
                 continue;
@@ -844,7 +867,12 @@ fn advance(
             DStage::Asked(f) => match f.as_mut().poll(cx) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(r) => {
-                    let r = r.map_err(|e| (e.to_string(), msg::UNAVAILABLE, false))?;
+                    // A far end's reset is read by its code; any other loss before the answer is
+                    // the connection's, and UNAVAILABLE.
+                    let r = r.map_err(|e| {
+                        let code = reset_status(&e).unwrap_or(msg::UNAVAILABLE);
+                        (e.to_string(), code, false)
+                    })?;
                     if r.status() != StatusCode::OK {
                         // A BARE HTTP STATUS IS AN ANSWER: a member (or a proxy or auth wall in
                         // front of it) answered the call without gRPC. Its status is the gRPC
@@ -897,7 +925,10 @@ fn advance(
             },
             DStage::Body(b, msgs) => match Pin::new(&mut *b).poll_frame(cx) {
                 Poll::Pending => return Ok(()),
-                Poll::Ready(Some(Err(e))) => return Err((e.to_string(), msg::INTERNAL, false)),
+                Poll::Ready(Some(Err(e))) => {
+                    let code = reset_status(&e).unwrap_or(msg::INTERNAL);
+                    return Err((e.to_string(), code, false));
+                }
                 Poll::Ready(Some(Ok(fr))) => match fr.into_data() {
                     Ok(d) => {
                         let got = msgs
@@ -925,6 +956,22 @@ fn advance(
             },
         }
     }
+}
+
+/// The gRPC status a far end's RST_STREAM stands for ([`msg::status_of_reset`]), where `e` (or an
+/// error it wraps: `hyper` hands up `h2`'s as its source) is one; `None` for any other failure.
+fn reset_status(e: &(dyn std::error::Error + 'static)) -> Option<u16> {
+    let mut at = Some(e);
+    while let Some(err) = at {
+        if let Some(h) = err.downcast_ref::<h2::Error>() {
+            return h
+                .reason()
+                .filter(|_| h.is_reset() && h.is_remote())
+                .map(|r| msg::status_of_reset(u32::from(r)));
+        }
+        at = err.source();
+    }
+    None
 }
 
 /// The fields the trailers' code and the terminal piece carry, never a field block's.
@@ -1114,6 +1161,34 @@ impl Accept {
                 reply.chan.end();
                 continue;
             };
+            if let Some(bad) = req
+                .headers()
+                .get(msg::GRPC_ENCODING)
+                .and_then(|v| msg::unsupported_encoding(v.as_bytes()))
+            {
+                // A compression this door does not take: answered here, trailers-only, before a
+                // message is read, as predev's server answered it (tonic 0.14's `into_http`:
+                // `content-type`, the accepted encodings, `grpc-status`, `grpc-message`). Never
+                // handed up.
+                let mut fields = HeaderMap::new();
+                fields.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(msg::CONTENT_TYPE),
+                );
+                fields.insert(
+                    msg::GRPC_ACCEPT_ENCODING,
+                    HeaderValue::from_static(msg::ACCEPT_ENCODING),
+                );
+                fields.insert(msg::GRPC_STATUS, HeaderValue::from(bad.status()));
+                if let Ok(text) =
+                    HeaderValue::from_str(&msg::encode_status_message(bad.to_string().as_bytes()))
+                {
+                    fields.insert(msg::GRPC_MESSAGE, text);
+                }
+                reply.head(StatusCode::OK, fields);
+                reply.chan.end();
+                continue;
+            }
             let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
             let words = HeadWords {
                 method: Bytes::copy_from_slice(req.method().as_str().as_bytes()),
