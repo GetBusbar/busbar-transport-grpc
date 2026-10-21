@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE gRPC LAYER'S BYTES (gRPC over HTTP/2, `PROTOCOL-HTTP2.md`): the length-prefixed message, the
-//! `grpc-timeout` value, `grpc-status` and its classes, the percent-encoded `grpc-message`, and the
-//! head block this door's host speaks in.
+//! THE gRPC LAYER'S BYTES (gRPC over HTTP/2, `PROTOCOL-HTTP2.md`): the length-prefixed message,
+//! `grpc-status` and its classes, the percent-encoded `grpc-message`, and the head block this
+//! door's host speaks in.
 //!
 //! THE HEAD BLOCK. What the host hands this door on `emit` (and what `encode` renders) is a head
 //! block, then messages:
@@ -22,8 +22,6 @@
 //! A frame this door answers is one whole message in that form, so it is never empty — an empty
 //! payload is still five bytes; the stream's end is its own piece (`PIECE_END`), never an empty
 //! frame.
-
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 
@@ -71,9 +69,10 @@ pub enum Bad {
 }
 
 impl Bad {
-    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message and
-    /// `UNIMPLEMENTED` for a compression the door does not take, as predev's gRPC line (tonic 0.14)
-    /// answered each (ARCHITECT ruling: byte-equal to predev); `INTERNAL` else.
+    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message, as
+    /// predev's gRPC line answered it (ARCHITECT ruling: byte-equal to predev); `UNIMPLEMENTED` for
+    /// a compression the door does not take (gRPC's compression rules, `compression.md`);
+    /// `INTERNAL` else.
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
@@ -84,8 +83,8 @@ impl Bad {
     }
 
     /// The closing status lines a call this failed closes with ([`status_lines`]): for a compression
-    /// the door does not take, `grpc-accept-encoding` first, as tonic 0.14's `Status::add_header`
-    /// writes the status's metadata ahead of `grpc-status`.
+    /// the door does not take, `grpc-accept-encoding` (the encodings it takes, `compression.md`)
+    /// first, then the status.
     ///
     /// # Errors
     ///
@@ -107,14 +106,13 @@ impl Bad {
 }
 
 /// The compression a call's `grpc-encoding` value `v` names, where this door does not take it:
-/// every value but `identity` (tonic 0.14 `CompressionEncoding::from_encoding_header`, with no
-/// compression enabled, as predev's gRPC line ran it). `None` = the call is not compressed.
+/// every value but `identity`, the one encoding it takes. `None` = the call is not compressed.
 #[must_use]
 pub fn unsupported_encoding(v: &[u8]) -> Option<Bad> {
     if v == b"identity" {
         return None;
     }
-    // Text where it is text; else the bytes as tonic spelled them (their `Debug`).
+    // Text where it is text; else the bytes, each as its number.
     Some(Bad::Encoding(
         std::str::from_utf8(v).map_or_else(|_| format!("{v:?}"), str::to_owned),
     ))
@@ -126,10 +124,9 @@ impl std::fmt::Display for Bad {
             Self::Compressed => {
                 f.write_str("a message is compressed and no compression was agreed")
             }
-            // tonic 0.14's words for it (`codec/compression.rs`), byte-equal.
             Self::Encoding(name) => write!(
                 f,
-                "Content is compressed with `{name}` which isn't supported"
+                "the message encoding `{name}` is not supported: this server takes identity"
             ),
             // Predev's words for it, byte-equal (tonic 0.14 `codec/decode.rs`), the limit being
             // this door's ceiling (`limits.request_body_max_bytes`).
@@ -198,50 +195,6 @@ impl Messages {
     }
 }
 
-// ── grpc-timeout ─────────────────────────────────────────────────────────────────────────────────
-
-/// `d` as a `grpc-timeout` value: at most eight digits, in the finest unit that holds it.
-#[must_use]
-pub fn timeout_value(d: Duration) -> String {
-    const MAX: u128 = 99_999_999;
-    let ns = d.as_nanos();
-    let units: [(u128, char); 6] = [
-        (1, 'n'),
-        (1_000, 'u'),
-        (1_000_000, 'm'),
-        (1_000_000_000, 'S'),
-        (60_000_000_000, 'M'),
-        (3_600_000_000_000, 'H'),
-    ];
-    for (per, unit) in units {
-        // Rounded UP, so the far end never waits less than the caller's clock allows.
-        let v = ns.div_ceil(per);
-        if v <= MAX {
-            return format!("{v}{unit}");
-        }
-    }
-    format!("{MAX}H")
-}
-
-/// A `grpc-timeout` value, read.
-#[must_use]
-pub fn parse_timeout(v: &[u8]) -> Option<Duration> {
-    let (digits, unit) = v.split_at(v.len().checked_sub(1)?);
-    if digits.is_empty() || digits.len() > 8 || !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let n: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
-    Some(match unit {
-        b"n" => Duration::from_nanos(n),
-        b"u" => Duration::from_micros(n),
-        b"m" => Duration::from_millis(n),
-        b"S" => Duration::from_secs(n),
-        b"M" => Duration::from_secs(n.saturating_mul(60)),
-        b"H" => Duration::from_secs(n.saturating_mul(3600)),
-        _ => return None,
-    })
-}
-
 // ── the gRPC fields ──────────────────────────────────────────────────────────────────────────────
 
 /// The field the call's status travels in (the trailers, or a trailers-only head).
@@ -296,11 +249,16 @@ pub fn status_of_http(code: u16) -> u16 {
     }
 }
 
-/// The `grpc-status` a far end's RST_STREAM stands for, by its HTTP/2 error `code`, before or after
-/// the answer's head alike (gRPC over HTTP/2, "Errors"): `CANCEL` is `CANCELLED`,
-/// `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`, `INADEQUATE_SECURITY` is `PERMISSION_DENIED`,
-/// `REFUSED_STREAM` is `UNAVAILABLE` (nothing was processed: safe to retry), and every other code
-/// (`NO_ERROR`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `FLOW_CONTROL_ERROR`, ...) is `INTERNAL`.
+/// The `grpc-status` an HTTP/2 error `code` stands for on a dialled stream it ended (a reset or a
+/// GOAWAY, either end's), before or after the answer's head alike: gRPC over HTTP/2
+/// (PROTOCOL-HTTP2.md, "Errors"). `REFUSED_STREAM` is `UNAVAILABLE` (nothing was processed: safe
+/// to retry), `CANCEL` is `CANCELLED`, `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`,
+/// `INADEQUATE_SECURITY` is `PERMISSION_DENIED`, and every other code is `INTERNAL`: the ones the
+/// table lists so (`NO_ERROR`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `FLOW_CONTROL_ERROR`,
+/// `SETTINGS_TIMEOUT`, `FRAME_SIZE_ERROR`, `COMPRESSION_ERROR`, `CONNECT_ERROR`,
+/// `HTTP_1_1_REQUIRED`), `STREAM_CLOSED`, which it does not list, and a code HTTP/2 does not
+/// define. RFC 9113 §7 has an unknown code read as `INTERNAL_ERROR`, and nothing about such a
+/// stream says the far end processed nothing, so it is never read as safe to retry.
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
     match code {
@@ -310,6 +268,31 @@ pub fn status_of_reset(code: u32) -> u16 {
         0xc => PERMISSION_DENIED,
         _ => INTERNAL,
     }
+}
+
+/// An HTTP/2 error `code`'s name (RFC 9113 §7), or its number where HTTP/2 defines none.
+#[must_use]
+pub fn reset_name(code: u32) -> String {
+    const NAMES: [&str; 14] = [
+        "NO_ERROR",
+        "PROTOCOL_ERROR",
+        "INTERNAL_ERROR",
+        "FLOW_CONTROL_ERROR",
+        "SETTINGS_TIMEOUT",
+        "STREAM_CLOSED",
+        "FRAME_SIZE_ERROR",
+        "REFUSED_STREAM",
+        "CANCEL",
+        "COMPRESSION_ERROR",
+        "CONNECT_ERROR",
+        "ENHANCE_YOUR_CALM",
+        "INADEQUATE_SECURITY",
+        "HTTP_1_1_REQUIRED",
+    ];
+    usize::try_from(code)
+        .ok()
+        .and_then(|i| NAMES.get(i))
+        .map_or_else(|| format!("error code {code:#x}"), |n| (*n).to_owned())
 }
 
 /// The `grpc-status` a refusal's neutral status ([`RefuseIn::status`]) stands for on a call's

@@ -50,7 +50,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
     proof.push(format!("unary messages {:?}", &f[1..]));
     proof.push(format!("unary terminal {:?}", host.terminal(1)));
     assert_eq!(field(&f[0], "x-answer").as_deref(), Some("yes"));
-    assert_eq!(f[1..], [lpm(b"got:hello;timeout=5000000u")]);
+    assert_eq!(f[1..], [lpm(b"got:hello")], "no grpc-timeout goes upstream");
     assert_eq!(host.terminal(1), Some((0, STATUS_SUCCESS, false, vec![])));
 
     // Server streaming.
@@ -316,10 +316,10 @@ fn a_listener_is_offered_h2_alone() {
 }
 
 /// THE FRAMER'S OWN HEAD LINES ARE STATED AT `locate`, so the host puts them in the head BEFORE the
-/// auth signs it (THE DESIGN §6, step 5): the content type, `te: trailers` and `grpc-timeout` (the
-/// attempt timeout the settings state), in the order the dial writes them, and the dial then sends
-/// them as signed. Both images, the default timeout and a set one. RED before the fix: `locate`
-/// stated no line, and the dial added all three at `emit`, after the auth had run.
+/// auth signs it (THE DESIGN §6, step 5): the content type and `te: trailers`, in the order the
+/// dial writes them, and the dial then sends them as signed. No `grpc-timeout`, whatever timeout
+/// the settings state: none goes upstream, as predev's hop sent none. Both images. RED before the
+/// fix: `locate` stated a `grpc-timeout` line.
 #[test]
 fn locate_states_the_framers_own_head_lines_before_the_auth_signs() {
     let (d, _lib) = dropped();
@@ -328,14 +328,14 @@ fn locate_states_the_framers_own_head_lines_before_the_auth_signs() {
         let loc = host.locate("https://peer.test").expect("locate");
         assert_eq!(
             loc.defaults,
-            "content-type: application/grpc\r\nte: trailers\r\ngrpc-timeout: 300000m\r\n"
+            "content-type: application/grpc\r\nte: trailers\r\n"
         );
         host.close();
         let mut host = Host::open(ops, r#"{"limits.upstream_request_timeout_secs":5}"#, ROOMY);
         let loc = host.locate("http://peer.test:50051").expect("locate");
         assert_eq!(
             loc.defaults,
-            "content-type: application/grpc\r\nte: trailers\r\ngrpc-timeout: 5000000u\r\n"
+            "content-type: application/grpc\r\nte: trailers\r\n"
         );
         host.close();
     }
@@ -513,13 +513,12 @@ fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
     );
 }
 
-/// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` in predev's
-/// bytes: tonic 0.14's `into_http` for the status its `from_encoding_header` answered with no
-/// compression enabled (`grpc-accept-encoding: identity` and its words), whatever refusal the host
-/// closes the failed stream with. Both images. RED before the fix: `grpc-encoding` was never read,
-/// the compressed message failed `INTERNAL`, and the close was the refusal's neutral status mapped.
+/// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` with the
+/// encodings it takes (gRPC's compression rules, `compression.md`), whatever refusal the host closes
+/// the failed stream with. Both images. RED before the fix: `grpc-encoding` was never read, the
+/// compressed message failed `INTERNAL`, and the close was the refusal's neutral status mapped.
 #[test]
-fn a_stream_in_an_encoding_the_door_does_not_take_is_predevs_unimplemented() {
+fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
     let (d, _lib) = dropped();
     for ops in [linked(), d] {
         let mut host = Host::open(ops, "{}", ROOMY);
@@ -531,15 +530,11 @@ fn a_stream_in_an_encoding_the_door_does_not_take_is_predevs_unimplemented() {
         assert_eq!(host.feed(&[1, 0, 0, 0, 1, b'z'], true), Outcome::Failed);
         let at = host.wire_log.len();
         assert_eq!(host.refuse_as(1, b"", 400), Outcome::Ready);
-        let mut status =
-            tonic::Status::unimplemented("Content is compressed with `gzip` which isn't supported");
-        status.metadata_mut().insert(
-            "grpc-accept-encoding",
-            tonic::metadata::MetadataValue::from_static("identity"),
-        );
         assert_eq!(
             String::from_utf8_lossy(&host.wire_log[at..]),
-            tonic_block(status, true)
+            ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-accept-encoding: identity\r\n\
+             grpc-status: 12\r\ngrpc-message: the%20message%20encoding%20%60gzip%60%20is%20not\
+             %20supported:%20this%20server%20takes%20identity\r\n"
         );
         host.close();
     }

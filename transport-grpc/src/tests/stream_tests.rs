@@ -10,7 +10,6 @@ fn grpc() -> StreamCall {
     StreamCall::open(
         [(&b"content-type"[..], &b"application/grpc+proto"[..])].into_iter(),
         1024,
-        0,
     )
     .expect("a gRPC call")
 }
@@ -68,18 +67,13 @@ fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
 
 #[test]
 fn a_call_that_is_not_grpc_is_refused_before_it_is_one() {
-    assert!(StreamCall::open(
-        [(&b"content-type"[..], &b"text/plain"[..])].into_iter(),
-        1,
-        0
-    )
-    .is_err());
-    assert!(StreamCall::open(std::iter::empty(), 1, 0).is_err());
+    assert!(StreamCall::open([(&b"content-type"[..], &b"text/plain"[..])].into_iter(), 1).is_err());
+    assert!(StreamCall::open(std::iter::empty(), 1).is_err());
 }
 
-/// The encoding is predev's, which is tonic 0.14's `Status` (v1.5.5 served no gRPC).
+/// The encoding is predev's gRPC line's (v1.5.5 served no gRPC).
 #[test]
-fn the_status_message_is_encoded_as_predevs_tonic_encoded_it() {
+fn the_status_message_is_encoded_as_predev_encoded_it() {
     assert_eq!(
         msg::encode_status_message("a b%\"#<>`?{}~\u{2713}\n".as_bytes()),
         "a%20b%25%22%23%3C%3E%60%3F%7B%7D~%E2%9C%93%0A"
@@ -121,13 +115,13 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
     assert!(wire(&mut c).contains("grpc-status:"));
 }
 
-/// THE CALLER'S `grpc-timeout` HOLDS ON THE SHARED LISTENER TOO: the deadline runs from the call's
-/// arrival, the framer asks the host for its timer, and past it the call fails
-/// `DEADLINE_EXCEEDED` with a failure piece, as the dedicated listener's accept path fails it; the
-/// host's refusal then closes it `DEADLINE_EXCEEDED`. RED before the fix: the stream path read only
-/// `content-type` and never asked for a timer.
+/// A `grpc-timeout` THE CALLER STATES IS NEVER ENFORCED HERE, as predev's server enforced none:
+/// the call asks the host for no timer, and however long it runs it is never closed
+/// `DEADLINE_EXCEEDED` by this framing; the value stays in the head the host keeps, a fact for the
+/// plane. RED before the fix: the framing asked for a timer at the stated deadline and failed the
+/// call `DEADLINE_EXCEEDED` there.
 #[test]
-fn a_stated_grpc_timeout_closes_the_call_deadline_exceeded() {
+fn a_stated_grpc_timeout_is_never_enforced_here() {
     let mut c = StreamCall::open(
         [
             (&b"content-type"[..], &b"application/grpc"[..]),
@@ -135,72 +129,25 @@ fn a_stated_grpc_timeout_closes_the_call_deadline_exceeded() {
         ]
         .into_iter(),
         1024,
-        1_000,
     )
     .expect("a gRPC call");
-    assert_eq!(c.next_deadline(), Some(1_000 + 5_000_000));
-    c.expire(1_000 + 4_999_999);
-    assert!(c.pieces().is_empty(), "not yet");
-    c.expire(1_000 + 5_000_000);
-    assert!(c
-        .pieces()
-        .drain(..)
-        .any(|p| p.status == Some(msg::DEADLINE_EXCEEDED)));
-    assert_eq!(c.next_deadline(), None);
-    c.refuse(b"", 504, false).unwrap();
-    assert_eq!(
-        wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 4\r\n\
-         grpc-message: deadline%20exceeded\r\n",
-        "before any head, the close is the whole answer"
+    assert_eq!(c.next_deadline(), None, "no timer is asked for");
+    c.ingest(&msg::frame(b"q"), true).expect("served");
+    assert!(
+        c.pieces().drain(..).all(|p| !p.failed),
+        "nothing fails the call"
     );
-}
-
-/// A call opened with a `grpc-timeout` of 5ms at host time 1000, already past it.
-fn expired() -> StreamCall {
-    let mut c = StreamCall::open(
-        [
-            (&b"content-type"[..], &b"application/grpc"[..]),
-            (&b"grpc-timeout"[..], &b"5m"[..]),
-        ]
-        .into_iter(),
-        1024,
-        1_000,
-    )
-    .expect("a gRPC call");
-    c.expire(1_000 + 5_000_000);
-    c
-}
-
-/// A DEADLINE AFTER THE HOST'S HEAD WRITES CLOSING LINES ONLY: the timer does not say whether the
-/// host sent the response head, so the expiry writes nothing, and the close is the host's refusal,
-/// which states it (`head_sent`): after a head, the `DEADLINE_EXCEEDED` lines alone, never a second
-/// `:status`. RED before the fix: the expiry wrote `:status: 200` and a content type into the
-/// trailers of a head the host had already sent.
-#[test]
-fn a_deadline_after_the_hosts_head_writes_its_closing_lines_only() {
-    let mut c = expired();
-    assert_eq!(wire(&mut c), "", "the expiry writes nothing");
-    assert!(!c.ended(), "the close is the host's refusal");
-    c.refuse(b"", 504, true).unwrap();
-    assert_eq!(
-        wire(&mut c),
-        "grpc-status: 4\r\ngrpc-message: deadline%20exceeded\r\n"
-    );
-    assert!(c.ended());
-    // The unit's own final status after the expiry closes it DEADLINE_EXCEEDED all the same.
-    let mut c = expired();
+    c.emit(b"late but answered", true);
     c.finish(0, b"", b"").unwrap();
-    assert_eq!(
-        wire(&mut c),
-        "grpc-status: 4\r\ngrpc-message: deadline%20exceeded\r\n"
-    );
+    let mut answer = msg::frame(b"late but answered");
+    answer.extend_from_slice(b"grpc-status: 0\r\n");
+    assert_eq!(c.take_wire(usize::MAX), answer);
 }
 
 /// AN EMIT AFTER THE CLOSE WRITES NOTHING: a reply message the host emits once the call is closed
-/// (or past its deadline) is dropped, as the dedicated listener drops one after its reply is over;
-/// it never lands behind the closing lines the host sends as trailers. RED before the fix: the
-/// message was framed into the wire after the status lines.
+/// is dropped, as the dedicated listener drops one after its reply is over; it never lands behind
+/// the closing lines the host sends as trailers. RED before the fix: the message was framed into
+/// the wire after the status lines.
 #[test]
 fn an_emit_after_the_close_writes_nothing() {
     let mut c = grpc();
@@ -213,65 +160,63 @@ fn an_emit_after_the_close_writes_nothing() {
     drop(c.take_wire(usize::MAX));
     c.emit(b"late", true);
     assert_eq!(wire(&mut c), "");
-    let mut c = expired();
-    c.emit(b"late", true);
-    assert_eq!(wire(&mut c), "", "nothing after the deadline");
 }
 
-/// A COMPRESSION THE DOOR DOES NOT TAKE IS `UNIMPLEMENTED` WITH THE ENCODINGS IT TAKES, as
-/// predev's gRPC line (tonic 0.14, no compression enabled) answered it: the call's first `ingest`
-/// fails, and whatever refusal the host then closes it with, the close is `grpc-accept-encoding:
-/// identity`, `grpc-status: 12` and tonic's words, in tonic's order. `identity` is no compression.
-/// RED before the fix: `grpc-encoding` was never read, the compressed message failed `INTERNAL`,
-/// and the close was the refusal's neutral status mapped.
+/// A call whose head states `fields` after its gRPC content type.
+fn open_with(fields: &[(&'static [u8], &'static [u8])]) -> StreamCall {
+    StreamCall::open(
+        std::iter::once((&b"content-type"[..], &b"application/grpc"[..]))
+            .chain(fields.iter().copied()),
+        1024,
+    )
+    .expect("a gRPC call")
+}
+
+/// The close a compression the door does not take ends a call with, before any reply: the whole
+/// answer, `UNIMPLEMENTED` with the encodings the door takes, and this framer's words.
+const UNIMPLEMENTED_GZIP: &str = ":status: 200\r\ncontent-type: application/grpc\r\n\
+     grpc-accept-encoding: identity\r\ngrpc-status: 12\r\ngrpc-message: the%20message%20encoding\
+     %20%60gzip%60%20is%20not%20supported:%20this%20server%20takes%20identity\r\n";
+
+/// A COMPRESSION THE DOOR DOES NOT TAKE IS `UNIMPLEMENTED` WITH THE ENCODINGS IT TAKES (gRPC's
+/// compression rules, `compression.md`): the call's first `ingest` fails, and whatever refusal the
+/// host then closes it with, the close is `grpc-accept-encoding: identity` and `grpc-status: 12`.
+/// `identity` is no compression. RED before the fix: `grpc-encoding` was never read, the compressed
+/// message failed `INTERNAL`, and the close was the refusal's neutral status mapped.
 #[test]
 fn a_compression_the_door_does_not_take_closes_unimplemented() {
-    let open = |encoding: &'static [u8]| {
-        StreamCall::open(
-            [
-                (&b"content-type"[..], &b"application/grpc"[..]),
-                (&b"grpc-encoding"[..], encoding),
-            ]
-            .into_iter(),
-            1024,
-            0,
-        )
-        .expect("a gRPC call")
-    };
-    let mut c = open(b"gzip");
+    let mut c = open_with(&[(&b"grpc-encoding"[..], &b"gzip"[..])]);
     let why = c.ingest(&[1, 0, 0, 0, 1, b'z'], true).expect_err("refused");
     assert_eq!(
         why.0,
-        "Content is compressed with `gzip` which isn't supported"
+        "the message encoding `gzip` is not supported: this server takes identity"
     );
     assert!(c.pieces().is_empty(), "no message is handed up");
     c.refuse(why.0.as_bytes(), 400, false).unwrap();
-    assert_eq!(
-        wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-accept-encoding: identity\r\n\
-         grpc-status: 12\r\ngrpc-message: Content%20is%20compressed%20with%20%60gzip%60%20which\
-         %20isn't%20supported\r\n"
-    );
-    let mut c = open(b"identity");
+    assert_eq!(wire(&mut c), UNIMPLEMENTED_GZIP);
+    let mut c = open_with(&[(&b"grpc-encoding"[..], &b"identity"[..])]);
     c.ingest(&msg::frame(b"a"), true)
         .expect("identity is no compression");
     assert_eq!(c.pieces().len(), 1);
 }
 
-/// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN (Q128 grpc L1, ruling (a)): when the host states
-/// `RefuseIn::head_sent`, the refusal is the call's closing lines only, the trailers after the
-/// head it answered. RED before the fix: the framer judged by its own state alone and wrote a
-/// second `:status: 200` head.
+/// THE FIRST `grpc-encoding` FIELD IS THE CALL'S: a repeat is not read. A call that states
+/// `identity` and then `gzip` is served; one that states `gzip` and then `identity` is refused
+/// `UNIMPLEMENTED`. RED before the fix: the last field won, so each call was read the other way.
 #[test]
-fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
-    let mut c = grpc();
-    c.refuse(b"", 429, true).unwrap();
-    assert_eq!(
-        wire(&mut c),
-        "grpc-status: 14\r\ngrpc-message: busbar%20answered%20HTTP%20429\r\n"
-    );
-    let mut c = grpc();
-    c.refuse(b"grpc-status: 7\r\ngrpc-message: no\r\n", 0, true)
-        .unwrap();
-    assert_eq!(wire(&mut c), "grpc-status: 7\r\ngrpc-message: no\r\n");
+fn the_first_grpc_encoding_field_is_the_calls() {
+    let mut c = open_with(&[
+        (&b"grpc-encoding"[..], &b"identity"[..]),
+        (&b"grpc-encoding"[..], &b"gzip"[..]),
+    ]);
+    c.ingest(&msg::frame(b"a"), true)
+        .expect("the first field, identity, is the call's");
+    assert_eq!(c.pieces().len(), 1);
+    let mut c = open_with(&[
+        (&b"grpc-encoding"[..], &b"gzip"[..]),
+        (&b"grpc-encoding"[..], &b"identity"[..]),
+    ]);
+    let why = c.ingest(&msg::frame(b"a"), true).expect_err("refused");
+    c.refuse(why.0.as_bytes(), 400, false).unwrap();
+    assert_eq!(wire(&mut c), UNIMPLEMENTED_GZIP);
 }
