@@ -15,7 +15,7 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome, BLOB_JSON};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{
@@ -52,7 +52,7 @@ fn cdylib() -> std::path::PathBuf {
 
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_grpc::door).expect("the door states itself")
+    LinkedRow::of_macro(busbar_transport_grpc::MACRO_DOOR).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -69,12 +69,7 @@ fn open(p: &Plugin<Transport>) {
     let settings = "{}";
     let mut i: OpenIn = z();
     i.head = in_head();
-    i.settings = Blob {
-        ptr: settings.as_ptr(),
-        len: settings.len(),
-        fmt: BLOB_JSON,
-        flags: 0,
-    };
+    i.settings = Blob::json(settings.as_bytes());
     let mut o: OpenOut = z();
     o.head = out_head();
     let mut f = Frame::new(i, o);
@@ -90,10 +85,7 @@ fn script(p: &Plugin<Transport>) -> Script {
     let (mut a, mut n, mut alpn) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
     let mut i: LocateIn = z();
     i.head = in_head();
-    i.target = AbiStr {
-        ptr: target.as_ptr(),
-        len: target.len(),
-    };
+    i.target = AbiStr::of(target);
     (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
     (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
     (i.alpn_buf, i.alpn_cap) = (alpn.as_mut_ptr(), alpn.len());
@@ -123,10 +115,7 @@ fn script(p: &Plugin<Transport>) -> Script {
     let mut i: BeginIn = z();
     i.head = in_head();
     i.side = SIDE_DIAL;
-    i.target = AbiStr {
-        ptr: target.as_ptr(),
-        len: target.len(),
-    };
+    i.target = AbiStr::of(target);
     i.sink = FramerSink {
         wire: wire.as_mut_ptr(),
         wire_cap: wire.len(),
@@ -187,7 +176,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_grpc::door,
+    door: busbar_transport_grpc::MACRO_DOOR,
     cdylib: "busbar_transport_grpc_plugin",
     inputs: include_str!("conformance.json"),
 }

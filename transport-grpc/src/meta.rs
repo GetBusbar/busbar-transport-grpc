@@ -7,7 +7,6 @@
 //! code it describes.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
-use busbar_contract::abi::mechanism::door::KindTailHead;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::transport::{
     FaultRow, SettingDecl, StatusRow, TransportTail, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
@@ -164,36 +163,17 @@ pub(crate) const SETTINGS: &[SettingDecl] = &[
     },
 ];
 
-pub(crate) const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
+pub(crate) const NONE: AbiStr = AbiStr::ABSENT;
 
-pub(crate) const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
-    role: ROLE_FRAMER,
-    framing: FRAMING_STREAM,
-    facts: 0,
-    handshake_max_steps: 0,
-    frame_piece_size: FRAME_PIECE_SIZE,
-    _reserved: 0,
-    composes_over: COMPOSES_OVER.as_ptr(),
-    composes_over_len: COMPOSES_OVER.len(),
-    claim_rows: crate::claims::CLAIMS.as_ptr(),
-    claim_rows_len: crate::claims::CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
-    status_rows: STATUS_ROWS.as_ptr(),
-    status_rows_len: STATUS_ROWS.len(),
-    settings: SETTINGS.as_ptr(),
-    settings_len: SETTINGS.len(),
-    fault_rows: FAULT_ROWS.as_ptr(),
-    fault_rows_len: FAULT_ROWS.len(),
+pub(crate) const TAIL: TransportTail = {
+    let mut t = TransportTail::EMPTY
+        .with_composes_over(COMPOSES_OVER)
+        .with_claim_rows(crate::claims::CLAIMS)
+        .with_status_rows(STATUS_ROWS)
+        .with_settings(SETTINGS)
+        .with_fault_rows(FAULT_ROWS);
+    t.role = ROLE_FRAMER;
+    t.framing = FRAMING_STREAM;
+    t.frame_piece_size = FRAME_PIECE_SIZE;
+    t
 };

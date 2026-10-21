@@ -26,8 +26,9 @@ mod msg;
 mod stream;
 mod transport;
 
-/// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape).
-pub use door::door;
+/// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape), with the
+/// `MACRO_DOOR` the macro expands beside it.
+pub use door::{door, MACRO_DOOR};
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK.
 busbar_contract::hyper_io!(::bytes::Bytes);
