@@ -322,7 +322,7 @@ fn a_trailer_block_stating_grpc_status_wins_over_the_neutral_status() {
 }
 
 #[test]
-fn the_callers_deadline_goes_out_as_grpc_timeout_and_fails_the_call_when_it_passes() {
+fn the_callers_deadline_fails_the_call_when_it_passes_and_never_goes_upstream() {
     let mut p = Pair::new();
     let t0 = p.now;
     p.d.emit(
@@ -335,8 +335,9 @@ fn the_callers_deadline_goes_out_as_grpc_timeout_and_fails_the_call_when_it_pass
     .expect("emit");
     p.settle();
     assert_eq!(
-        field(&head(&p.got_a, 1).bytes, "grpc-timeout").as_deref(),
-        Some(&b"2000000u"[..])
+        field(&head(&p.got_a, 1).bytes, "grpc-timeout"),
+        None,
+        "the deadline is held here, never sent upstream"
     );
     assert_eq!(
         p.d.next_deadline(),
@@ -352,19 +353,31 @@ fn the_callers_deadline_goes_out_as_grpc_timeout_and_fails_the_call_when_it_pass
     assert!(p.d.failure().is_none(), "the connection lives on");
 }
 
+/// AN ACCEPTED CALL'S `grpc-timeout` IS A FACT FOR THE PLANE, NEVER ENFORCED HERE, as predev's
+/// server enforced none: it is handed up among the head's fields, and long past it the call is
+/// still open, with no `DEADLINE_EXCEEDED` from this side. RED before the fix: the accepted side
+/// failed the call `DEADLINE_EXCEEDED` at the stated deadline.
 #[test]
-fn an_accepted_call_past_its_grpc_timeout_ends_deadline_exceeded_both_ways() {
-    let mut p = Pair::new();
-    let t0 = p.now;
-    p.d.emit(1, &call("/pkg.Svc/Slow", &[], &[b"q"]), true, t0 + SEC, t0)
-        .expect("emit");
-    p.settle();
-    // Both clocks run: the dialled deadline and the accepted grpc-timeout are the same instant.
-    p.at(t0 + SEC);
-    let a = terminal(&p.got_a, 1).expect("the accepted side's terminal");
-    assert_eq!(a.status, Some(msg::DEADLINE_EXCEEDED));
-    let d = terminal(&p.got_d, 1).expect("the dialled side's terminal");
-    assert_eq!(d.status, Some(msg::DEADLINE_EXCEEDED));
+fn an_accepted_calls_grpc_timeout_is_handed_up_and_never_enforced() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    a.ingest(
+        &opening_with(Some("trailers"), &[("grpc-timeout", "1m")]),
+        false,
+    );
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert_eq!(
+        field(&head(&got, 1).bytes, "grpc-timeout").as_deref(),
+        Some(&b"1m"[..]),
+        "the caller's deadline reaches the plane"
+    );
+    assert_eq!(a.next_deadline(), None, "no timer is asked for");
+    a.drive(60 * SEC);
+    assert!(
+        a.pieces().drain(..).all(|p| !p.failed),
+        "nothing fails the call"
+    );
+    assert_eq!(held(&a), 1, "the call is still open");
 }
 
 #[test]
@@ -430,6 +443,11 @@ fn h2(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 /// HPACK by hand (indexed and literal-without-indexing fields, no Huffman), so a field hyper's own
 /// client would never send can be.
 fn opening(te: Option<&str>) -> Vec<u8> {
+    opening_with(te, &[])
+}
+
+/// [`opening`], with `extra` fields after `te`.
+fn opening_with(te: Option<&str>, extra: &[(&str, &str)]) -> Vec<u8> {
     let lit = |out: &mut Vec<u8>, s: &str| {
         out.push(u8::try_from(s.len()).expect("short"));
         out.extend_from_slice(s.as_bytes());
@@ -445,6 +463,11 @@ fn opening(te: Option<&str>) -> Vec<u8> {
         block.push(0x00);
         lit(&mut block, "te");
         lit(&mut block, te);
+    }
+    for (name, value) in extra {
+        block.push(0x00);
+        lit(&mut block, name);
+        lit(&mut block, value);
     }
     let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     out.extend(h2(4, 0, 0, &[]));
@@ -959,101 +982,239 @@ fn an_oversize_message_fails_out_of_range_in_predevs_words() {
     assert_eq!(end.bytes.as_ref(), words.as_bytes());
 }
 
-// ── a far end's reset, by its code ───────────────────────────────────────────────────────────────
+// ── a dialled stream's failure below gRPC, by its HTTP/2 code ────────────────────────────────────
 
-/// The far end resets dialled stream 1 with RST_STREAM `code`: before the answer's head
-/// (`after_head` false: the call is sent and unanswered) or after it (the head is in, the body
-/// still open). The dialled side's terminal piece.
-fn reset_by_far_end(code: u32, after_head: bool) -> Piece {
+/// A dialled call on stream 1, sent whole and unanswered; with `after_head`, its answer's head is
+/// in and its body still open (after `partial` bytes of a message, where any).
+fn open_call(after_head: bool, partial: &[u8]) -> Pair {
     let mut p = Pair::new();
     p.d.emit(1, &call("/pkg.Svc/Say", &[], &[b"q"]), true, 0, p.now)
         .expect("emit");
     p.settle();
     if after_head {
         p.a.emit(1, b"\r\n", false, 0, p.now).expect("answer head");
+        if !partial.is_empty() {
+            p.a.emit(1, partial, false, 0, p.now)
+                .expect("part of a message");
+        }
         p.settle();
         head(&p.got_d, 1);
     }
     assert!(terminal(&p.got_d, 1).is_none(), "the call is still open");
-    // The far end's frame, carried to the dialled side as the far end's own bytes.
-    p.d.ingest(&h2(3, 0, 1, &code.to_be_bytes()), false);
+    p
+}
+
+/// `frame` carried to the dialled side as the far end's own bytes; the stream's terminal piece.
+fn far_end_sends(mut p: Pair, frame: &[u8]) -> Piece {
+    p.d.ingest(frame, false);
     p.settle();
     let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
-    assert!(t.failed, "the reset fails the stream: {t:?}");
-    assert!(p.d.failure().is_none(), "the connection lives on");
+    assert!(t.failed, "the stream fails: {t:?}");
     t
 }
 
-/// The status a reset with `code` fails the dialled stream with, before and after the head.
-fn reset_status_both_ways(code: u32) -> [Option<u16>; 2] {
-    [
-        reset_by_far_end(code, false).status,
-        reset_by_far_end(code, true).status,
-    ]
+/// The status and text a far end's RST_STREAM `code` fails the dialled stream with, before the
+/// answer's head and after it.
+fn reset_both_ways(code: u32) -> [(Option<u16>, String); 2] {
+    [false, true].map(|after_head| {
+        let t = far_end_sends(
+            open_call(after_head, b""),
+            &h2(3, 0, 1, &code.to_be_bytes()),
+        );
+        (t.status, String::from_utf8_lossy(&t.bytes).into_owned())
+    })
 }
 
-/// A FAR END'S RST_STREAM `CANCEL` IS `CANCELLED` (gRPC over HTTP/2, "Errors"), before or after the
-/// answer's head: the caller's class, no penalty to the destination. RED before the fix: read as
-/// `UNAVAILABLE` before the head and `INTERNAL` after it, whatever the code.
-#[test]
-fn a_far_ends_cancel_reset_fails_the_call_cancelled() {
-    assert_eq!(reset_status_both_ways(0x8), [Some(msg::CANCELLED); 2]);
+/// `code` fails the stream with `status` both ways, and the framer's own text naming `name`.
+fn assert_reset(code: u32, status: u16, name: &str) {
+    let text = format!("the stream was reset: {name}");
+    let [before, after] = reset_both_ways(code);
+    assert_eq!(before, (Some(status), text.clone()), "before the head");
+    if code == 0 {
+        // `hyper` reads a NO_ERROR reset after the head as the body's end: the answer ended with
+        // no trailers, and that is INTERNAL in its own words.
+        assert_eq!(
+            after,
+            (
+                Some(status),
+                "the answer ended without a grpc-status".into()
+            ),
+            "after the head"
+        );
+    } else {
+        assert_eq!(after, (Some(status), text), "after the head");
+    }
 }
 
-/// RST_STREAM `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`. RED before the fix, as above.
+// The gRPC over HTTP/2 table (PROTOCOL-HTTP2.md, "Errors"), one test per code. predev's hop read
+// no code (every transport failure was one refusal), so the table is the reference. RED before
+// the fix, where marked: a far end's reset before the head was UNAVAILABLE and after it INTERNAL,
+// whatever the code, and only a far end's reset was read by code at all.
+
+/// `NO_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head, UNKNOWN after it.
 #[test]
-fn a_far_ends_enhance_your_calm_reset_fails_the_call_resource_exhausted() {
+fn a_no_error_reset_fails_the_call_internal() {
+    assert_reset(0x0, msg::INTERNAL, "NO_ERROR");
+}
+
+/// `PROTOCOL_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn a_protocol_error_reset_fails_the_call_internal() {
+    assert_reset(0x1, msg::INTERNAL, "PROTOCOL_ERROR");
+}
+
+/// `INTERNAL_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn an_internal_error_reset_fails_the_call_internal() {
+    assert_reset(0x2, msg::INTERNAL, "INTERNAL_ERROR");
+}
+
+/// `FLOW_CONTROL_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn a_flow_control_error_reset_fails_the_call_internal() {
+    assert_reset(0x3, msg::INTERNAL, "FLOW_CONTROL_ERROR");
+}
+
+/// `SETTINGS_TIMEOUT` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn a_settings_timeout_reset_fails_the_call_internal() {
+    assert_reset(0x4, msg::INTERNAL, "SETTINGS_TIMEOUT");
+}
+
+/// `STREAM_CLOSED`, which the table does not list, is `INTERNAL`, as every code the table does not
+/// read otherwise. RED: UNAVAILABLE before the head.
+#[test]
+fn a_stream_closed_reset_fails_the_call_internal() {
+    assert_reset(0x5, msg::INTERNAL, "STREAM_CLOSED");
+}
+
+/// `FRAME_SIZE_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn a_frame_size_error_reset_fails_the_call_internal() {
+    assert_reset(0x6, msg::INTERNAL, "FRAME_SIZE_ERROR");
+}
+
+/// `REFUSED_STREAM` is `UNAVAILABLE`: the far end processed nothing. RED: INTERNAL after the head.
+#[test]
+fn a_refused_stream_reset_fails_the_call_unavailable() {
+    assert_reset(0x7, msg::UNAVAILABLE, "REFUSED_STREAM");
+}
+
+/// `CANCEL` is `CANCELLED`. RED: UNAVAILABLE before the head, INTERNAL after it.
+#[test]
+fn a_cancel_reset_fails_the_call_cancelled() {
+    assert_reset(0x8, msg::CANCELLED, "CANCEL");
+}
+
+/// `COMPRESSION_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn a_compression_error_reset_fails_the_call_internal() {
+    assert_reset(0x9, msg::INTERNAL, "COMPRESSION_ERROR");
+}
+
+/// `CONNECT_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn a_connect_error_reset_fails_the_call_internal() {
+    assert_reset(0xa, msg::INTERNAL, "CONNECT_ERROR");
+}
+
+/// `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`. RED: UNAVAILABLE before the head, INTERNAL after.
+#[test]
+fn an_enhance_your_calm_reset_fails_the_call_resource_exhausted() {
+    assert_reset(0xb, msg::RESOURCE_EXHAUSTED, "ENHANCE_YOUR_CALM");
+}
+
+/// `INADEQUATE_SECURITY` is `PERMISSION_DENIED`. RED: UNAVAILABLE before the head, INTERNAL after.
+#[test]
+fn an_inadequate_security_reset_fails_the_call_permission_denied() {
+    assert_reset(0xc, msg::PERMISSION_DENIED, "INADEQUATE_SECURITY");
+}
+
+/// `HTTP_1_1_REQUIRED` is `INTERNAL`. RED: UNAVAILABLE before the head.
+#[test]
+fn an_http_1_1_required_reset_fails_the_call_internal() {
+    assert_reset(0xd, msg::INTERNAL, "HTTP_1_1_REQUIRED");
+}
+
+/// A CODE HTTP/2 DOES NOT DEFINE is `INTERNAL`: RFC 9113 §7 reads an unknown code as
+/// `INTERNAL_ERROR`, and nothing about it says the far end processed nothing, so it is never read
+/// as safe to retry; predev's hop read no code, so nothing there differs. RED: UNAVAILABLE before
+/// the head.
+#[test]
+fn an_unknown_code_reset_fails_the_call_internal() {
+    assert_reset(0x1f, msg::INTERNAL, "error code 0x1f");
+}
+
+/// A RESET OF OUR OWN is read by its code as the far end's is: a malformed answer head (a
+/// connection-specific field, which HTTP/2 forbids) has the connection reset the stream
+/// `PROTOCOL_ERROR` itself, and the call fails `INTERNAL`. RED: UNAVAILABLE, a local reset not read
+/// by its code.
+#[test]
+fn a_local_reset_is_read_by_its_code() {
+    // HPACK: `:status: 200` (static index 8), then `connection: close` as a literal.
+    let mut block = vec![0x88, 0x00, 10];
+    block.extend_from_slice(b"connection");
+    block.push(5);
+    block.extend_from_slice(b"close");
+    let t = far_end_sends(open_call(false, b""), &h2(1, 0x4, 1, &block));
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    assert_eq!(t.bytes.as_ref(), b"the stream was reset: PROTOCOL_ERROR");
+}
+
+/// A GOAWAY THAT LEAVES THE STREAM UNPROCESSED is read by its code, as a reset is: last stream 0
+/// and `ENHANCE_YOUR_CALM` fail the open call `RESOURCE_EXHAUSTED`. RED: UNAVAILABLE.
+#[test]
+fn a_goaway_is_read_by_its_code() {
+    let mut payload = 0u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(&0xbu32.to_be_bytes());
+    let t = far_end_sends(open_call(false, b""), &h2(7, 0, 0, &payload));
+    assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
     assert_eq!(
-        reset_status_both_ways(0xb),
-        [Some(msg::RESOURCE_EXHAUSTED); 2]
+        t.bytes.as_ref(),
+        b"the connection went away: ENHANCE_YOUR_CALM"
     );
 }
 
-/// RST_STREAM `INADEQUATE_SECURITY` is `PERMISSION_DENIED`. RED before the fix, as above.
+/// A CONNECTION LOST BEFORE ANY STATUS is `UNAVAILABLE`, before the answer's head or after it: the
+/// far end's bytes end with the call open. RED: INTERNAL after the head, with `hyper`'s text.
 #[test]
-fn a_far_ends_inadequate_security_reset_fails_the_call_permission_denied() {
+fn a_connection_lost_before_any_status_fails_the_call_unavailable() {
+    for after_head in [false, true] {
+        let mut p = open_call(after_head, b"");
+        p.d.ingest(&[], true);
+        p.settle();
+        let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
+        assert!(t.failed);
+        assert_eq!(t.status, Some(msg::UNAVAILABLE), "after_head {after_head}");
+        assert_eq!(
+            t.bytes.as_ref(),
+            b"the connection to the far end was lost",
+            "after_head {after_head}"
+        );
+    }
+}
+
+/// AN ANSWER THAT ENDS INSIDE A MESSAGE, with no trailers (here the far end's NO_ERROR reset after
+/// part of a message), is `INTERNAL` in this framer's words. RED: UNKNOWN.
+#[test]
+fn an_answer_cut_inside_a_message_fails_the_call_internal() {
+    let part = &msg::frame(b"hello")[..3];
+    let t = far_end_sends(open_call(true, part), &h2(3, 0, 1, &0u32.to_be_bytes()));
+    assert_eq!(t.status, Some(msg::INTERNAL));
     assert_eq!(
-        reset_status_both_ways(0xc),
-        [Some(msg::PERMISSION_DENIED); 2]
+        t.bytes.as_ref(),
+        b"the answer ended inside a message, with no grpc-status"
     );
-}
-
-/// RST_STREAM `REFUSED_STREAM` is `UNAVAILABLE` (the far end processed nothing), after the head
-/// too. RED before the fix: `INTERNAL` after the head.
-#[test]
-fn a_far_ends_refused_stream_reset_fails_the_call_unavailable() {
-    assert_eq!(reset_status_both_ways(0x7), [Some(msg::UNAVAILABLE); 2]);
-}
-
-/// RST_STREAM `PROTOCOL_ERROR`, like every code the table does not name, is `INTERNAL`, before the
-/// head too. RED before the fix: `UNAVAILABLE` (a retryable status) before the head.
-#[test]
-fn a_far_ends_protocol_error_reset_fails_the_call_internal() {
-    assert_eq!(reset_status_both_ways(0x1), [Some(msg::INTERNAL); 2]);
-}
-
-/// RST_STREAM `INTERNAL_ERROR` is `INTERNAL`, before the head too. RED before the fix:
-/// `UNAVAILABLE` before the head.
-#[test]
-fn a_far_ends_internal_error_reset_fails_the_call_internal() {
-    assert_eq!(reset_status_both_ways(0x2), [Some(msg::INTERNAL); 2]);
-}
-
-/// RST_STREAM `FLOW_CONTROL_ERROR` is `INTERNAL`, before the head too. RED before the fix:
-/// `UNAVAILABLE` before the head.
-#[test]
-fn a_far_ends_flow_control_error_reset_fails_the_call_internal() {
-    assert_eq!(reset_status_both_ways(0x3), [Some(msg::INTERNAL); 2]);
 }
 
 // ── compression ──────────────────────────────────────────────────────────────────────────────────
 
-/// A COMPRESSION THE SERVER DOES NOT TAKE IS ANSWERED `UNIMPLEMENTED`, as predev's server (tonic
-/// 0.14, no compression enabled) answered it: trailers-only, before a message is read, with
-/// `grpc-accept-encoding: identity` and tonic's words, and never handed up. A call stating
-/// `identity` is no compressed call, and is served. RED before the fix: `grpc-encoding` was never
-/// read, the call was handed up, and its compressed message failed `INTERNAL` with no
-/// `grpc-accept-encoding` to fall back on.
+/// A COMPRESSION THE SERVER DOES NOT TAKE IS ANSWERED `UNIMPLEMENTED` (gRPC's compression rules,
+/// `compression.md`): trailers-only, before a message is read, with `grpc-accept-encoding:
+/// identity` and this framer's words, and never handed up. A call stating `identity` is no
+/// compressed call, and is served. RED before the fix: `grpc-encoding` was never read, the call
+/// was handed up, and its compressed message failed `INTERNAL` with no `grpc-accept-encoding` to
+/// fall back on.
 #[test]
 fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
     let mut p = Pair::new();
@@ -1074,7 +1235,7 @@ fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
     assert!(end.failed);
     assert_eq!(
         end.bytes.as_ref(),
-        b"Content is compressed with `gzip` which isn't supported"
+        b"the message encoding `gzip` is not supported: this server takes identity"
     );
 
     let mut p = Pair::new();
@@ -1094,26 +1255,52 @@ fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
     );
 }
 
-// ── the framer's own head lines ──────────────────────────────────────────────────────────────────
-
-/// THE HEAD'S OWN `grpc-timeout` GOES OUT AS SIGNED. The host puts the framer's own lines (stated
-/// at `locate`) in the head before the auth signs it; the dial sends the head's `grpc-timeout` as
-/// it stands, never one of its own written after the auth ran (THE DESIGN §6, step 5). A head
-/// stating none still carries the remaining deadline. RED before the fix: the head's value was
-/// dropped and the remaining deadline written in its place.
+/// THE FIRST `grpc-encoding` FIELD IS THE CALL'S on the dedicated listener too: `identity` then
+/// `gzip` is served, `gzip` then `identity` is answered `UNIMPLEMENTED` and never handed up.
 #[test]
-fn a_grpc_timeout_the_head_states_goes_out_as_signed() {
+fn the_first_grpc_encoding_field_is_the_calls() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    a.ingest(
+        &opening_with(
+            Some("trailers"),
+            &[("grpc-encoding", "identity"), ("grpc-encoding", "gzip")],
+        ),
+        false,
+    );
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert!(!of(&got, 1).is_empty(), "identity first: served");
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    a.ingest(
+        &opening_with(
+            Some("trailers"),
+            &[("grpc-encoding", "gzip"), ("grpc-encoding", "identity")],
+        ),
+        false,
+    );
+    a.drive(5 * SEC);
+    assert!(a.pieces().is_empty(), "gzip first: never handed up");
+    assert_eq!(held(&a), 0);
+}
+
+// ── no grpc-timeout upstream ─────────────────────────────────────────────────────────────────────
+
+/// NO `grpc-timeout` GOES UPSTREAM, as predev's hop sent none (predev
+/// `crates/busbar-a2a/src/a2a/relay.rs` `build_request`): not one of the dial's own, and not one
+/// the head carries. The attempt's deadline still holds the call, here. RED before the fix: the
+/// head's value went out verbatim (and, with none, the remaining deadline was written).
+#[test]
+fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
     let mut p = Pair::new();
     let t0 = p.now;
-    // The head as the host hands it: the framer's own lines in it, added before the auth.
-    let signed: [(&str, &[u8]); 3] = [
+    let carried: [(&str, &[u8]); 3] = [
         ("content-type", b"application/grpc"),
         ("te", b"trailers"),
         ("grpc-timeout", b"7S"),
     ];
     p.d.emit(
         1,
-        &call("/pkg.Svc/Say", &signed, &[b"q"]),
+        &call("/pkg.Svc/Say", &carried, &[b"q"]),
         true,
         t0 + 2 * SEC,
         t0,
@@ -1121,7 +1308,7 @@ fn a_grpc_timeout_the_head_states_goes_out_as_signed() {
     .expect("emit");
     p.settle();
     let h = head(&p.got_a, 1);
-    assert_eq!(field(&h.bytes, "grpc-timeout").as_deref(), Some(&b"7S"[..]));
+    assert_eq!(field(&h.bytes, "grpc-timeout"), None, "no grpc-timeout");
     assert_eq!(
         field(&h.bytes, "content-type").as_deref(),
         Some(&b"application/grpc"[..])
