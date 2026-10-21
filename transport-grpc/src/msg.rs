@@ -257,8 +257,9 @@ pub fn status_of_http(code: u16) -> u16 {
 /// table lists so (`NO_ERROR`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `FLOW_CONTROL_ERROR`,
 /// `SETTINGS_TIMEOUT`, `FRAME_SIZE_ERROR`, `COMPRESSION_ERROR`, `CONNECT_ERROR`,
 /// `HTTP_1_1_REQUIRED`), `STREAM_CLOSED`, which it does not list, and a code HTTP/2 does not
-/// define. RFC 9113 §7 has an unknown code read as `INTERNAL_ERROR`, and nothing about such a
-/// stream says the far end processed nothing, so it is never read as safe to retry.
+/// define. These last follow the coordinator's ruling for row 159 ("all others → INTERNAL"); RFC
+/// 9113 §7 permits it, saying an unknown code MAY be treated as `INTERNAL_ERROR`, and nothing about
+/// such a stream says the far end processed nothing, so it is never read as safe to retry.
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
     match code {
