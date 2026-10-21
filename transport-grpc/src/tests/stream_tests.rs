@@ -80,13 +80,13 @@ fn the_status_message_is_encoded_as_predev_encoded_it() {
     );
 }
 
-/// AN OVERSIZE MESSAGE ON ONE STREAM CLOSES IT `OUT_OF_RANGE` NAMING THE LIMIT. The body's message
+/// AN OVERSIZE MESSAGE ON ONE STREAM CLOSES IT `RESOURCE_EXHAUSTED` NAMING THE LIMIT. The body's message
 /// states a length past the ceiling: `ingest` fails, and the refusal the host then closes the
 /// stream with (its neutral status for a body it could not decode, the failure's text as its
-/// bytes) is rendered as `grpc-status: 11` and this framer's own words, which print the configured
+/// bytes) is rendered as `grpc-status: 8` and this framer's own words, which print the configured
 /// limit (coordinator ruling (b)). RED before the fix: the words were predev's server's.
 #[test]
-fn an_oversize_message_closes_the_stream_out_of_range_naming_the_limit() {
+fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
     let mut c = grpc();
     let mut body = vec![0u8];
     body.extend_from_slice(&1025u32.to_be_bytes());
@@ -94,7 +94,7 @@ fn an_oversize_message_closes_the_stream_out_of_range_naming_the_limit() {
     c.refuse(why.0.as_bytes(), 400, false).unwrap();
     assert_eq!(
         wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 11\r\n\
+        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 8\r\n\
          grpc-message: the%20message%20is%201025%20bytes,%20over%20the%20limit%20of%201024%20bytes\
          %20(limits.request_body_max_bytes)\r\n"
     );

@@ -542,7 +542,7 @@ fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
 
 /// AN OVERSIZE MESSAGE IS REFUSED AT THE CONFIGURED LIMIT, IN THIS FRAMER'S WORDS (coordinator
 /// ruling (b)): `limits.request_body_max_bytes` bounds a message on the accepting side, and the close
-/// is `OUT_OF_RANGE` with text that prints the configured number, whatever refusal the host then
+/// is `RESOURCE_EXHAUSTED` with text that prints the configured number, whatever refusal the host then
 /// closes the failed stream with. A non-default limit, both images. RED before the fix: predev's
 /// server's words.
 #[test]
@@ -559,7 +559,7 @@ fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words(
         assert_eq!(host.refuse_as(1, b"", 400), Outcome::Ready);
         assert_eq!(
             String::from_utf8_lossy(&host.wire_log[at..]),
-            ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 11\r\n\
+            ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 8\r\n\
              grpc-message: the%20message%20is%202049%20bytes,%20over%20the%20limit%20of%202048\
              %20bytes%20(limits.request_body_max_bytes)\r\n"
         );

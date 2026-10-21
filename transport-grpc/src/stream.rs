@@ -23,8 +23,8 @@
 //!   host's trailers;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
 //!   mapped ([`msg::status_of_refusal`], predev's words); a body whose message was over the ceiling
-//!   closes `OUT_OF_RANGE` in this framer's words, naming the configured limit, whatever the refusal; before any message went
-//!   out the block is the whole answer (trailers-only: `:status: 200`, `content-type`, then the
+//!   closes `RESOURCE_EXHAUSTED` in this framer's words, naming the configured limit, whatever the
+//!   refusal; before any message went out the block is the whole answer (trailers-only: `:status: 200`, `content-type`, then the
 //!   status lines).
 //!
 //! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
@@ -48,7 +48,7 @@ pub struct StreamCall {
     answered: bool,
     closed: bool,
     /// The body was refused for what it is (a message over the ceiling, a compression the door
-    /// does not take): the call closes with predev's status and words for it (`OUT_OF_RANGE`,
+    /// does not take): the call closes with its status and words for it (`RESOURCE_EXHAUSTED`,
     /// `UNIMPLEMENTED`), whatever refusal the host then closes it with.
     oversize: Option<msg::Bad>,
 }

@@ -69,14 +69,15 @@ pub enum Bad {
 }
 
 impl Bad {
-    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message (the
-    /// status predev's gRPC line answered it with); `UNIMPLEMENTED` for
+    /// The `grpc-status` a call fails with for it: `RESOURCE_EXHAUSTED` for an oversize message, on
+    /// the dial and both accept paths (gRPC's status codes: "received message larger than max";
+    /// coordinator ruling); `UNIMPLEMENTED` for
     /// a compression the door does not take (gRPC's compression rules, `compression.md`);
     /// `INTERNAL` else.
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
-            Self::TooLarge(..) => OUT_OF_RANGE,
+            Self::TooLarge(..) => RESOURCE_EXHAUSTED,
             Self::Encoding(_) => UNIMPLEMENTED,
             Self::Compressed | Self::Truncated => INTERNAL,
         }
@@ -225,8 +226,6 @@ pub const DEADLINE_EXCEEDED: u16 = 4;
 pub const PERMISSION_DENIED: u16 = 7;
 /// `RESOURCE_EXHAUSTED`.
 pub const RESOURCE_EXHAUSTED: u16 = 8;
-/// `OUT_OF_RANGE`.
-pub const OUT_OF_RANGE: u16 = 11;
 /// `UNIMPLEMENTED`.
 pub const UNIMPLEMENTED: u16 = 12;
 /// `INTERNAL`.

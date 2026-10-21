@@ -952,13 +952,13 @@ fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
 
 // ── an oversize message ──────────────────────────────────────────────────────────────────────────
 
-/// AN OVERSIZE MESSAGE FAILS `OUT_OF_RANGE` NAMING THE LIMIT. A call whose message states a length
+/// AN OVERSIZE MESSAGE FAILS `RESOURCE_EXHAUSTED` NAMING THE LIMIT. A call whose message states a length
 /// past the ceiling (`limits.request_body_max_bytes`, the knob that bounds every inbound body)
-/// fails `OUT_OF_RANGE` (code 11) in this framer's own words, which print that configured ceiling
+/// fails `RESOURCE_EXHAUSTED` (code 8) in this framer's own words, which print that configured ceiling
 /// (coordinator ruling (b)). Both ends see it: the accepted side's failure piece, and the dialled
 /// side's trailers and decoded message. RED before the fix: predev's server's words.
 #[test]
-fn an_oversize_message_fails_out_of_range_naming_the_limit_on_the_accepted_side() {
+fn an_oversize_message_fails_resource_exhausted_naming_the_limit_on_the_accepted_side() {
     let mut p = Pair::new();
     let limit = posture().max_message_bytes;
     let over = u32::try_from(limit + 1).expect("small");
@@ -973,16 +973,24 @@ fn an_oversize_message_fails_out_of_range_naming_the_limit_on_the_accepted_side(
     );
     let a = terminal(&p.got_a, 1).expect("the accepted side fails it");
     assert!(a.failed, "{a:?}");
-    assert_eq!(a.status, Some(11), "OUT_OF_RANGE");
+    assert_eq!(
+        a.status,
+        Some(msg::RESOURCE_EXHAUSTED),
+        "RESOURCE_EXHAUSTED"
+    );
     assert_eq!(a.bytes.as_ref(), words.as_bytes());
     let t = terminal(&p.got_d, 1).expect("the dialled side's trailers");
-    assert_eq!(t.status, Some(11), "OUT_OF_RANGE");
+    assert_eq!(
+        t.status,
+        Some(msg::RESOURCE_EXHAUSTED),
+        "RESOURCE_EXHAUSTED"
+    );
     let end = last(&p.got_d, 1).expect("terminal");
     assert!(end.failed);
     assert_eq!(end.bytes.as_ref(), words.as_bytes());
 }
 
-/// AN OVERSIZE ANSWER ON THE DIAL is `OUT_OF_RANGE` in this framer's own words: predev's hop had no
+/// AN OVERSIZE ANSWER ON THE DIAL is `RESOURCE_EXHAUSTED` in this framer's own words: predev's hop had no
 /// gRPC status for it (its refusal was `BodyTooLarge`), so nothing of predev's server is copied.
 /// RED before the fix: the dial handed the host predev's server wording ("Error, decoded message
 /// length too large: ...").
@@ -999,7 +1007,7 @@ fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
     p.settle();
     let t = terminal(&p.got_d, 1).cloned().expect("the dial fails it");
     assert!(t.failed, "{t:?}");
-    assert_eq!(t.status, Some(msg::OUT_OF_RANGE));
+    assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
     assert_eq!(
         String::from_utf8_lossy(&t.bytes),
         format!("the answer's message is {over} bytes, over the limit of {limit} bytes")
