@@ -285,9 +285,13 @@ slot!(
         a.extend(authority.as_bytes());
         n.extend(host.as_bytes());
         l.extend(offer);
-        d.extend(default_lines(timeout).as_bytes());
+        // A host that lends no defaults buffer predates it: no line is stated, and the dial writes
+        // its own as before (the contract's `LocateIn::defaults_buf`).
+        if i.defaults_cap != 0 {
+            d.extend(default_lines(timeout).as_bytes());
+        }
         // One short answer for every buffer, each at its full size. The framer's own lines are
-        // owed to every call, so a defaults buffer too small for them is a short answer too.
+        // owed to every call, so a lent defaults buffer too small for them is a short answer too.
         let short = !(a.fits() && n.fits() && l.fits() && d.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
