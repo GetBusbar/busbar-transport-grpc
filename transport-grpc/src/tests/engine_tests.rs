@@ -959,7 +959,7 @@ fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
 /// it: the accepted side's failure piece, and the dialled side's trailers and decoded message. RED
 /// before the fix: INTERNAL, with this framer's own words.
 #[test]
-fn an_oversize_message_fails_out_of_range_in_predevs_words() {
+fn an_oversize_message_fails_out_of_range_in_predevs_words_on_the_accepted_side() {
     let mut p = Pair::new();
     let limit = posture().max_message_bytes;
     let over = u32::try_from(limit + 1).expect("small");
@@ -980,6 +980,30 @@ fn an_oversize_message_fails_out_of_range_in_predevs_words() {
     let end = last(&p.got_d, 1).expect("terminal");
     assert!(end.failed);
     assert_eq!(end.bytes.as_ref(), words.as_bytes());
+}
+
+/// AN OVERSIZE ANSWER ON THE DIAL is `OUT_OF_RANGE` in this framer's own words: predev's hop had no
+/// gRPC status for it (its refusal was `BodyTooLarge`), so nothing of predev's server is copied.
+/// RED before the fix: the dial handed the host predev's server wording ("Error, decoded message
+/// length too large: ...").
+#[test]
+fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
+    let mut p = open_call(false, b"");
+    let limit = posture().max_message_bytes;
+    let over = u32::try_from(limit + 1).expect("small");
+    p.a.emit(1, b"\r\n", false, 0, p.now).expect("answer head");
+    let mut prefix = vec![0u8];
+    prefix.extend_from_slice(&over.to_be_bytes());
+    p.a.emit(1, &prefix, false, 0, p.now)
+        .expect("an oversize prefix");
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the dial fails it");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.status, Some(msg::OUT_OF_RANGE));
+    assert_eq!(
+        String::from_utf8_lossy(&t.bytes),
+        format!("the answer's message is {over} bytes, over the limit of {limit} bytes")
+    );
 }
 
 // ── a dialled stream's failure below gRPC, by its HTTP/2 code ────────────────────────────────────
@@ -1136,9 +1160,9 @@ fn an_http_1_1_required_reset_fails_the_call_internal() {
     assert_reset(0xd, msg::INTERNAL, "HTTP_1_1_REQUIRED");
 }
 
-/// A CODE HTTP/2 DOES NOT DEFINE is `INTERNAL`: RFC 9113 §7 reads an unknown code as
-/// `INTERNAL_ERROR`, and nothing about it says the far end processed nothing, so it is never read
-/// as safe to retry; predev's hop read no code, so nothing there differs. RED: UNAVAILABLE before
+/// A CODE HTTP/2 DOES NOT DEFINE is `INTERNAL`, by the coordinator's "all others → INTERNAL" ruling
+/// (RFC 9113 §7: an unknown code MAY be treated as `INTERNAL_ERROR`); nothing about it says the far
+/// end processed nothing, so it is never read as safe to retry, and predev's hop read no code. RED: UNAVAILABLE before
 /// the head.
 #[test]
 fn an_unknown_code_reset_fails_the_call_internal() {

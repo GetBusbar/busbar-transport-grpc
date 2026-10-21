@@ -220,3 +220,21 @@ fn the_first_grpc_encoding_field_is_the_calls() {
     c.refuse(why.0.as_bytes(), 400, false).unwrap();
     assert_eq!(wire(&mut c), UNIMPLEMENTED_GZIP);
 }
+
+/// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN (Q128 grpc L1, ruling (a)): when the host states
+/// `RefuseIn::head_sent`, the refusal is the call's closing lines only, the trailers after the
+/// head it answered. RED before the fix: the framer judged by its own state alone and wrote a
+/// second `:status: 200` head.
+#[test]
+fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
+    let mut c = grpc();
+    c.refuse(b"", 429, true).unwrap();
+    assert_eq!(
+        wire(&mut c),
+        "grpc-status: 14\r\ngrpc-message: busbar%20answered%20HTTP%20429\r\n"
+    );
+    let mut c = grpc();
+    c.refuse(b"grpc-status: 7\r\ngrpc-message: no\r\n", 0, true)
+        .unwrap();
+    assert_eq!(wire(&mut c), "grpc-status: 7\r\ngrpc-message: no\r\n");
+}

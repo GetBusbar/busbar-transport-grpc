@@ -915,7 +915,7 @@ fn advance(
                     Ok(d) => {
                         let got = msgs
                             .push(&d)
-                            .map_err(|e| (e.to_string(), e.status(), false))?;
+                            .map_err(|e| (dial_bad_text(&e), e.status(), false))?;
                         out.extend(got.into_iter().map(|m| Piece::data(id, m)));
                     }
                     Err(other) => {
@@ -978,6 +978,18 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
         msg::UNAVAILABLE,
         "the connection to the far end was lost".into(),
     )
+}
+
+/// What a dialled answer that is no message stream is called, in this framer's own words: predev's
+/// hop had no gRPC status for an oversize answer (its refusal was `BodyTooLarge`), so the words
+/// predev's server gave an oversize request are not repeated here.
+fn dial_bad_text(e: &msg::Bad) -> String {
+    match e {
+        msg::Bad::TooLarge(n, limit) => {
+            format!("the answer's message is {n} bytes, over the limit of {limit} bytes")
+        }
+        other => other.to_string(),
+    }
 }
 
 /// The fields the trailers' code and the terminal piece carry, never a field block's.
