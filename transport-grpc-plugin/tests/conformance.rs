@@ -25,7 +25,7 @@ use busbar_plugin_loader::dispatch::kinds::hook::Hook;
 use busbar_plugin_loader::dispatch::kinds::transport::Transport;
 use busbar_plugin_loader::dispatch::{
     in_head, load_dropped, load_linked, out_head, Bind, ConnTable, DispatchConfig, Dispatcher,
-    Frame, LinkedRow, LoadError, NoSink, Plugin,
+    Frame, LinkedRow, LoadError, LoadedDoor, NoSink, Plugin,
 };
 
 fn z<T>() -> T {
@@ -50,9 +50,16 @@ fn cdylib() -> std::path::PathBuf {
         .unwrap_or_else(|| panic!("the busbar-transport-grpc-plugin cdylib ({file}) is not built"))
 }
 
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> LoadedDoor {
+    // SAFETY: `door` is this crate's own `plugin_door!` entry.
+    unsafe { LoadedDoor::from_raw(busbar_transport_grpc::door) }
+}
+
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_grpc::door).expect("the door states itself")
+    LinkedRow::of_loaded(loaded()).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -176,7 +183,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_grpc::door,
+    loaded: loaded(),
     cdylib: "busbar_transport_grpc_plugin",
     inputs: include_str!("conformance.json"),
 }
