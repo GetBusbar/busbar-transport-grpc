@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Tests for the gRPC layer's bytes: framing, timeouts, statuses, `grpc-message` and the head block.
+//! Tests for the gRPC layer's bytes: framing, statuses, `grpc-message` and the head block.
 
 use super::*;
 
@@ -75,75 +75,6 @@ fn a_stream_that_ends_inside_a_message_is_truncated() {
 fn a_stream_that_ends_between_messages_is_clean() {
     let m = Messages::new(64);
     assert_eq!(m.end(), Ok(()));
-}
-
-// ── grpc-timeout ─────────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn a_short_timeout_stays_in_nanoseconds() {
-    assert_eq!(timeout_value(Duration::from_nanos(1500)), "1500n");
-    assert_eq!(timeout_value(Duration::ZERO), "0n");
-}
-
-#[test]
-fn a_timeout_too_long_for_nanoseconds_rounds_up_into_microseconds() {
-    // 1_000_000_001 ns needs ten digits in `n`; in `u` it is 1_000_000.001, rounded up.
-    assert_eq!(
-        timeout_value(Duration::from_nanos(1_000_000_001)),
-        "1000001u"
-    );
-}
-
-#[test]
-fn a_long_timeout_moves_to_seconds_minutes_and_hours() {
-    assert_eq!(timeout_value(Duration::from_secs(100_000)), "100000S");
-    assert_eq!(timeout_value(Duration::from_secs(100_000_000)), "1666667M");
-    assert_eq!(
-        timeout_value(Duration::from_secs(10_000_000_000)),
-        "2777778H"
-    );
-    assert_eq!(timeout_value(Duration::from_secs(u64::MAX)), "99999999H");
-}
-
-#[test]
-fn a_timeout_value_never_has_more_than_eight_digits() {
-    for ns in [0u64, 1, 99_999_999, 100_000_000, 1 << 40, u64::MAX] {
-        let v = timeout_value(Duration::from_nanos(ns));
-        assert!(v.len() <= 9, "{v}");
-    }
-}
-
-#[test]
-fn a_timeout_round_trips_through_parse_timeout() {
-    for d in [
-        Duration::from_nanos(1500),
-        Duration::from_millis(250),
-        Duration::from_secs(2),
-        Duration::from_secs(100_000),
-    ] {
-        assert_eq!(parse_timeout(timeout_value(d).as_bytes()), Some(d));
-    }
-}
-
-#[test]
-fn every_timeout_unit_is_read() {
-    assert_eq!(parse_timeout(b"5n"), Some(Duration::from_nanos(5)));
-    assert_eq!(parse_timeout(b"5u"), Some(Duration::from_micros(5)));
-    assert_eq!(parse_timeout(b"5m"), Some(Duration::from_millis(5)));
-    assert_eq!(parse_timeout(b"5S"), Some(Duration::from_secs(5)));
-    assert_eq!(parse_timeout(b"5M"), Some(Duration::from_secs(300)));
-    assert_eq!(parse_timeout(b"5H"), Some(Duration::from_secs(18_000)));
-}
-
-#[test]
-fn a_malformed_timeout_is_refused() {
-    assert_eq!(parse_timeout(b""), None);
-    assert_eq!(parse_timeout(b"S"), None);
-    assert_eq!(parse_timeout(b"5"), None);
-    assert_eq!(parse_timeout(b"123456789S"), None);
-    assert_eq!(parse_timeout(b"5x"), None);
-    assert_eq!(parse_timeout(b"1aS"), None);
-    assert_eq!(parse_timeout(b"-1S"), None);
 }
 
 // ── grpc-status ──────────────────────────────────────────────────────────────────────────────────

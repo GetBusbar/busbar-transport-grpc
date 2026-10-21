@@ -152,7 +152,7 @@ dependencies = [
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=7263f4e61b7af7fdadb9079394d139547e61d1c0#7263f4e61b7af7fdadb9079394d139547e61d1c0"
+source = "git+https://github.com/GetBusbar/busbar?rev=1b09a4a79a962112c8ef8036e2df50a7221daf5e#1b09a4a79a962112c8ef8036e2df50a7221daf5e"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=7263f4e61b7af7fdadb9079394d139547e61d1c0#7263f4e61b7af7fdadb9079394d139547e61d1c0"
+source = "git+https://github.com/GetBusbar/busbar?rev=1b09a4a79a962112c8ef8036e2df50a7221daf5e#1b09a4a79a962112c8ef8036e2df50a7221daf5e"
 dependencies = [
  "busbar-contract",
  "ed25519-dalek",
@@ -199,6 +199,7 @@ dependencies = [
  "busbar-contract",
  "bytes",
  "futures",
+ "h2",
  "http",
  "http-body",
  "hyper",
@@ -994,9 +995,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
