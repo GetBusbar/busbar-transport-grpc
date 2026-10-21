@@ -78,7 +78,7 @@ pub fn runtime() -> tokio::runtime::Runtime {
 // ── the door, linked and dropped in ──────────────────────────────────────────────────────────────
 
 pub fn linked() -> &'static Ops {
-    let d = busbar_transport_grpc::door::door();
+    let d = busbar_transport_grpc::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
