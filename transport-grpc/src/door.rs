@@ -64,8 +64,17 @@ use crate::claims::CLAIM_NAMES;
 use crate::meta::{class_of, fault_of, TAIL};
 pub use crate::meta::{setting, KEY};
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../declares.json")
+    )]
+);
+
 /// The door's Statement: the `grpc` framer.
 pub const STATEMENT: Statement = Statement {
+    extensions: EXTENSIONS,
     kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
@@ -218,8 +227,25 @@ answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
 slot!(
-    /// `locate`.
+    /// `locate`: where a dialled target is and the offer its handshake makes, with THE FRAMER'S
+    /// OWN HEAD LINES for a request to it (`DEFAULT_LINES`); or, asked for an ACCEPTING
+    /// listener (`LocateIn::accept`), the offer that listener makes: `h2` alone, the protocol a
+    /// gRPC client negotiates over TLS. A listener names no far end, so no target is read and no
+    /// authority, name or head line is stated.
     Locate, LocateIn, LocateOut, |_, i, o| {
+        if i.accept != 0 {
+            let mut alpn = i.alpn_buf();
+            alpn.extend(OFFER_H2);
+            let short = !alpn.fits();
+            let (pw, pnd) = alpn.settle(short);
+            o.set(|x| &x.alpn_written, pw as u64);
+            o.set(|x| &x.alpn_needed, pnd as u64);
+            if short {
+                o.error("locate: a host buffer is too small");
+                return Outcome::Failed;
+            }
+            return Outcome::Ready;
+        }
         let Some(uri) = std::str::from_utf8(i.field(|x| &x.target).bytes())
             .ok()
             .and_then(|t| t.parse::<http::Uri>().ok())
@@ -250,21 +276,31 @@ slot!(
         let offer: &[u8] = if secure { OFFER_H2 } else { &[] };
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
-        let (mut a, mut n, mut p) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let mut d = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(host.as_bytes());
-        p.extend(offer);
-        // One short answer for every buffer, each at its full size.
-        let short = !(a.fits() && n.fits() && p.fits());
+        l.extend(offer);
+        // A host that lends no defaults buffer predates it: no line is stated, and the dial writes
+        // its own as before (the contract's `LocateIn::defaults_buf`).
+        if i.defaults_cap != 0 {
+            d.extend(DEFAULT_LINES.as_bytes());
+        }
+        // One short answer for every buffer, each at its full size. The framer's own lines are
+        // owed to every call, so a lent defaults buffer too small for them is a short answer too.
+        let short = !(a.fits() && n.fits() && l.fits() && d.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
-        let (pw, pnd) = p.settle(short);
+        let (lw, lnd) = l.settle(short);
+        let (dw, dnd) = d.settle(short);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
-        o.set(|x| &x.alpn_written, pw as u64);
-        o.set(|x| &x.alpn_needed, pnd as u64);
+        o.set(|x| &x.alpn_written, lw as u64);
+        o.set(|x| &x.alpn_needed, lnd as u64);
+        o.set(|x| &x.defaults_written, dw as u64);
+        o.set(|x| &x.defaults_needed, dnd as u64);
         if short {
             o.error("locate: a host buffer is too small");
             return Outcome::Failed;
@@ -272,6 +308,14 @@ slot!(
         Outcome::Ready
     }
 );
+
+/// THE FRAMER'S OWN HEAD LINES on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
+/// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
+/// auth signs the head (THE DESIGN §6, step 5), and the dial then sends them as signed: the content
+/// type and `te: trailers`, in the order the dial writes them. No `grpc-timeout`: none goes
+/// upstream, as predev's hop sent none (predev `crates/busbar-a2a/src/a2a/relay.rs`
+/// `build_request`).
+const DEFAULT_LINES: &str = "content-type: application/grpc\r\nte: trailers\r\n";
 
 slot!(
     /// `begin`.
@@ -286,7 +330,6 @@ slot!(
                     .iter()
                     .map(|f| (f.field(|x| &x.name).bytes(), f.field(|x| &x.value).bytes())),
                 inst.posture.max_message_bytes,
-                i.sink.now_monotonic_ns,
             );
             let mut call = match opened {
                 Ok(call) => call,
@@ -408,11 +451,8 @@ slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
         if let Some(call) = one_stream(&p, i.framing) {
-            let now = i.sink.now_monotonic_ns;
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
-                c.expire(now);
-                Ok(())
-            });
+            // One stream asks for no timer (it enforces no deadline): a call only fills.
+            return on_stream(&call, i.field(|x| &x.sink), &mut o, |_| Ok(()));
         }
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }

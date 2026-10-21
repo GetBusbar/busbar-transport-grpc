@@ -26,6 +26,9 @@ hyper = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 bytes = { workspace = true }
+# HTTP/2's own error codes: a far end's RST_STREAM code, read off the error `hyper` hands up
+# (`std::error::Error::source`), is mapped to its gRPC status. The same `h2` `hyper` runs on.
+h2 = { workspace = true }
 # The door's settings blob is JSON.
 serde_json = { workspace = true }
 
