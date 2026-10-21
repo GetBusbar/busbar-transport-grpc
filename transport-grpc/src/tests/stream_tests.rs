@@ -80,14 +80,13 @@ fn the_status_message_is_encoded_as_predev_encoded_it() {
     );
 }
 
-/// AN OVERSIZE MESSAGE ON ONE STREAM CLOSES IT `OUT_OF_RANGE` IN PREDEV'S WORDS. The body's message
+/// AN OVERSIZE MESSAGE ON ONE STREAM CLOSES IT `OUT_OF_RANGE` NAMING THE LIMIT. The body's message
 /// states a length past the ceiling: `ingest` fails, and the refusal the host then closes the
 /// stream with (its neutral status for a body it could not decode, the failure's text as its
-/// bytes) is rendered as predev answered it: `grpc-status: 11` and tonic 0.14's text, encoded as
-/// tonic encoded it, the limit being the ceiling. RED before the fix: the neutral status mapped,
-/// with predev's refusal words.
+/// bytes) is rendered as `grpc-status: 11` and this framer's own words, which print the configured
+/// limit (coordinator ruling (b)). RED before the fix: the words were predev's server's.
 #[test]
-fn an_oversize_message_closes_the_stream_out_of_range_in_predevs_words() {
+fn an_oversize_message_closes_the_stream_out_of_range_naming_the_limit() {
     let mut c = grpc();
     let mut body = vec![0u8];
     body.extend_from_slice(&1025u32.to_be_bytes());
@@ -96,8 +95,8 @@ fn an_oversize_message_closes_the_stream_out_of_range_in_predevs_words() {
     assert_eq!(
         wire(&mut c),
         ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 11\r\n\
-         grpc-message: Error,%20decoded%20message%20length%20too%20large:%20found%201025%20bytes,\
-         %20the%20limit%20is:%201024%20bytes\r\n"
+         grpc-message: the%20message%20is%201025%20bytes,%20over%20the%20limit%20of%201024%20bytes\
+         %20(limits.request_body_max_bytes)\r\n"
     );
 }
 

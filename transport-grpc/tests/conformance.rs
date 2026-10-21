@@ -539,3 +539,30 @@ fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
         host.close();
     }
 }
+
+/// AN OVERSIZE MESSAGE IS REFUSED AT THE CONFIGURED LIMIT, IN THIS FRAMER'S WORDS (coordinator
+/// ruling (b)): `limits.request_body_max_bytes` bounds a message on the accepting side, and the close
+/// is `OUT_OF_RANGE` with text that prints the configured number, whatever refusal the host then
+/// closes the failed stream with. A non-default limit, both images. RED before the fix: predev's
+/// server's words.
+#[test]
+fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, r#"{"limits.request_body_max_bytes":2048}"#, ROOMY);
+        let fields = [("content-type", "application/grpc")];
+        assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
+        let mut body = vec![0u8];
+        body.extend_from_slice(&2049u32.to_be_bytes());
+        assert_eq!(host.feed(&body, false), Outcome::Failed);
+        let at = host.wire_log.len();
+        assert_eq!(host.refuse_as(1, b"", 400), Outcome::Ready);
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 11\r\n\
+             grpc-message: the%20message%20is%202049%20bytes,%20over%20the%20limit%20of%202048\
+             %20bytes%20(limits.request_body_max_bytes)\r\n"
+        );
+        host.close();
+    }
+}
