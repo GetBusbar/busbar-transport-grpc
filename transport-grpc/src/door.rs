@@ -233,7 +233,7 @@ slot!(
     /// gRPC client negotiates over TLS. A listener names no far end, so no target is read and no
     /// authority, name or head line is stated.
     Locate, LocateIn, LocateOut, |_, i, o| {
-        if i.accept != 0 {
+        if i.accept() != 0 {
             let mut alpn = i.alpn_buf();
             alpn.extend(OFFER_H2);
             let short = !alpn.fits();
@@ -283,7 +283,7 @@ slot!(
         l.extend(offer);
         // A host that lends no defaults buffer predates it: no line is stated, and the dial writes
         // its own as before (the contract's `LocateIn::defaults_buf`).
-        if i.defaults_cap != 0 {
+        if i.defaults_cap() != 0 {
             d.extend(DEFAULT_LINES.as_bytes());
         }
         // One short answer for every buffer, each at its full size. The framer's own lines are
