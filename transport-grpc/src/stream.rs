@@ -8,7 +8,7 @@
 //! * `begin` takes the call's head fields: a call that is not gRPC (its `content-type`) is refused
 //!   before it is one; a call whose `grpc-encoding` names a compression this door does not take
 //!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding` (gRPC's
-//!   compression rules); the first `grpc-encoding` field is the call's, a later one is not read;
+//!   compression rules); the first `grpc-encoding` field is the call's, a repeat is not read;
 //!   a `grpc-timeout` it states is a fact for the plane in the head the host keeps: this framing
 //!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`, as predev's server enforced
 //!   none;
