@@ -163,8 +163,6 @@ pub(crate) const SETTINGS: &[SettingDecl] = &[
     },
 ];
 
-pub(crate) const NONE: AbiStr = AbiStr::ABSENT;
-
 pub(crate) const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
         .with_composes_over(COMPOSES_OVER)
