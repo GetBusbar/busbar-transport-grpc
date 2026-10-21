@@ -52,7 +52,7 @@ fn cdylib() -> std::path::PathBuf {
 
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of_macro(busbar_transport_grpc::MACRO_DOOR).expect("the door states itself")
+    LinkedRow::of(busbar_transport_grpc::door).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -176,7 +176,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_grpc::MACRO_DOOR,
+    door: busbar_transport_grpc::door,
     cdylib: "busbar_transport_grpc_plugin",
     inputs: include_str!("conformance.json"),
 }
