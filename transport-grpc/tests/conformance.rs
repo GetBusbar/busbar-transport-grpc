@@ -295,6 +295,52 @@ fn locate_offers_h2_alone_on_a_secured_target_and_nothing_in_the_clear() {
     }
 }
 
+/// A TLS gRPC LISTENER OFFERS `h2`: asked for an ACCEPTING listener's offer (`LocateIn::accept`,
+/// the empty target the connector passes), `locate` answers `h2` alone, the protocol every gRPC
+/// client negotiates over TLS (tonic's TLS connector and grpc-go refuse a connection without it),
+/// and states no authority, name or head line. Both images. RED before the fix: the empty target
+/// was read as a malformed URL, `locate` answered FAILED, and the listener made no offer.
+#[test]
+fn a_listener_is_offered_h2_alone() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let l = host.locate_listener().expect("the listener's offer");
+        assert_eq!(l.offer.as_slice(), &b"\x02h2"[..]);
+        assert_eq!(
+            (l.authority.as_str(), l.name.as_str(), l.defaults.as_str()),
+            ("", "", "")
+        );
+        host.close();
+    }
+}
+
+/// THE FRAMER'S OWN HEAD LINES ARE STATED AT `locate`, so the host puts them in the head BEFORE the
+/// auth signs it (THE DESIGN §6, step 5): the content type, `te: trailers` and `grpc-timeout` (the
+/// attempt timeout the settings state), in the order the dial writes them, and the dial then sends
+/// them as signed. Both images, the default timeout and a set one. RED before the fix: `locate`
+/// stated no line, and the dial added all three at `emit`, after the auth had run.
+#[test]
+fn locate_states_the_framers_own_head_lines_before_the_auth_signs() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let loc = host.locate("https://peer.test").expect("locate");
+        assert_eq!(
+            loc.defaults,
+            "content-type: application/grpc\r\nte: trailers\r\ngrpc-timeout: 300000m\r\n"
+        );
+        host.close();
+        let mut host = Host::open(ops, r#"{"limits.upstream_request_timeout_secs":5}"#, ROOMY);
+        let loc = host.locate("http://peer.test:50051").expect("locate");
+        assert_eq!(
+            loc.defaults,
+            "content-type: application/grpc\r\nte: trailers\r\ngrpc-timeout: 5000000u\r\n"
+        );
+        host.close();
+    }
+}
+
 // ── ONE STREAM (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────────────────
 
 /// The unit's message on the close: every byte tonic 0.14 percent-encodes, and some it does not.
@@ -302,7 +348,7 @@ const MESSAGE: &str = "not here: \u{2713} 100% {x} <y> `z` ?q #h \"s\" ok-_.~";
 /// The unit's details, raw (the value it writes is their base64, without padding, verbatim).
 const DETAILS: &[u8] = &[0x08, 0x05, 0x12, 0x03, b'a', b'b', 0xff, 0x00, 0x7f];
 
-/// Base64, standard alphabet, without padding: the value 1.5.5's tonic wrote for raw details.
+/// Base64, standard alphabet, without padding: the value predev's tonic wrote for raw details.
 fn b64_nopad(raw: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -320,8 +366,11 @@ fn b64_nopad(raw: &[u8]) -> String {
     out
 }
 
-/// What 1.5.5's gRPC line wrote for a status: tonic 0.14's own header rendering, as field lines
+/// What predev's gRPC line wrote for a status: tonic 0.14's own header rendering, as field lines
 /// (with `head`: the trailers-only answer's `:status` and `content-type` first, `into_http`).
+/// v1.5.5 served no gRPC; predev is the baseline, and its rendering is tonic's. Where predev
+/// differs from tonic is the text it gave a status, never the rendering: a refusal's words and its
+/// neutral status's mapping are predev's own (tonic has no refusal).
 fn tonic_block(status: tonic::Status, head: bool) -> String {
     let mut out = String::new();
     let map = if head {
@@ -381,12 +430,12 @@ fn one_stream(ops: &'static Ops, caps: Caps) -> (Vec<String>, String) {
     (proof, block)
 }
 
-/// THE CLOSE IS THE DOOR'S, BOTH WAYS IN, IN 1.5.5'S BYTES: the linked and the dropped-in door
+/// THE CLOSE IS THE DOOR'S, BOTH WAYS IN, IN PREDEV'S BYTES: the linked and the dropped-in door
 /// frame one stream the same (a tight sink's re-calls included), and the closing block is the
 /// trailers tonic 0.14 wrote for the same status, message and details (a status-with-details cell),
 /// and for a whole end.
 #[test]
-fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_1_5_5s_bytes() {
+fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_predevs_bytes() {
     let l = linked();
     let (d, _lib) = dropped();
     let mut runs = Vec::new();
@@ -406,7 +455,7 @@ fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_1_5_5s_bytes(
                     ),
                     false
                 ),
-                "{image}: the close is 1.5.5's trailers, byte for byte"
+                "{image}: the close is predev's trailers, byte for byte"
             );
             runs.push(proof);
         }
@@ -426,10 +475,10 @@ fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_1_5_5s_bytes(
     host.close();
 }
 
-/// A STREAM REFUSED BEFORE ANY REPLY is the door's trailers-only answer, in 1.5.5's bytes (tonic
+/// A STREAM REFUSED BEFORE ANY REPLY is the door's trailers-only answer, in predev's bytes (tonic
 /// 0.14's `into_http` for the status the refusal's neutral status maps to, predev's words).
 #[test]
-fn a_stream_refused_before_any_reply_is_1_5_5s_trailers_only_answer() {
+fn a_stream_refused_before_any_reply_is_predevs_trailers_only_answer() {
     let (d, _lib) = dropped();
     for ops in [linked(), d] {
         let mut host = Host::open(ops, "{}", ROOMY);
@@ -462,4 +511,36 @@ fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
         host.finish_final(13, b"x", b"line\r\nbreak"),
         Outcome::Failed
     );
+}
+
+/// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` in predev's
+/// bytes: tonic 0.14's `into_http` for the status its `from_encoding_header` answered with no
+/// compression enabled (`grpc-accept-encoding: identity` and its words), whatever refusal the host
+/// closes the failed stream with. Both images. RED before the fix: `grpc-encoding` was never read,
+/// the compressed message failed `INTERNAL`, and the close was the refusal's neutral status mapped.
+#[test]
+fn a_stream_in_an_encoding_the_door_does_not_take_is_predevs_unimplemented() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let fields = [
+            ("content-type", "application/grpc"),
+            ("grpc-encoding", "gzip"),
+        ];
+        assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
+        assert_eq!(host.feed(&[1, 0, 0, 0, 1, b'z'], true), Outcome::Failed);
+        let at = host.wire_log.len();
+        assert_eq!(host.refuse_as(1, b"", 400), Outcome::Ready);
+        let mut status =
+            tonic::Status::unimplemented("Content is compressed with `gzip` which isn't supported");
+        status.metadata_mut().insert(
+            "grpc-accept-encoding",
+            tonic::metadata::MetadataValue::from_static("identity"),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            tonic_block(status, true)
+        );
+        host.close();
+    }
 }

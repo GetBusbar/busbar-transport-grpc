@@ -16,7 +16,9 @@
 //! ```
 //!
 //! A message on this wire, both ways, is its LENGTH-PREFIXED FORM: one flag byte (`0` = not
-//! compressed; this door negotiates no compression), a four-byte big-endian length, the payload.
+//! compressed; this door negotiates no compression, and a call whose `grpc-encoding` names one is
+//! answered `UNIMPLEMENTED` with the `grpc-accept-encoding` it takes, [`unsupported_encoding`]), a
+//! four-byte big-endian length, the payload.
 //! A frame this door answers is one whole message in that form, so it is never empty — an empty
 //! payload is still five bytes; the stream's end is its own piece (`PIECE_END`), never an empty
 //! frame.
@@ -60,6 +62,8 @@ pub fn frame(payload: &[u8]) -> Vec<u8> {
 pub enum Bad {
     /// A message is compressed, and no compression was agreed.
     Compressed,
+    /// The call's `grpc-encoding` names a compression this door does not take: the name, as text.
+    Encoding(String),
     /// A message is larger than the ceiling: its stated length, and the ceiling.
     TooLarge(usize, usize),
     /// The stream ended inside a message.
@@ -67,15 +71,53 @@ pub enum Bad {
 }
 
 impl Bad {
-    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message, as
-    /// predev's gRPC line answered it (ARCHITECT ruling: byte-equal to predev); `INTERNAL` else.
+    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message and
+    /// `UNIMPLEMENTED` for a compression the door does not take, as predev's gRPC line (tonic 0.14)
+    /// answered each (ARCHITECT ruling: byte-equal to predev); `INTERNAL` else.
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
             Self::TooLarge(..) => OUT_OF_RANGE,
+            Self::Encoding(_) => UNIMPLEMENTED,
             Self::Compressed | Self::Truncated => INTERNAL,
         }
     }
+
+    /// The closing status lines a call this failed closes with ([`status_lines`]): for a compression
+    /// the door does not take, `grpc-accept-encoding` first, as tonic 0.14's `Status::add_header`
+    /// writes the status's metadata ahead of `grpc-status`.
+    ///
+    /// # Errors
+    ///
+    /// Never for these texts: [`status_lines`] refuses only details, and these state none.
+    pub fn close_lines(&self) -> Result<Vec<u8>, &'static str> {
+        let mut out = Vec::new();
+        if matches!(self, Self::Encoding(_)) {
+            out.extend_from_slice(
+                format!("{GRPC_ACCEPT_ENCODING}: {ACCEPT_ENCODING}\r\n").as_bytes(),
+            );
+        }
+        out.extend(status_lines(
+            u32::from(self.status()),
+            self.to_string().as_bytes(),
+            &[],
+        )?);
+        Ok(out)
+    }
+}
+
+/// The compression a call's `grpc-encoding` value `v` names, where this door does not take it:
+/// every value but `identity` (tonic 0.14 `CompressionEncoding::from_encoding_header`, with no
+/// compression enabled, as predev's gRPC line ran it). `None` = the call is not compressed.
+#[must_use]
+pub fn unsupported_encoding(v: &[u8]) -> Option<Bad> {
+    if v == b"identity" {
+        return None;
+    }
+    // Text where it is text; else the bytes as tonic spelled them (their `Debug`).
+    Some(Bad::Encoding(
+        std::str::from_utf8(v).map_or_else(|_| format!("{v:?}"), str::to_owned),
+    ))
 }
 
 impl std::fmt::Display for Bad {
@@ -84,6 +126,11 @@ impl std::fmt::Display for Bad {
             Self::Compressed => {
                 f.write_str("a message is compressed and no compression was agreed")
             }
+            // tonic 0.14's words for it (`codec/compression.rs`), byte-equal.
+            Self::Encoding(name) => write!(
+                f,
+                "Content is compressed with `{name}` which isn't supported"
+            ),
             // Predev's words for it, byte-equal (tonic 0.14 `codec/decode.rs`), the limit being
             // this door's ceiling (`limits.request_body_max_bytes`).
             Self::TooLarge(n, limit) => write!(
@@ -203,6 +250,12 @@ pub const GRPC_STATUS: &str = "grpc-status";
 pub const GRPC_MESSAGE: &str = "grpc-message";
 /// The field a call's deadline travels in.
 pub const GRPC_TIMEOUT: &str = "grpc-timeout";
+/// The field naming the compression a call's messages are in.
+pub const GRPC_ENCODING: &str = "grpc-encoding";
+/// The field naming the compressions a server takes, on an answer refusing another.
+pub const GRPC_ACCEPT_ENCODING: &str = "grpc-accept-encoding";
+/// The one compression this door takes: none.
+pub const ACCEPT_ENCODING: &str = "identity";
 
 // ── grpc-status ──────────────────────────────────────────────────────────────────────────────────
 
@@ -240,6 +293,22 @@ pub fn status_of_http(code: u16) -> u16 {
         404 => UNIMPLEMENTED,
         429 | 502 | 503 | 504 => UNAVAILABLE,
         _ => UNKNOWN,
+    }
+}
+
+/// The `grpc-status` a far end's RST_STREAM stands for, by its HTTP/2 error `code`, before or after
+/// the answer's head alike (gRPC over HTTP/2, "Errors"): `CANCEL` is `CANCELLED`,
+/// `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`, `INADEQUATE_SECURITY` is `PERMISSION_DENIED`,
+/// `REFUSED_STREAM` is `UNAVAILABLE` (nothing was processed: safe to retry), and every other code
+/// (`NO_ERROR`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `FLOW_CONTROL_ERROR`, ...) is `INTERNAL`.
+#[must_use]
+pub fn status_of_reset(code: u32) -> u16 {
+    match code {
+        0x7 => UNAVAILABLE,
+        0x8 => CANCELLED,
+        0xb => RESOURCE_EXHAUSTED,
+        0xc => PERMISSION_DENIED,
+        _ => INTERNAL,
     }
 }
 
@@ -301,10 +370,11 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
 
 // ── one stream's close (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────
 
-/// `text` as a `grpc-message` value in 1.5.5's bytes (tonic 0.14's `Status`, which 1.5.5's gRPC
-/// line answered with), for every `grpc-message` this door writes, on either accept side (spec
-/// ruling 2026-09-30: a refusal's trailers byte-equal to predev): every control byte, every byte past ASCII, and each of `` "#%<>`?{}`` and
-/// the space percent-encoded, upper-case hex; every other byte as it is.
+/// `text` as a `grpc-message` value in predev's bytes, for every `grpc-message` this door writes,
+/// on either accept side (spec ruling 2026-09-30: a refusal's trailers byte-equal to predev).
+/// v1.5.5 served no gRPC: the baseline is predev's gRPC line, which answered with tonic 0.14's
+/// `Status`, so the encoding is tonic's: every control byte, every byte past ASCII, and each of
+/// `` "#%<>`?{}`` and the space percent-encoded, upper-case hex; every other byte as it is.
 #[must_use]
 pub fn encode_status_message(text: &[u8]) -> String {
     let mut out = String::with_capacity(text.len());
@@ -318,9 +388,13 @@ pub fn encode_status_message(text: &[u8]) -> String {
     out
 }
 
-/// A stream's CLOSING STATUS LINES in 1.5.5's bytes and order (tonic 0.14's
-/// `Status::add_header`): `grpc-status`, then `grpc-message` where there is a message, then
-/// `grpc-status-details-bin` where there are details, the value the plane wrote, verbatim.
+/// A stream's CLOSING STATUS LINES in predev's bytes and order, which are tonic 0.14's
+/// (`Status::add_header`): `grpc-status`, then `grpc-message` where there is a message, then
+/// `grpc-status-details-bin` where there are details, the value the plane wrote, verbatim. Where
+/// predev differs from tonic is the text, never the rendering: a refusal's words and its neutral
+/// status's mapping are predev's own ([`refusal_message`], [`status_of_refusal`]; tonic has no
+/// refusal), and the details go out as the value the plane wrote (already the unpadded base64
+/// tonic wrote of the raw bytes).
 ///
 /// # Errors
 ///

@@ -227,8 +227,25 @@ answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
 slot!(
-    /// `locate`.
-    Locate, LocateIn, LocateOut, |_, i, o| {
+    /// `locate`: where a dialled target is and the offer its handshake makes, with THE FRAMER'S
+    /// OWN HEAD LINES for a request to it (`default_lines`); or, asked for an ACCEPTING
+    /// listener (`LocateIn::accept`), the offer that listener makes: `h2` alone, the protocol a
+    /// gRPC client negotiates over TLS. A listener names no far end, so no target is read and no
+    /// authority, name or head line is stated.
+    Locate, LocateIn, LocateOut, |p, i, o| {
+        if i.accept != 0 {
+            let mut alpn = i.alpn_buf();
+            alpn.extend(OFFER_H2);
+            let short = !alpn.fits();
+            let (pw, pnd) = alpn.settle(short);
+            o.set(|x| &x.alpn_written, pw as u64);
+            o.set(|x| &x.alpn_needed, pnd as u64);
+            if short {
+                o.error("locate: a host buffer is too small");
+                return Outcome::Failed;
+            }
+            return Outcome::Ready;
+        }
         let Some(uri) = std::str::from_utf8(i.field(|x| &x.target).bytes())
             .ok()
             .and_then(|t| t.parse::<http::Uri>().ok())
@@ -257,23 +274,33 @@ slot!(
         };
         // The offer exists only where a handshake does: on a secured connection.
         let offer: &[u8] = if secure { OFFER_H2 } else { &[] };
+        let timeout = p.get().map_or(
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            |inst| inst.posture.timeout,
+        );
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
-        let (mut a, mut n, mut p) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let mut d = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(host.as_bytes());
-        p.extend(offer);
-        // One short answer for every buffer, each at its full size.
-        let short = !(a.fits() && n.fits() && p.fits());
+        l.extend(offer);
+        d.extend(default_lines(timeout).as_bytes());
+        // One short answer for every buffer, each at its full size. The framer's own lines are
+        // owed to every call, so a defaults buffer too small for them is a short answer too.
+        let short = !(a.fits() && n.fits() && l.fits() && d.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
-        let (pw, pnd) = p.settle(short);
+        let (lw, lnd) = l.settle(short);
+        let (dw, dnd) = d.settle(short);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
-        o.set(|x| &x.alpn_written, pw as u64);
-        o.set(|x| &x.alpn_needed, pnd as u64);
+        o.set(|x| &x.alpn_written, lw as u64);
+        o.set(|x| &x.alpn_needed, lnd as u64);
+        o.set(|x| &x.defaults_written, dw as u64);
+        o.set(|x| &x.defaults_needed, dnd as u64);
         if short {
             o.error("locate: a host buffer is too small");
             return Outcome::Failed;
@@ -281,6 +308,20 @@ slot!(
         Outcome::Ready
     }
 );
+
+/// THE FRAMER'S OWN HEAD LINES on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
+/// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
+/// auth signs the head (THE DESIGN §6, step 5), and the dial then sends them as signed: the
+/// content type, `te: trailers`, and the call's deadline as `grpc-timeout`, the attempt timeout
+/// the settings state (`limits.upstream_request_timeout_secs`), in the order the dial writes them.
+fn default_lines(timeout: Duration) -> String {
+    format!(
+        "content-type: {}\r\nte: trailers\r\n{}: {}\r\n",
+        msg::CONTENT_TYPE,
+        msg::GRPC_TIMEOUT,
+        msg::timeout_value(timeout)
+    )
+}
 
 slot!(
     /// `begin`.
