@@ -69,8 +69,8 @@ pub enum Bad {
 }
 
 impl Bad {
-    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message, as
-    /// predev's gRPC line answered it (ARCHITECT ruling: byte-equal to predev); `UNIMPLEMENTED` for
+    /// The `grpc-status` a call fails with for it: `OUT_OF_RANGE` for an oversize message (the
+    /// status predev's gRPC line answered it with); `UNIMPLEMENTED` for
     /// a compression the door does not take (gRPC's compression rules, `compression.md`);
     /// `INTERNAL` else.
     #[must_use]
@@ -128,11 +128,12 @@ impl std::fmt::Display for Bad {
                 f,
                 "the message encoding `{name}` is not supported: this server takes identity"
             ),
-            // Predev's words for it, byte-equal (tonic 0.14 `codec/decode.rs`), the limit being
-            // this door's ceiling (`limits.request_body_max_bytes`).
+            // This framer's own words (coordinator ruling (b)), naming the configured ceiling: the
+            // same `limits.request_body_max_bytes` that bounds every inbound body.
             Self::TooLarge(n, limit) => write!(
                 f,
-                "Error, decoded message length too large: found {n} bytes, the limit is: {limit} bytes"
+                "the message is {n} bytes, over the limit of {limit} bytes \
+                 (limits.request_body_max_bytes)"
             ),
             Self::Truncated => f.write_str("the stream ended inside a message"),
         }

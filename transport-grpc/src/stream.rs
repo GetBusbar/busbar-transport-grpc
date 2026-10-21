@@ -23,7 +23,7 @@
 //!   host's trailers;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
 //!   mapped ([`msg::status_of_refusal`], predev's words); a body whose message was over the ceiling
-//!   closes `OUT_OF_RANGE` in predev's words for it, whatever the refusal; before any message went
+//!   closes `OUT_OF_RANGE` in this framer's words, naming the configured limit, whatever the refusal; before any message went
 //!   out the block is the whole answer (trailers-only: `:status: 200`, `content-type`, then the
 //!   status lines).
 //!
