@@ -295,6 +295,43 @@ fn locate_offers_h2_alone_on_a_secured_target_and_nothing_in_the_clear() {
     }
 }
 
+/// THE DIALLED PLACE IS 1.5.5'S (`dial_authority`): an IDN target is dialled at its punycode and
+/// offers the punycode as its name, a non-default port is kept, and the scheme's default port is the
+/// one dialled when none is written. Both images. RED before the fix: `http::Uri` refused the IDN
+/// host and `locate` failed.
+#[test]
+fn locate_dials_an_idn_target_at_its_punycode() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        for (target, authority, name) in [
+            (
+                "https://b\u{fc}cher.example/",
+                "xn--bcher-kva.example:443",
+                "xn--bcher-kva.example",
+            ),
+            (
+                "https://B\u{fc}cher.Example:8443/v1",
+                "xn--bcher-kva.example:8443",
+                "xn--bcher-kva.example",
+            ),
+            (
+                "http://b\u{fc}cher.example:80",
+                "xn--bcher-kva.example:80",
+                "xn--bcher-kva.example",
+            ),
+        ] {
+            let loc = host.locate(target).expect("locate");
+            assert_eq!(
+                (loc.authority.as_str(), loc.name.as_str()),
+                (authority, name),
+                "{target}"
+            );
+        }
+        host.close();
+    }
+}
+
 /// A TLS gRPC LISTENER OFFERS `h2`: asked for an ACCEPTING listener's offer (`LocateIn::accept`,
 /// the empty target the connector passes), `locate` answers `h2` alone, the protocol every gRPC
 /// client negotiates over TLS (tonic's TLS connector and grpc-go refuse a connection without it),

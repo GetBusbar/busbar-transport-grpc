@@ -58,6 +58,7 @@ use std::time::Duration;
 
 use crate::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
 use busbar_contract::abi::transport::fields::hop_by_hop;
+use busbar_contract::net::{dial_authority, DialAuthority};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body, Frame};
@@ -298,6 +299,27 @@ fn watch<F>(
     }));
 }
 
+/// A dialled target, read: whether it asks for connection security (`https`, else `http`), and
+/// where it is and what a request to it calls it, as busbar 1.5.5's client stack read them
+/// (`busbar_contract::net::dial_authority`: the host `url` serialised, punycode for an IDN, the
+/// port the connection is made to, and the `Host` value with the scheme's default port elided).
+///
+/// # Errors
+///
+/// The scheme is neither `http` nor `https`, or the target is no URL with a host.
+pub(crate) fn dial_target(target: &str) -> Result<(bool, DialAuthority), &'static str> {
+    let secure = match target
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+    {
+        Some(s) if s == "https" => true,
+        Some(s) if s == "http" => false,
+        _ => return Err("locate: the target's scheme is not http or https"),
+    };
+    let at = dial_authority(target).map_err(|_| "locate: the target is not a URL")?;
+    Ok((secure, at))
+}
+
 impl Conn {
     /// Open a dialled connection to `target` (an `http`/`https` URL: its scheme and authority are
     /// every call's), at host time `now_ns`.
@@ -306,13 +328,11 @@ impl Conn {
     ///
     /// `target` is not a URL with a host.
     pub fn dial(target: &str, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
-        let uri: http::Uri = target
-            .parse()
-            .map_err(|_| Failure(format!("not a target: {target}")))?;
-        let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
-            return Err(Failure(format!("not a target: {target}")));
-        };
-        let base = format!("{scheme}://{authority}");
+        let (secure, at) =
+            dial_target(target).map_err(|_| Failure(format!("not a target: {target}")))?;
+        // Every call's `:authority` (gRPC's `Host`) is the target's, as 1.5.5's client wrote it.
+        let scheme = if secure { "https" } else { "http" };
+        let base = format!("{scheme}://{}", at.host_header);
         let io = HostIo::new(now_ns);
         let conn_err = Arc::new(Mutex::new(None));
         let conn_done = Arc::new(AtomicBool::new(false));

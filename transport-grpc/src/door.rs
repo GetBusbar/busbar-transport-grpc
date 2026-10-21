@@ -246,32 +246,27 @@ slot!(
             }
             return Outcome::Ready;
         }
-        let Some(uri) = std::str::from_utf8(i.field(|x| &x.target).bytes())
-            .ok()
-            .and_then(|t| t.parse::<http::Uri>().ok())
-        else {
+        let Ok(target) = std::str::from_utf8(i.field(|x| &x.target).bytes()) else {
             o.error("locate: the target is not a URL");
             return Outcome::Failed;
         };
-        let secure = match uri.scheme_str() {
-            Some("https") => true,
-            Some("http") => false,
-            _ => {
-                o.error("locate: the target's scheme is not http or https");
+        // The dialled place as busbar 1.5.5's client stack spelled it (`dial_authority`): an IDN
+        // host as its punycode, the host lower-cased, an alternate IPv4 spelling as its dotted
+        // quad, the port the connection is made to.
+        let (secure, at) = match transport::dial_target(target) {
+            Ok(t) => t,
+            Err(why) => {
+                o.error(why);
                 return Outcome::Failed;
             }
         };
-        let Some(host) = uri.host() else {
-            o.error("locate: the target names no host");
+        let Some(port) = at.dial_port else {
+            o.error("locate: the target names no port");
             return Outcome::Failed;
         };
-        let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let authority = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
+        let authority = format!("{}:{port}", at.host);
+        // The name offered to the far end is the host itself, an IPv6 one without its brackets.
+        let host = at.host.trim_start_matches('[').trim_end_matches(']');
         // The offer exists only where a handshake does: on a secured connection.
         let offer: &[u8] = if secure { OFFER_H2 } else { &[] };
         let timeout = p.get().map_or(

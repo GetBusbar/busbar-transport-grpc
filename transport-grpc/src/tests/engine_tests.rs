@@ -44,9 +44,14 @@ struct Pair {
 
 impl Pair {
     fn new() -> Self {
+        Self::to("http://peer.test:50051")
+    }
+
+    /// A pair whose dialled side dials `target`.
+    fn to(target: &str) -> Self {
         let now = 5 * SEC;
         Self {
-            d: Conn::dial("http://peer.test:50051", posture(), now).expect("dial"),
+            d: Conn::dial(target, posture(), now).expect("dial"),
             a: Conn::accept(posture(), now),
             now,
             got_d: Vec::new(),
@@ -1131,4 +1136,30 @@ fn a_grpc_timeout_the_head_states_goes_out_as_signed() {
         Some(t0 + 2 * SEC),
         "the attempt's own deadline still holds the call"
     );
+}
+
+// ── the dialled authority ────────────────────────────────────────────────────────────────────────
+
+/// A CALL'S `:authority` IS THE TARGET'S AS 1.5.5'S CLIENT WROTE IT (`dial_authority`): an IDN host
+/// as its punycode, lower-cased, a non-default port kept and the scheme's default port elided. RED
+/// before the fix: the target was read by `http::Uri`, which refuses a host past ASCII, so an IDN
+/// target could not be dialled at all, and a default port was sent as written.
+#[test]
+fn a_calls_authority_is_the_targets_as_1_5_5_wrote_it() {
+    for (target, authority) in [
+        ("https://b\u{fc}cher.example/", "xn--bcher-kva.example"),
+        ("https://B\u{fc}cher.Example:443/", "xn--bcher-kva.example"),
+        (
+            "http://b\u{fc}cher.example:8080",
+            "xn--bcher-kva.example:8080",
+        ),
+    ] {
+        let mut p = Pair::to(target);
+        p.d.emit(1, &call("/pkg.Svc/Say", &[], &[b"q"]), true, 0, p.now)
+            .expect("emit");
+        p.settle();
+        let h = head(&p.got_a, 1);
+        let words = h.head.as_ref().expect("an accepted head states its words");
+        assert_eq!(words.authority.as_ref(), authority.as_bytes(), "{target}");
+    }
 }
