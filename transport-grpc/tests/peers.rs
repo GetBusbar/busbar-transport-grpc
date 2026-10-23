@@ -69,7 +69,7 @@ fn a_unary_call_half_closes_and_tonic_answers_it() {
     assert!(started.elapsed() < BOUND, "answered well inside the bound");
     let f = host.frames(1);
     println!("PROOF h2c unary: {:?}", String::from_utf8_lossy(&f[1]));
-    assert_eq!(f[1..], [lpm(b"got:hello;timeout=30000000u;meta=one")]);
+    assert_eq!(f[1..], [lpm(b"got:hello;meta=one")]);
     assert_eq!(host.terminal(1).map(|t| t.0), Some(0));
     host.close();
 }
@@ -102,7 +102,7 @@ fn a_unary_peer_waits_for_end_stream_and_the_frames_end_is_it() {
     assert_eq!(host.pump_until(BOUND, ended(1)), Outcome::Ready);
     println!("PROOF half-closed: terminal {:?}", host.terminal(1));
     assert_eq!(host.terminal(1).map(|t| t.0), Some(0));
-    assert_eq!(host.frames(1)[1..], [lpm(b"got:hello;timeout=300000m")]);
+    assert_eq!(host.frames(1)[1..], [lpm(b"got:hello")]);
     host.close();
 }
 
@@ -219,7 +219,7 @@ fn over_tls_the_offer_is_h2_and_the_agreed_h2_carries_the_call() {
     host.begin(SIDE_DIAL, &target, &agreed, Some(bridge(&rt, tls)));
     host.ask(1, "/t.T/Unary", b"sealed", 0);
     assert_eq!(host.pump_until(BOUND, ended(1)), Outcome::Ready);
-    assert_eq!(host.frames(1)[1..], [lpm(b"got:sealed;timeout=300000m")]);
+    assert_eq!(host.frames(1)[1..], [lpm(b"got:sealed")]);
     assert_eq!(host.terminal(1).map(|t| t.0), Some(0));
     host.close();
 }

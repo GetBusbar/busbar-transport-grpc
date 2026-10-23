@@ -12,25 +12,37 @@
 //!
 //! DIALLED. The host `emit`s a stream's head block and its messages; the head's `path` names the
 //! method. The request carries `content-type: application/grpc` (or the caller's `+proto`/`+json`
-//! form), `te: trailers` and the stream's remaining deadline as `grpc-timeout`, and its body ENDS
-//! (END_STREAM) once the head's `content-length` bytes are in, or on an `emit` that ends the frame:
+//! form) and `te: trailers`. These are THE FRAMER'S OWN HEAD LINES, stated at `locate`
+//! (`LocateIn::defaults_buf`) so the host puts them in the head BEFORE the auth signs it (THE
+//! DESIGN §6, step 5: nothing is added to the head after the auth has run): the head's own
+//! `content-type` goes out as it was signed, and only a head that states none (a host that
+//! predates the defaults) has one written here. NO `grpc-timeout` goes upstream, as predev's hop
+//! sent none: one the head carries is dropped, and the attempt's deadline is held here. The
+//! request's body ENDS (END_STREAM) once the head's `content-length` bytes are in, or on an `emit` that ends the frame:
 //! a unary server waits for exactly that. The answer comes back as frames (HEAD-FIELDS, GRPC-DOOR
 //! rulings): the HEAD, always first, a field block with no status code; one frame per message; the
 //! TRAILERS, a field block carrying `grpc-status` as its code; then the terminal piece, empty when
 //! the status is `OK`, else a failure whose bytes are the decoded `grpc-message`. A trailers-only
 //! answer (status in the head) yields the same three. An answer that is not gRPC fails the stream
-//! with its HTTP status mapped the way gRPC maps it. At the deadline the stream is reset and fails
-//! `DEADLINE_EXCEEDED`.
+//! with its HTTP status mapped the way gRPC maps it. A stream reset or a connection gone away
+//! (either end's) fails with the status its HTTP/2 error code stands for, before or after the
+//! answer's head alike ([`msg::status_of_reset`]); a connection lost before any status is
+//! `UNAVAILABLE`; an answer that ends with no trailers is `INTERNAL`. At the deadline the stream is
+//! reset and fails `DEADLINE_EXCEEDED`.
 //!
 //! ACCEPTED. Each call the far end opens is a stream: its head (a field block, with the call's
 //! method, target and authority in the stream's head slots, never as fields), one frame per
-//! message, and the end piece (`PIECE_END`) when the far end has sent its last. `te` is checked as 1.5.5's
-//! server checked it, by HTTP/2 itself: a `te` other than `trailers` resets the stream with
+//! message, and the end piece (`PIECE_END`) when the far end has sent its last. A `grpc-timeout`
+//! the caller states is one of the head's fields, a fact for the plane: this side enforces no
+//! deadline and never fails a call `DEADLINE_EXCEEDED`, as predev's server enforced none. `te` is
+//! checked by HTTP/2 itself: a `te` other than `trailers` resets the stream with
 //! `PROTOCOL_ERROR` before it is a call, and a missing one is served; it is then dropped as
 //! hop-by-hop. The host answers on the same stream: `emit` a head block (the answer's metadata) and
 //! messages; `refuse` with the trailer block (`grpc-status`, `grpc-message`, ...) ends the call —
 //! trailers-only when nothing was emitted first. A call that is not gRPC is answered `415` here and
-//! never reaches the host.
+//! never reaches the host; nor does one whose `grpc-encoding` names a compression this door does
+//! not take, answered here trailers-only `UNIMPLEMENTED` with `grpc-accept-encoding: identity`
+//! (gRPC's compression rules, `compression.md`).
 //!
 //! A STREAM ENDS ONCE. A far end that resets an accepted call (before or after its last message,
 //! before or after the host's answer began) fails the stream `CANCELLED`, and nothing more is
@@ -421,13 +433,13 @@ impl Conn {
                             deadline_ns
                         };
                         d.calls
-                            .push((stream, DialStream::new(at, timer.sleep_until_ns(at))));
+                            .push((stream, DialStream::new(timer.sleep_until_ns(at))));
                         d.calls.len() - 1
                     }
                 };
                 let base = d.base.clone();
                 let s = &mut d.calls[idx].1;
-                if let Err(why) = s.take(&base, bytes, end, now_ns, max) {
+                if let Err(why) = s.take(&base, bytes, end, max) {
                     s.stage = DStage::Done;
                     self.out.push_back(Piece {
                         status: Some(msg::INTERNAL),
@@ -560,7 +572,7 @@ impl Conn {
         let r = io.rounds(|cx| match &mut self.side {
             Side::Dial(d) => d.step(&mut self.out, max, cx),
             Side::Accept(a) => {
-                a.step(&mut self.out, max, &io, cx);
+                a.step(&mut self.out, max, cx);
                 Ok(())
             }
         });
@@ -669,17 +681,16 @@ struct DialStream {
     chan: Chan,
     /// Bytes of the message stream still to come, when the head stated its length.
     left: Option<usize>,
-    deadline_ns: u64,
+    /// The attempt's deadline: the stream fails `DEADLINE_EXCEEDED` here when it passes.
     sleep: Pin<Box<dyn Sleep>>,
 }
 
 impl DialStream {
-    fn new(deadline_ns: u64, sleep: Pin<Box<dyn Sleep>>) -> Self {
+    fn new(sleep: Pin<Box<dyn Sleep>>) -> Self {
         Self {
             stage: DStage::Head(Vec::new()),
             chan: Chan::default(),
             left: None,
-            deadline_ns,
             sleep,
         }
     }
@@ -689,14 +700,7 @@ impl DialStream {
     }
 
     /// Take `bytes` the host emitted on this stream.
-    fn take(
-        &mut self,
-        base: &str,
-        bytes: &[u8],
-        end: bool,
-        now_ns: u64,
-        max: usize,
-    ) -> Result<(), String> {
+    fn take(&mut self, base: &str, bytes: &[u8], end: bool, max: usize) -> Result<(), String> {
         let body: Vec<u8> = match &mut self.stage {
             DStage::Head(buf) => {
                 buf.extend_from_slice(bytes);
@@ -707,7 +711,7 @@ impl DialStream {
                     return Ok(());
                 };
                 let rest = buf.split_off(took);
-                let req = self.request(base, &head, now_ns)?;
+                let req = self.request(base, &head)?;
                 self.left = head.content_length;
                 self.stage = DStage::Queued(req);
                 rest
@@ -731,7 +735,7 @@ impl DialStream {
         Ok(())
     }
 
-    fn request(&self, base: &str, head: &Head, now_ns: u64) -> Result<Request<ChanBody>, String> {
+    fn request(&self, base: &str, head: &Head) -> Result<Request<ChanBody>, String> {
         let path = head.get("path").ok_or("the head names no path")?;
         if !path.starts_with(b"/") {
             return Err("the head's path is not absolute".into());
@@ -750,8 +754,9 @@ impl DialStream {
             .version(http::Version::HTTP_2)
             .header(http::header::CONTENT_TYPE, content_type)
             .header(http::header::TE, "trailers");
-        let left = Duration::from_nanos(self.deadline_ns.saturating_sub(now_ns));
-        b = b.header(msg::GRPC_TIMEOUT, msg::timeout_value(left));
+        // NO `grpc-timeout` GOES UPSTREAM, as predev's hop sent none (predev
+        // `crates/busbar-a2a/src/a2a/relay.rs` `build_request`): the attempt's deadline is held
+        // here (the stream's timer), and one a head carries is dropped (`RESERVED_ON_REQUEST`).
         for (name, value) in &head.fields {
             if RESERVED_ON_REQUEST.contains(&name.as_str()) || hop_by_hop(name, []) {
                 continue;
@@ -844,7 +849,12 @@ fn advance(
             DStage::Asked(f) => match f.as_mut().poll(cx) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(r) => {
-                    let r = r.map_err(|e| (e.to_string(), msg::UNAVAILABLE, false))?;
+                    // A reset or a GOAWAY is read by its code; any other loss is the
+                    // connection's, and UNAVAILABLE ([`wire_failure`]).
+                    let r = r.map_err(|e| {
+                        let (code, why) = wire_failure(&e);
+                        (why, code, false)
+                    })?;
                     if r.status() != StatusCode::OK {
                         // A BARE HTTP STATUS IS AN ANSWER: a member (or a proxy or auth wall in
                         // front of it) answered the call without gRPC. Its status is the gRPC
@@ -897,12 +907,15 @@ fn advance(
             },
             DStage::Body(b, msgs) => match Pin::new(&mut *b).poll_frame(cx) {
                 Poll::Pending => return Ok(()),
-                Poll::Ready(Some(Err(e))) => return Err((e.to_string(), msg::INTERNAL, false)),
+                Poll::Ready(Some(Err(e))) => {
+                    let (code, why) = wire_failure(&e);
+                    return Err((why, code, false));
+                }
                 Poll::Ready(Some(Ok(fr))) => match fr.into_data() {
                     Ok(d) => {
                         let got = msgs
                             .push(&d)
-                            .map_err(|e| (e.to_string(), e.status(), false))?;
+                            .map_err(|e| (dial_bad_text(&e), e.status(), false))?;
                         out.extend(got.into_iter().map(|m| Piece::data(id, m)));
                     }
                     Err(other) => {
@@ -915,15 +928,67 @@ fn advance(
                         }
                     }
                 },
+                // The answer's body ended with no trailers (a far end's END_STREAM on its data, or
+                // its RST_STREAM `NO_ERROR`, which `hyper` reads as the body's end): no status
+                // came, and the far end's stream is not whole. `INTERNAL` (PROTOCOL-HTTP2.md: a
+                // stream that ends without trailers is a protocol error), cut inside a message
+                // or between two.
                 Poll::Ready(None) => {
-                    return Err((
-                        "the answer ended without a grpc-status".into(),
-                        msg::UNKNOWN,
-                        false,
-                    ))
+                    let why = if msgs.end().is_err() {
+                        "the answer ended inside a message, with no grpc-status"
+                    } else {
+                        "the answer ended without a grpc-status"
+                    };
+                    return Err((why.into(), msg::INTERNAL, false));
                 }
             },
         }
+    }
+}
+
+/// A DIALLED STREAM'S FAILURE BELOW gRPC, as the status it stands for and this framer's own text
+/// for it. A reset or a GOAWAY, either end's (`hyper` hands up `h2`'s error as its source), is read
+/// by its HTTP/2 error code ([`msg::status_of_reset`]), before or after the answer's head alike.
+/// Anything else (the connection lost, an I/O error) is the far end become unreachable before any
+/// status came: `UNAVAILABLE`. predev's hop read none of these by code: every transport failure,
+/// a reset mid-body included, was one refusal (predev `crates/busbar-a2a/src/a2a/relay.rs`
+/// `RelayRefusal::Transport`, classed `Network` by `classify_hop`), so the codes follow the
+/// gRPC over HTTP/2 table.
+fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
+    let mut at = Some(e);
+    while let Some(err) = at {
+        if let Some(h) = err.downcast_ref::<h2::Error>() {
+            if let Some(reason) = h.reason() {
+                let code = u32::from(reason);
+                let what = if h.is_go_away() {
+                    "the connection went away"
+                } else {
+                    "the stream was reset"
+                };
+                return (
+                    msg::status_of_reset(code),
+                    format!("{what}: {}", msg::reset_name(code)),
+                );
+            }
+            break;
+        }
+        at = err.source();
+    }
+    (
+        msg::UNAVAILABLE,
+        "the connection to the far end was lost".into(),
+    )
+}
+
+/// What a dialled answer that is no message stream is called, in this framer's own words: predev's
+/// hop had no gRPC status for an oversize answer (its refusal was `BodyTooLarge`), so the words
+/// predev's server gave an oversize request are not repeated here.
+fn dial_bad_text(e: &msg::Bad) -> String {
+    match e {
+        msg::Bad::TooLarge(n, limit) => {
+            format!("the answer's message is {n} bytes, over the limit of {limit} bytes")
+        }
+        other => other.to_string(),
     }
 }
 
@@ -1036,7 +1101,6 @@ struct AStream {
     head_buf: Vec<u8>,
     head_sent: bool,
     reply_over: bool,
-    sleep: Option<Pin<Box<dyn Sleep>>>,
 }
 
 impl AStream {
@@ -1098,7 +1162,7 @@ impl AStream {
 const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
 
 impl Accept {
-    fn step(&mut self, out: &mut VecDeque<Piece>, max: usize, io: &HostIo, cx: &mut Context<'_>) {
+    fn step(&mut self, out: &mut VecDeque<Piece>, max: usize, cx: &mut Context<'_>) {
         let new: Vec<_> = self
             .arrivals
             .lock()
@@ -1114,6 +1178,34 @@ impl Accept {
                 reply.chan.end();
                 continue;
             };
+            if let Some(bad) = req
+                .headers()
+                .get(msg::GRPC_ENCODING)
+                .and_then(|v| msg::unsupported_encoding(v.as_bytes()))
+            {
+                // A compression this door does not take: answered here, trailers-only, before a
+                // message is read, `UNIMPLEMENTED` with the encodings it does take (gRPC's
+                // compression rules, `compression.md`): `content-type`, `grpc-accept-encoding`,
+                // `grpc-status`, `grpc-message`. Never handed up.
+                let mut fields = HeaderMap::new();
+                fields.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(msg::CONTENT_TYPE),
+                );
+                fields.insert(
+                    msg::GRPC_ACCEPT_ENCODING,
+                    HeaderValue::from_static(msg::ACCEPT_ENCODING),
+                );
+                fields.insert(msg::GRPC_STATUS, HeaderValue::from(bad.status()));
+                if let Ok(text) =
+                    HeaderValue::from_str(&msg::encode_status_message(bad.to_string().as_bytes()))
+                {
+                    fields.insert(msg::GRPC_MESSAGE, text);
+                }
+                reply.head(StatusCode::OK, fields);
+                reply.chan.end();
+                continue;
+            }
             let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
             let words = HeadWords {
                 method: Bytes::copy_from_slice(req.method().as_str().as_bytes()),
@@ -1123,16 +1215,9 @@ impl Accept {
                 }),
                 reason: Bytes::new(),
             };
-            let sleep = req
-                .headers()
-                .get(msg::GRPC_TIMEOUT)
-                .and_then(|v| msg::parse_timeout(v.as_bytes()))
-                .map(|d| {
-                    let now = io.timer().now_ns();
-                    io.timer().sleep_until_ns(
-                        now.saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
-                    )
-                });
+            // A `grpc-timeout` the caller states is handed up with the head's fields, a fact for
+            // the plane: this side enforces no deadline of its own and never fails a call
+            // `DEADLINE_EXCEEDED`, as predev's server enforced none.
             out.push_back(Piece {
                 head: Some(words),
                 ..Piece::fields(id, Bytes::from(field_block(req.headers(), &[])))
@@ -1146,7 +1231,6 @@ impl Accept {
                     head_buf: Vec::new(),
                     head_sent: false,
                     reply_over: false,
-                    sleep,
                 },
             ));
         }
@@ -1164,20 +1248,6 @@ impl Accept {
                     ..Piece::failure(*id, "the far end cancelled the call")
                 });
                 continue;
-            }
-            if !s.reply_over {
-                if let Some(sl) = s.sleep.as_mut() {
-                    if sl.as_mut().poll(cx).is_ready() {
-                        s.sleep = None;
-                        s.fail_reply(msg::DEADLINE_EXCEEDED, b"deadline exceeded");
-                        s.body = None;
-                        out.push_back(Piece {
-                            status: Some(msg::DEADLINE_EXCEEDED),
-                            ..Piece::failure(*id, "deadline exceeded")
-                        });
-                        continue;
-                    }
-                }
             }
             while let Some((b, msgs)) = s.body.as_mut() {
                 match Pin::new(&mut *b).poll_frame(cx) {
