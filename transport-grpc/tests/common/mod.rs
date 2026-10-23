@@ -78,7 +78,7 @@ pub fn runtime() -> tokio::runtime::Runtime {
 // ── the door, linked and dropped in ──────────────────────────────────────────────────────────────
 
 pub fn linked() -> &'static Ops {
-    let d = busbar_transport_grpc::door::door();
+    let d = busbar_transport_grpc::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -254,6 +254,8 @@ pub struct Located {
     pub name: String,
     pub secure: bool,
     pub offer: Vec<u8>,
+    /// The framer's own head lines for a request (`LocateIn::defaults_buf`), as written.
+    pub defaults: String,
 }
 
 impl Host {
@@ -314,16 +316,30 @@ impl Host {
 
     /// `locate` `target`, judged by the kind's own check.
     pub fn locate(&mut self, target: &str) -> Result<Located, Outcome> {
+        self.locate_as(target, false)
+    }
+
+    /// `locate` as the connector asks it for an ACCEPTING listener (`LocateIn::accept`, an empty
+    /// target: a listener names no far end), judged by the kind's own check.
+    pub fn locate_listener(&mut self) -> Result<Located, Outcome> {
+        self.locate_as("", true)
+    }
+
+    fn locate_as(&mut self, target: &str, accept: bool) -> Result<Located, Outcome> {
         let (mut a, mut n, mut p) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
+        // The framer's own head lines for a request (`defaults`), offered as the host offers it.
+        let mut d = vec![0_u8; 256];
         let mut i: LocateIn = z();
         i.target = s(target);
+        i.accept = u32::from(accept);
         (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
         (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
         (i.alpn_buf, i.alpn_cap) = (p.as_mut_ptr(), p.len());
+        (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
         let mut o: LocateOut = z();
         let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
         let offer = p[..o.alpn_written as usize].to_vec();
-        check_locate(r, &o, 256, 256, 64, &offer).expect("locate passes the kind's check");
+        check_locate(r, &o, 256, 256, 64, &offer, 256).expect("locate passes the kind's check");
         if r != Outcome::Ready {
             return Err(r);
         }
@@ -332,6 +348,7 @@ impl Host {
             name: String::from_utf8_lossy(&n[..o.name_written as usize]).into_owned(),
             secure: o.secure != 0,
             offer,
+            defaults: String::from_utf8_lossy(&d[..o.defaults_written as usize]).into_owned(),
         })
     }
 
