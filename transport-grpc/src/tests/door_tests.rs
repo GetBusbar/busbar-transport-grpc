@@ -21,7 +21,7 @@ use crate::meta::{COMPOSES_OVER, FAULT_ROWS, SETTINGS, STATUS_ROWS};
 fn the_tail_is_a_framer_that_names_no_other_transport() {
     assert_eq!(check_tail(&TAIL), Ok(()));
     // One row per scheme the Statement names: the names are the Statement's alone.
-    assert_eq!(check_claim_rows(STATEMENT.claims_len, &TAIL), Ok(()));
+    assert_eq!(check_claim_rows(STATEMENT.claims_len(), &TAIL), Ok(()));
     assert_eq!(CLAIM_NAMES.len(), CLAIMS.len());
     assert_eq!(check_claims(CLAIMS), Ok(()));
     assert_eq!(check_composes_over(COMPOSES_OVER), Ok(()));
@@ -33,7 +33,7 @@ fn the_tail_is_a_framer_that_names_no_other_transport() {
     // No transport names another (THE DESIGN, the transport chain). The connector picks the
     // carrier; the tail names none, so the connector serves it over the host's socket.
     assert!(COMPOSES_OVER.is_empty());
-    assert_eq!(TAIL.composes_over_len, 0);
+    assert_eq!(TAIL.composes_over_len(), 0);
 }
 
 #[test]

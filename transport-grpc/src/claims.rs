@@ -37,27 +37,23 @@ pub(crate) const FACTS: &[AbiStr] = &[
 ];
 
 pub(crate) const fn bytes_str(b: &'static [u8]) -> AbiStr {
-    AbiStr {
-        ptr: b.as_ptr(),
-        len: b.len(),
-    }
+    AbiStr::of_bytes(b)
 }
 
 /// The scheme `grpc` claims, by name: the Statement's `claims`, the one place it is stated.
 pub(crate) const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY)];
 
 /// The claimed scheme's row, by index into [`CLAIM_NAMES`].
-pub(crate) const CLAIMS: &[Claim] = &[Claim {
-    selector_forms: bytes_str(&SELECTOR_CODES),
-    egress_selector_forms: abi_str(""),
-    facts: FACTS.as_ptr(),
-    facts_len: FACTS.len(),
-    status_namespace: abi_str(status_ns::GRPC),
+pub(crate) const CLAIMS: &[Claim] = &[{
+    let mut c = Claim::EMPTY.with_facts(FACTS);
+    c.selector_forms = bytes_str(&SELECTOR_CODES);
+    c.egress_selector_forms = abi_str("");
+    c.status_namespace = abi_str(status_ns::GRPC);
     // A connection multiplexes calls, each its own stream; the session opens at a call's first
     // message.
-    session: 1,
-    session_bound: 1,
-    unit0_trigger: UNIT0_FIRST_MESSAGE,
-    status_at: STATUS_AT_TERMINAL,
-    _reserved: 0,
+    c.session = 1;
+    c.session_bound = 1;
+    c.unit0_trigger = UNIT0_FIRST_MESSAGE;
+    c.status_at = STATUS_AT_TERMINAL;
+    c
 }];
