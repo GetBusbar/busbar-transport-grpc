@@ -141,13 +141,7 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        let mut block = bytes.to_vec();
-        if !block.ends_with(b"\r\n\r\n") {
-            if !block.is_empty() && !block.ends_with(b"\r\n") {
-                block.extend_from_slice(b"\r\n");
-            }
-            block.extend_from_slice(b"\r\n");
-        }
+        let block = msg::terminate_block(bytes);
         let lines = if let Some(e) = &self.oversize {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else {

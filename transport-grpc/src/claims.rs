@@ -36,17 +36,13 @@ pub(crate) const FACTS: &[AbiStr] = &[
     abi_str(tfacts::PEER),
 ];
 
-pub(crate) const fn bytes_str(b: &'static [u8]) -> AbiStr {
-    AbiStr::of_bytes(b)
-}
-
 /// The scheme `grpc` claims, by name: the Statement's `claims`, the one place it is stated.
 pub(crate) const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY)];
 
 /// The claimed scheme's row, by index into [`CLAIM_NAMES`].
 pub(crate) const CLAIMS: &[Claim] = &[{
     let mut c = Claim::EMPTY.with_facts(FACTS);
-    c.selector_forms = bytes_str(&SELECTOR_CODES);
+    c.selector_forms = AbiStr::of_bytes(&SELECTOR_CODES);
     c.egress_selector_forms = abi_str("");
     c.status_namespace = abi_str(status_ns::GRPC);
     // A connection multiplexes calls, each its own stream; the session opens at a call's first
