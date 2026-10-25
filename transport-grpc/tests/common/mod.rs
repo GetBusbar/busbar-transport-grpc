@@ -81,6 +81,50 @@ pub fn linked() -> &'static Ops {
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
 
+/// THE IMAGE WHERE `cargo test` DID NOT BUILD IT: the coverage job. `cargo test` builds every
+/// example, this cdylib among them, beside the test binaries. The fleet's coverage job runs
+/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built, and every test that loads
+/// the dropped-in door used to fail there. So the image is built here, once per test binary, with
+/// the same cargo, manifest and profile, under this run's environment: under `cargo llvm-cov` that
+/// environment carries its instrumentation flags, so the dropped-in door is built under llvm-cov
+/// and its lines are measured like the linked door's. It goes to its own target directory beside
+/// this profile (`<target>/grpc-door-image`), never the one the running `cargo test` owns, so this
+/// build never waits on that cargo's build-directory lock.
+fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
+    static BUILT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let name = profile.file_name()?;
+            let target = profile.parent()?.join("grpc-door-image");
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut build = std::process::Command::new(cargo);
+            build
+                .args([
+                    "build",
+                    "--locked",
+                    "--example",
+                    "grpc_door",
+                    "--manifest-path",
+                ])
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .arg("--target-dir")
+                .arg(&target);
+            if name == "release" {
+                build.arg("--release");
+            }
+            let status = build
+                .status()
+                .expect("run cargo to build the dropped-in image");
+            assert!(
+                status.success(),
+                "cargo build --example grpc_door: {status}"
+            );
+            let path = target.join(name).join("examples").join(file);
+            path.exists().then_some(path)
+        })
+        .clone()
+}
+
 pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -92,14 +136,18 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
-    let path = [
-        profile.join("examples").join(&file),
-        profile.join("examples").join("deps").join(&file),
-    ]
-    .into_iter()
-    .find(|p| p.exists())
-    .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
-    // SAFETY: our own example, built by this `cargo test`.
+    let built = || {
+        [
+            profile.join("examples").join(&file),
+            profile.join("examples").join("deps").join(&file),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    };
+    let path = built()
+        .or_else(|| image_built_here(profile, &file))
+        .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
+    // SAFETY: our own example, built by this `cargo test` (or by `image_built_here`).
     let lib: &'static libloading::Library = Box::leak(Box::new(
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));
