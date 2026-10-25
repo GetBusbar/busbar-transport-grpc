@@ -543,13 +543,7 @@ impl Conn {
         if s.reply_over {
             return Ok(());
         }
-        let mut block = trailers.to_vec();
-        if !block.ends_with(b"\r\n\r\n") {
-            if !block.ends_with(b"\r\n") && !block.is_empty() {
-                block.extend_from_slice(b"\r\n");
-            }
-            block.extend_from_slice(b"\r\n");
-        }
+        let block = msg::terminate_block(trailers);
         match msg::read_head(&block, usize::MAX) {
             Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => s.finish(&h),
             _ if status != 0 => s.fail_reply(

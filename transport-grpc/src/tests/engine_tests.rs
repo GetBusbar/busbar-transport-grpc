@@ -1083,98 +1083,33 @@ fn assert_reset(code: u32, status: u16, name: &str) {
 // the fix, where marked: a far end's reset before the head was UNAVAILABLE and after it INTERNAL,
 // whatever the code, and only a far end's reset was read by code at all.
 
-/// `NO_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head, UNKNOWN after it.
+/// Every HTTP/2 reset code fails the call with its mapped gRPC status. RED: UNAVAILABLE before the
+/// head, INTERNAL or UNKNOWN after it. `STREAM_CLOSED`, which the table does not list, and a code
+/// HTTP/2 does not define (RFC 9113 §7; the coordinator's "all others → INTERNAL" ruling) are
+/// `INTERNAL`, never read as safe to retry; `REFUSED_STREAM` is `UNAVAILABLE` (the far end processed
+/// nothing).
 #[test]
-fn a_no_error_reset_fails_the_call_internal() {
-    assert_reset(0x0, msg::INTERNAL, "NO_ERROR");
-}
-
-/// `PROTOCOL_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn a_protocol_error_reset_fails_the_call_internal() {
-    assert_reset(0x1, msg::INTERNAL, "PROTOCOL_ERROR");
-}
-
-/// `INTERNAL_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn an_internal_error_reset_fails_the_call_internal() {
-    assert_reset(0x2, msg::INTERNAL, "INTERNAL_ERROR");
-}
-
-/// `FLOW_CONTROL_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn a_flow_control_error_reset_fails_the_call_internal() {
-    assert_reset(0x3, msg::INTERNAL, "FLOW_CONTROL_ERROR");
-}
-
-/// `SETTINGS_TIMEOUT` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn a_settings_timeout_reset_fails_the_call_internal() {
-    assert_reset(0x4, msg::INTERNAL, "SETTINGS_TIMEOUT");
-}
-
-/// `STREAM_CLOSED`, which the table does not list, is `INTERNAL`, as every code the table does not
-/// read otherwise. RED: UNAVAILABLE before the head.
-#[test]
-fn a_stream_closed_reset_fails_the_call_internal() {
-    assert_reset(0x5, msg::INTERNAL, "STREAM_CLOSED");
-}
-
-/// `FRAME_SIZE_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn a_frame_size_error_reset_fails_the_call_internal() {
-    assert_reset(0x6, msg::INTERNAL, "FRAME_SIZE_ERROR");
-}
-
-/// `REFUSED_STREAM` is `UNAVAILABLE`: the far end processed nothing. RED: INTERNAL after the head.
-#[test]
-fn a_refused_stream_reset_fails_the_call_unavailable() {
-    assert_reset(0x7, msg::UNAVAILABLE, "REFUSED_STREAM");
-}
-
-/// `CANCEL` is `CANCELLED`. RED: UNAVAILABLE before the head, INTERNAL after it.
-#[test]
-fn a_cancel_reset_fails_the_call_cancelled() {
-    assert_reset(0x8, msg::CANCELLED, "CANCEL");
-}
-
-/// `COMPRESSION_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn a_compression_error_reset_fails_the_call_internal() {
-    assert_reset(0x9, msg::INTERNAL, "COMPRESSION_ERROR");
-}
-
-/// `CONNECT_ERROR` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn a_connect_error_reset_fails_the_call_internal() {
-    assert_reset(0xa, msg::INTERNAL, "CONNECT_ERROR");
-}
-
-/// `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`. RED: UNAVAILABLE before the head, INTERNAL after.
-#[test]
-fn an_enhance_your_calm_reset_fails_the_call_resource_exhausted() {
-    assert_reset(0xb, msg::RESOURCE_EXHAUSTED, "ENHANCE_YOUR_CALM");
-}
-
-/// `INADEQUATE_SECURITY` is `PERMISSION_DENIED`. RED: UNAVAILABLE before the head, INTERNAL after.
-#[test]
-fn an_inadequate_security_reset_fails_the_call_permission_denied() {
-    assert_reset(0xc, msg::PERMISSION_DENIED, "INADEQUATE_SECURITY");
-}
-
-/// `HTTP_1_1_REQUIRED` is `INTERNAL`. RED: UNAVAILABLE before the head.
-#[test]
-fn an_http_1_1_required_reset_fails_the_call_internal() {
-    assert_reset(0xd, msg::INTERNAL, "HTTP_1_1_REQUIRED");
-}
-
-/// A CODE HTTP/2 DOES NOT DEFINE is `INTERNAL`, by the coordinator's "all others → INTERNAL" ruling
-/// (RFC 9113 §7: an unknown code MAY be treated as `INTERNAL_ERROR`); nothing about it says the far
-/// end processed nothing, so it is never read as safe to retry, and predev's hop read no code. RED: UNAVAILABLE before
-/// the head.
-#[test]
-fn an_unknown_code_reset_fails_the_call_internal() {
-    assert_reset(0x1f, msg::INTERNAL, "error code 0x1f");
+fn every_reset_code_fails_the_call_with_its_status() {
+    let table = [
+        (0x0, msg::INTERNAL, "NO_ERROR"),
+        (0x1, msg::INTERNAL, "PROTOCOL_ERROR"),
+        (0x2, msg::INTERNAL, "INTERNAL_ERROR"),
+        (0x3, msg::INTERNAL, "FLOW_CONTROL_ERROR"),
+        (0x4, msg::INTERNAL, "SETTINGS_TIMEOUT"),
+        (0x5, msg::INTERNAL, "STREAM_CLOSED"),
+        (0x6, msg::INTERNAL, "FRAME_SIZE_ERROR"),
+        (0x7, msg::UNAVAILABLE, "REFUSED_STREAM"),
+        (0x8, msg::CANCELLED, "CANCEL"),
+        (0x9, msg::INTERNAL, "COMPRESSION_ERROR"),
+        (0xa, msg::INTERNAL, "CONNECT_ERROR"),
+        (0xb, msg::RESOURCE_EXHAUSTED, "ENHANCE_YOUR_CALM"),
+        (0xc, msg::PERMISSION_DENIED, "INADEQUATE_SECURITY"),
+        (0xd, msg::INTERNAL, "HTTP_1_1_REQUIRED"),
+        (0x1f, msg::INTERNAL, "error code 0x1f"),
+    ];
+    for (code, status, name) in table {
+        assert_reset(code, status, name);
+    }
 }
 
 /// A RESET OF OUR OWN is read by its code as the far end's is: a malformed answer head (a
