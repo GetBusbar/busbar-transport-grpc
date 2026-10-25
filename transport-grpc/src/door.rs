@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
-use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
+use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
@@ -47,8 +47,8 @@ use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
     EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn, ListenOut,
-    LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail, WriteIn,
-    CANCEL_NOTHING_MOVED, SIDE_ACCEPT, SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
+    LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, SIDE_ACCEPT,
+    SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
     DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -73,12 +73,12 @@ busbar_contract::statement_extensions!(
 );
 
 /// The door's Statement: the `grpc` framer.
-pub const STATEMENT: Statement = Statement {
-    extensions: EXTENSIONS,
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
-    claims: CLAIM_NAMES.as_ptr(),
-    claims_len: CLAIM_NAMES.len(),
-    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+pub const STATEMENT: Statement = {
+    let mut s = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+        .with_kind_tail(&TAIL)
+        .with_claims(CLAIM_NAMES);
+    s.extensions = EXTENSIONS;
+    s
 };
 
 /// The protocol offer on a secured connection, in the handshake's ProtocolNameList encoding.
@@ -161,7 +161,7 @@ macro_rules! answer {
 slot!(
     /// `validate`.
     Validate, ValidateIn, OutHead, |_, i, o| {
-        match read_settings(i.field(|x| &x.settings).bytes()) {
+        match read_settings(i.settings().bytes()) {
             Ok(_) => Outcome::Ready,
             Err(e) => {
                 o.error(e);
@@ -174,7 +174,7 @@ slot!(
 slot!(
     /// `open`.
     Open, OpenIn, OpenOut, |instance, i, o| {
-        match read_settings(i.field(|x| &x.settings).bytes()) {
+        match read_settings(i.settings().bytes()) {
             Ok(posture) => {
                 instance.open(Instance {
                     posture,
@@ -233,7 +233,7 @@ slot!(
     /// gRPC client negotiates over TLS. A listener names no far end, so no target is read and no
     /// authority, name or head line is stated.
     Locate, LocateIn, LocateOut, |_, i, o| {
-        if i.accept != 0 {
+        if i.accept() != 0 {
             let mut alpn = i.alpn_buf();
             alpn.extend(OFFER_H2);
             let short = !alpn.fits();
@@ -246,7 +246,7 @@ slot!(
             }
             return Outcome::Ready;
         }
-        let Some(uri) = std::str::from_utf8(i.field(|x| &x.target).bytes())
+        let Some(uri) = std::str::from_utf8(i.target().bytes())
             .ok()
             .and_then(|t| t.parse::<http::Uri>().ok())
         else {
@@ -283,7 +283,7 @@ slot!(
         l.extend(offer);
         // A host that lends no defaults buffer predates it: no line is stated, and the dial writes
         // its own as before (the contract's `LocateIn::defaults_buf`).
-        if i.defaults_cap != 0 {
+        if i.defaults_cap() != 0 {
             d.extend(DEFAULT_LINES.as_bytes());
         }
         // One short answer for every buffer, each at its full size. The framer's own lines are
@@ -323,12 +323,12 @@ slot!(
         let Some(inst) = p.get() else {
             return Outcome::Failed;
         };
-        if i.side == SIDE_ACCEPT_STREAM {
+        if i.side() == SIDE_ACCEPT_STREAM {
             let fields = i.fields();
             let opened = StreamCall::open(
                 fields
                     .iter()
-                    .map(|f| (f.field(|x| &x.name).bytes(), f.field(|x| &x.value).bytes())),
+                    .map(|f| (f.name().bytes(), f.value().bytes())),
                 inst.posture.max_message_bytes,
             );
             let mut call = match opened {
@@ -337,7 +337,7 @@ slot!(
             };
             let token = inst.next.fetch_add(1, Ordering::Relaxed);
             o.set(|x| &x.framing, token);
-            fill(&mut call, i.field(|x| &x.sink), &mut o, class_of, fault_of);
+            fill(&mut call, i.sink(), &mut o, class_of, fault_of);
             inst.calls
                 .lock()
                 .expect("calls")
@@ -346,16 +346,16 @@ slot!(
         }
         let agreed = i
             .facts()
-            .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
+            .map_or(&[][..], |f| f.agreed_protocol().bytes());
         // `h2` agreed, or no agreement at all (cleartext: HTTP/2 by prior knowledge).
         if !(agreed.is_empty() || agreed == b"h2") {
             o.error("begin: gRPC needs h2, and another protocol was agreed");
             return Outcome::Refused;
         }
-        let now = i.sink.now_monotonic_ns;
-        let conn = match i.side {
+        let now = i.sink().now_monotonic_ns();
+        let conn = match i.side() {
             SIDE_DIAL => {
-                let Ok(target) = std::str::from_utf8(i.field(|x| &x.target).bytes()) else {
+                let Ok(target) = std::str::from_utf8(i.target().bytes()) else {
                     o.error("begin: the target is not text");
                     return Outcome::Failed;
                 };
@@ -381,7 +381,7 @@ slot!(
             .insert(token, held.clone());
         o.set(|x| &x.framing, token);
         let mut h = held.lock().expect("framing");
-        step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        step(&mut h, i.sink(), &mut o, |_| Ok(()))
     }
 );
 
@@ -389,12 +389,12 @@ slot!(
     /// `ingest`.
     Ingest, IngestIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
-        if let Some(call) = one_stream(&p, i.framing) {
-            let end = i.end != 0;
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.ingest(bytes, end));
+        if let Some(call) = one_stream(&p, i.framing()) {
+            let end = i.end() != 0;
+            return on_stream(&call, i.sink(), &mut o, |c| c.ingest(bytes, end));
         }
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| {
-            c.ingest(bytes, i.end != 0);
+        with(&p, i.framing(), i.sink(), &mut o, |c| {
+            c.ingest(bytes, i.end() != 0);
             Ok(())
         })
     }
@@ -404,20 +404,20 @@ slot!(
     /// `emit`.
     Emit, EmitIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
-        let (now, deadline, end) = (i.sink.now_monotonic_ns, i.deadline_ns, i.end_of_frame != 0);
-        if let Some(call) = one_stream(&p, i.framing) {
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+        let (now, deadline, end) = (i.sink().now_monotonic_ns(), i.deadline_ns(), i.end_of_frame() != 0);
+        if let Some(call) = one_stream(&p, i.framing()) {
+            return on_stream(&call, i.sink(), &mut o, |c| {
                 c.emit(bytes, end);
                 Ok(())
             });
         }
         // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
         // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
-        let stream = i.stream;
+        let stream = i.stream();
         with_then(
             &p,
-            i.framing,
-            i.field(|x| &x.sink),
+            i.framing(),
+            i.sink(),
             &mut o,
             |c| c.emit(stream, bytes, end, deadline, now),
             |c, o| {
@@ -434,27 +434,27 @@ slot!(
     /// refusal's neutral status mapped when the block states no `grpc-status`. A connection is
     /// never refused whole, and a dialled call is never answered.
     Refuse, RefuseIn, FramerOut, |p, i, o| {
-        if i.has_stream == 0 {
+        if i.has_stream() == 0 {
             o.error("refuse: gRPC refuses a call, never a connection");
             return Outcome::Refused;
         }
         let bytes = i.bytes();
-        if let Some(call) = one_stream(&p, i.framing) {
-            let (status, head_sent) = (i.status, i.head_sent != 0);
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |c| c.refuse(bytes, status, head_sent));
+        if let Some(call) = one_stream(&p, i.framing()) {
+            let (status, head_sent) = (i.status(), i.head_sent() != 0);
+            return on_stream(&call, i.sink(), &mut o, |c| c.refuse(bytes, status, head_sent));
         }
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |c| c.end_call(i.stream, bytes, i.status))
+        with(&p, i.framing(), i.sink(), &mut o, |c| c.end_call(i.stream(), bytes, i.status()))
     }
 );
 
 slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
-        if let Some(call) = one_stream(&p, i.framing) {
+        if let Some(call) = one_stream(&p, i.framing()) {
             // One stream asks for no timer (it enforces no deadline): a call only fills.
-            return on_stream(&call, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+            return on_stream(&call, i.sink(), &mut o, |_| Ok(()));
         }
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        with(&p, i.framing(), i.sink(), &mut o, |_| Ok(()))
     }
 );
 
@@ -464,7 +464,7 @@ slot!(
     Finish, FinishIn, FramerOut, |p, i, o| {
         let call = p
             .get()
-            .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing));
+            .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing()));
         if let Some(call) = call {
             let all = i.final_bytes();
             let at = |s: busbar_contract::abi::mechanism::call::Span| {
@@ -472,9 +472,9 @@ slot!(
                 all.get(start..start.saturating_add(s.len as usize))
                     .unwrap_or_default()
             };
-            let (message, details) = (at(i.final_message), at(i.final_details));
-            let status = i.final_status;
-            let answered = on_stream(&call, i.field(|x| &x.sink), &mut o, |c| {
+            let (message, details) = (at(i.final_message()), at(i.final_details()));
+            let status = i.final_status();
+            let answered = on_stream(&call, i.sink(), &mut o, |c| {
                 c.finish(status, message, details)
             });
             // A close the sink could not take whole stays until the host's re-call drains it, and a
@@ -485,14 +485,14 @@ slot!(
             };
             if keep {
                 if let Some(inst) = p.get() {
-                    inst.calls.lock().expect("calls").insert(i.framing, call);
+                    inst.calls.lock().expect("calls").insert(i.framing(), call);
                 }
             }
             return answered;
         }
         let removed = p
             .get()
-            .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing));
+            .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing()));
         if removed.is_some() {
             o.set(|x| &x.yielded.flags, YIELD_ENDED);
             Outcome::Ready
@@ -512,19 +512,19 @@ slot!(
         // The target head word, where the host states one, names the method: it leads, so it wins
         // over a same-named envelope field. gRPC's method word is always POST: a method word is
         // not read.
-        let word = i.field(|x| &x.target).bytes();
+        let word = i.target().bytes();
         if !word.is_empty() {
             pairs.push(("path", word));
         }
         for f in fields.iter() {
-            let Ok(name) = f.field(|x| &x.name).as_str() else {
+            let Ok(name) = f.name().as_str() else {
                 o.error("encode: a field name is not text");
                 return Outcome::Failed;
             };
             if !word.is_empty() && name.eq_ignore_ascii_case("path") {
                 continue;
             }
-            pairs.push((name, f.field(|x| &x.value).bytes()));
+            pairs.push((name, f.value().bytes()));
         }
         let message = msg::frame(i.body());
         let Ok(mut bytes) = msg::render_head(&pairs, Some(message.len())) else {
@@ -532,7 +532,7 @@ slot!(
             return Outcome::Failed;
         };
         bytes.extend_from_slice(&message);
-        let mut wire = i.field(|x| &x.sink).wire();
+        let mut wire = i.sink().wire();
         if bytes.len() > wire.cap() {
             o.error("encode: the rendered call is larger than the wire buffer");
             return Outcome::Failed;
@@ -608,7 +608,7 @@ fn step(
     if let Err(e) = f(&mut h.conn) {
         return o.fail(Refusal::failed(e.0));
     }
-    h.conn.drive(sink.now_monotonic_ns);
+    h.conn.drive(sink.now_monotonic_ns());
     let pending = h.conn.wire_pending() || !h.conn.pieces().is_empty();
     if let Some(e) = h.conn.failure().cloned() {
         if !pending {

@@ -25,9 +25,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use busbar_contract::abi::mechanism::call::Span;
-use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_JSON,
-};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
@@ -61,10 +59,8 @@ pub fn z<T>() -> T {
 }
 
 pub fn s(text: &str) -> AbiStr {
-    AbiStr {
-        ptr: text.as_ptr(),
-        len: text.len(),
-    }
+    // SAFETY: `text` is the test's own text, live for every call it is passed to.
+    unsafe { AbiStr::from_raw_parts(text.as_ptr(), text.len()) }
 }
 
 pub fn runtime() -> tokio::runtime::Runtime {
@@ -78,7 +74,9 @@ pub fn runtime() -> tokio::runtime::Runtime {
 // ── the door, linked and dropped in ──────────────────────────────────────────────────────────────
 
 pub fn linked() -> &'static Ops {
-    let d = busbar_transport_grpc::door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d = unsafe { busbar_transport_grpc::door() };
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -154,9 +152,11 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));
     // SAFETY: the one exported symbol, a `DoorFn`.
-    let door: libloading::Symbol<'_, extern "C" fn() -> *const Door> =
+    let door: libloading::Symbol<'_, unsafe extern "C" fn() -> *const Door> =
         unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
-    let d = door();
+    // SAFETY: the exported door takes no argument and answers a `'static` door.
+    #[allow(unused_unsafe)]
+    let d = unsafe { door() };
     // SAFETY: the dropped-in door's `'static` table.
     (unsafe { &*(*d).ops.cast::<Ops>() }, lib)
 }
@@ -287,11 +287,15 @@ pub fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;
     }
-    let raw = (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    let raw = unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
     raw.outcome()
 }
 
@@ -309,12 +313,7 @@ pub struct Located {
 impl Host {
     pub fn open(ops: &'static Ops, settings: &'static str, caps: Caps) -> Self {
         let mut i: OpenIn = z();
-        i.settings = Blob {
-            ptr: settings.as_ptr(),
-            len: settings.len(),
-            fmt: BLOB_JSON,
-            flags: 0,
-        };
+        i.settings = Blob::json(settings.as_bytes());
         let mut o: OpenOut = z();
         assert_eq!(
             call(
