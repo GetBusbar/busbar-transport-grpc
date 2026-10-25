@@ -372,6 +372,18 @@ pub fn encode_status_message(text: &[u8]) -> String {
     out
 }
 
+/// A trailer block ended as a block: its last line closed, then the blank line.
+pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
+    let mut block = bytes.to_vec();
+    if !block.ends_with(b"\r\n\r\n") {
+        if !block.is_empty() && !block.ends_with(b"\r\n") {
+            block.extend_from_slice(b"\r\n");
+        }
+        block.extend_from_slice(b"\r\n");
+    }
+    block
+}
+
 /// A stream's CLOSING STATUS LINES in predev's bytes and order, which are tonic 0.14's
 /// (`Status::add_header`): `grpc-status`, then `grpc-message` where there is a message, then
 /// `grpc-status-details-bin` where there are details, the value the plane wrote, verbatim. Where
