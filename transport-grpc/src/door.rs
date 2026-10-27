@@ -37,12 +37,8 @@ use std::time::Duration;
 use crate::hyper_io::{fill, mark_stream_full, Owed};
 use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Statement;
-use busbar_contract::abi::mechanism::lifecycle::{
-    CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
-    ValidateIn,
-};
 use busbar_contract::abi::sdk::door::statement;
-use busbar_contract::abi::sdk::life::Refusal;
+use busbar_contract::abi::sdk::life::{self, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -89,15 +85,10 @@ const OFFER_H2: &[u8] = b"\x02h2";
 /// What `open` read from the settings, and the framings it holds.
 pub struct Instance {
     posture: Posture,
-    framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
+    framings: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
     calls: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
     next: AtomicU64,
-}
-
-/// One framing.
-struct Held {
-    conn: Conn,
 }
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
@@ -125,6 +116,14 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, &'static str> {
     })
 }
 
+/// What every slot reads: the SDK's lifecycle state over [`Instance`].
+type State = Held<Instance>;
+
+/// This framer's instance, where the op has one open.
+fn mine<'a>(p: &sdk::Instance<'a, State>) -> Option<&'a Instance> {
+    p.get().map(Held::life)
+}
+
 /// One slot body on the SDK's safe surface, over this framer's [`Instance`].
 macro_rules! slot {
     ($(#[$doc:meta])* $name:ident, $in:ty, $out:ty,
@@ -134,9 +133,9 @@ macro_rules! slot {
         impl SafeSlot for $name {
             type In = $in;
             type Out = $out;
-            type State = Instance;
+            type State = State;
             fn call(
-                $inst: sdk::Instance<'_, Instance>,
+                $inst: sdk::Instance<'_, State>,
                 $input: Lent<'_, $in>,
                 #[allow(unused_mut)] mut $o: Out<'_, $out>,
             ) -> Outcome $body
@@ -158,58 +157,32 @@ macro_rules! answer {
 
 // ── the lifecycle ────────────────────────────────────────────────────────────────────────────────
 
-slot!(
-    /// `validate`.
-    Validate, ValidateIn, OutHead, |_, i, o| {
-        match read_settings(i.settings().bytes()) {
-            Ok(_) => Outcome::Ready,
-            Err(e) => {
-                o.error(e);
-                Outcome::Failed
-            }
-        }
-    }
-);
+impl Life for Instance {
+    /// No framer op pends, so nothing is ever in flight to cancel.
+    const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
-slot!(
-    /// `open`.
-    Open, OpenIn, OpenOut, |instance, i, o| {
-        match read_settings(i.settings().bytes()) {
-            Ok(posture) => {
-                instance.open(Instance {
-                    posture,
-                    framings: Mutex::new(HashMap::new()),
-                    calls: Mutex::new(HashMap::new()),
-                    next: AtomicU64::new(1),
-                });
-                Outcome::Ready
-            }
-            Err(e) => {
-                o.error(e);
-                Outcome::Failed
-            }
-        }
+    fn validate(settings: &[u8]) -> Result<(), Refusal> {
+        read_settings(settings).map(|_| ()).map_err(Refusal::failed)
     }
-);
+
+    fn open(settings: &[u8], _: &[&[u8]], _: u64) -> Result<Self, Refusal> {
+        Ok(Self {
+            posture: read_settings(settings).map_err(Refusal::failed)?,
+            framings: Mutex::new(HashMap::new()),
+            calls: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+        })
+    }
+
+    fn refresh(&self, _: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+        Ok(Refreshed::default())
+    }
+}
 
 slot!(
     /// `close`: answering READY, the SDK drops the instance.
     Close, InHead, OutHead, |_, _, _out| { Outcome::Ready }
 );
-
-slot!(
-    /// `cancel`: no framer op pends, so nothing is ever in flight to cancel.
-    Cancel, CancelIn, CancelOut, |_, _, o| {
-        o.set(|x| &x.disposition, CANCEL_NOTHING_MOVED);
-        Outcome::Ready
-    }
-);
-
-answer!(Tick, TickIn, TickOut, Outcome::Ready);
-answer!(Refresh, RefreshIn, OutHead, Outcome::Ready);
-answer!(Retire, GenIn, OutHead, Outcome::Ready);
-answer!(Drive, DriveIn, OutHead, Outcome::Ready);
-answer!(Release, ReleaseIn, OutHead, Outcome::Ready);
 
 // A framer is not a carrier: every carrier op is refused. Nothing detaches from, or adopts onto, a
 // gRPC connection.
@@ -320,7 +293,7 @@ const DEFAULT_LINES: &str = "content-type: application/grpc\r\nte: trailers\r\n"
 slot!(
     /// `begin`.
     Begin, BeginIn, FramerOut, |p, i, o| {
-        let Some(inst) = p.get() else {
+        let Some(inst) = mine(&p) else {
             return Outcome::Failed;
         };
         if i.side() == SIDE_ACCEPT_STREAM {
@@ -374,7 +347,7 @@ slot!(
             }
         };
         let token = inst.next.fetch_add(1, Ordering::Relaxed);
-        let held = Arc::new(Mutex::new(Held { conn }));
+        let held = Arc::new(Mutex::new(conn));
         inst.framings
             .lock()
             .expect("framings")
@@ -462,8 +435,7 @@ slot!(
     /// `finish`: the connection is dropped, with every call on it. A one-stream framing's finish
     /// closes its call with the final status the close states (its final tail), as trailers.
     Finish, FinishIn, FramerOut, |p, i, o| {
-        let call = p
-            .get()
+        let call = mine(&p)
             .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing()));
         if let Some(call) = call {
             let all = i.final_bytes();
@@ -484,14 +456,13 @@ slot!(
                 c.wire_pending() || !c.ended()
             };
             if keep {
-                if let Some(inst) = p.get() {
+                if let Some(inst) = mine(&p) {
                     inst.calls.lock().expect("calls").insert(i.framing(), call);
                 }
             }
             return answered;
         }
-        let removed = p
-            .get()
+        let removed = mine(&p)
             .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing()));
         if removed.is_some() {
             o.set(|x| &x.yielded.flags, YIELD_ENDED);
@@ -544,9 +515,8 @@ slot!(
 );
 
 /// The one-stream framing `token` names, where it names one.
-fn one_stream(p: &sdk::Instance<'_, Instance>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
-    p.get()
-        .and_then(|inst| inst.calls.lock().expect("calls").get(&token).cloned())
+fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
+    mine(p).and_then(|inst| inst.calls.lock().expect("calls").get(&token).cloned())
 }
 
 /// Run `f` on a one-stream framing, then fill the sink with what it owes.
@@ -566,7 +536,7 @@ fn on_stream(
 
 /// Run `f` on framing `token`, then drive it and fill the sink.
 fn with(
-    p: &sdk::Instance<'_, Instance>,
+    p: &sdk::Instance<'_, State>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -577,16 +547,15 @@ fn with(
 
 /// [`with`], then `then` on the framing and the answer, where the op answered READY.
 fn with_then(
-    p: &sdk::Instance<'_, Instance>,
+    p: &sdk::Instance<'_, State>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
     then: impl FnOnce(&Conn, &mut Out<'_, FramerOut>),
 ) -> Outcome {
-    let held = p
-        .get()
-        .and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
+    let held =
+        mine(p).and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
     let Some(held) = held else {
         o.error("no such framing");
         return Outcome::Failed;
@@ -594,28 +563,28 @@ fn with_then(
     let mut h = held.lock().expect("framing");
     let outcome = step(&mut h, sink, o, f);
     if matches!(outcome, Outcome::Ready) {
-        then(&h.conn, o);
+        then(&h, o);
     }
     outcome
 }
 
 fn step(
-    h: &mut Held,
+    c: &mut Conn,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
-    if let Err(e) = f(&mut h.conn) {
+    if let Err(e) = f(c) {
         return o.fail(Refusal::failed(e.0));
     }
-    h.conn.drive(sink.now_monotonic_ns());
-    let pending = h.conn.wire_pending() || !h.conn.pieces().is_empty();
-    if let Some(e) = h.conn.failure().cloned() {
+    c.drive(sink.now_monotonic_ns());
+    let pending = c.wire_pending() || !c.pieces().is_empty();
+    if let Some(e) = c.failure().cloned() {
         if !pending {
             return o.fail(Refusal::failed(e.0));
         }
     }
-    fill(&mut h.conn, sink, o, class_of, fault_of);
+    fill(c, sink, o, class_of, fault_of);
     Outcome::Ready
 }
 
@@ -623,14 +592,14 @@ busbar_contract::plugin_door! {
     ops: Ops,
     statement: STATEMENT,
     lifecycle: {
-        validate: Safe<Validate>,
-        open: Safe<Open>,
-        refresh: Safe<Refresh>,
-        retire: Safe<Retire>,
-        tick: Safe<Tick>,
-        drive: Safe<Drive>,
-        cancel: Safe<Cancel>,
-        release: Safe<Release>,
+        validate: Safe<life::Validate<Instance>>,
+        open: Safe<life::Open<Instance>>,
+        refresh: Safe<life::Refresh<Instance>>,
+        retire: Safe<life::Retire<Instance>>,
+        tick: Safe<life::Tick<Instance>>,
+        drive: Safe<life::Drive<Instance>>,
+        cancel: Safe<life::Cancel<Instance>>,
+        release: Safe<life::Release<Instance>>,
         close: Safe<Close>,
     },
     kind_ops: {
