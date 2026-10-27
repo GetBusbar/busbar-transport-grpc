@@ -16,6 +16,7 @@ use std::mem::zeroed;
 use std::sync::Arc;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome};
+use busbar_contract::abi::mechanism::door::DoorFn;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{
@@ -51,10 +52,9 @@ fn cdylib() -> std::path::PathBuf {
 }
 
 /// This crate's own door, as the loader names a compiled-in one.
-#[allow(unused_unsafe)]
 fn loaded() -> LoadedDoor {
-    // SAFETY: `door` is this crate's own `plugin_door!` entry.
-    unsafe { LoadedDoor::from_raw(busbar_transport_grpc::door) }
+    let door: DoorFn = busbar_transport_grpc::door;
+    LoadedDoor::from(door)
 }
 
 /// The row a compiled-in build holds for this door.
