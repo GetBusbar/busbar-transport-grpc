@@ -35,8 +35,9 @@ repository = "https://github.com/GetBusbar/busbar-transport-grpc"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "498b1dc0fe6f041c58da2ce5479223171c791f2b" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "498b1dc0fe6f041c58da2ce5479223171c791f2b" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "91af6001dad844b8a441e41c397034a874ccb52f" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "91af6001dad844b8a441e41c397034a874ccb52f" }
+busbar-test-kit = { git = "https://github.com/GetBusbar/busbar", rev = "91af6001dad844b8a441e41c397034a874ccb52f" }
 # busbar's root [workspace.dependencies], third-party rows, at 498b1dc0fe6f041c58da2ce5479223171c791f2b
 arc-swap = "1"
 async-trait = "0.1"
