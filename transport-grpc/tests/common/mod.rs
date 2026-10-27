@@ -78,7 +78,7 @@ pub fn linked() -> &'static Ops {
     #[allow(unused_unsafe)]
     let d = unsafe { busbar_transport_grpc::door() };
     // SAFETY: the door's `'static` table.
-    unsafe { &*(*d).ops.cast::<Ops>() }
+    unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
 /// THE IMAGE WHERE `cargo test` DID NOT BUILD IT: the coverage job. `cargo test` builds every
@@ -158,7 +158,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     #[allow(unused_unsafe)]
     let d = unsafe { door() };
     // SAFETY: the dropped-in door's `'static` table.
-    (unsafe { &*(*d).ops.cast::<Ops>() }, lib)
+    (unsafe { &*(*d).ops().cast::<Ops>() }, lib)
 }
 
 // ── the socket ───────────────────────────────────────────────────────────────────────────────────
