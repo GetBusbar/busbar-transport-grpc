@@ -182,7 +182,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     loaded: loaded(),
     cdylib: "busbar_transport_grpc_plugin",
     inputs: include_str!("conformance.json"),
