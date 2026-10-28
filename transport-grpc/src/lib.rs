@@ -17,8 +17,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-// THE KIND'S SHAPE (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
-// (`claims`), the entry (`transport`: the sans-IO gRPC framer), and the door that states them.
+// What it declares (`meta`), what it claims (`claims`), the entry (`transport`: the sans-IO gRPC
+// framer), and the door that states them.
 mod claims;
 mod door;
 mod meta;
@@ -26,7 +26,7 @@ mod msg;
 mod stream;
 mod transport;
 
-/// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape).
+/// The door: this plugin's one public item.
 pub use door::door;
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK.

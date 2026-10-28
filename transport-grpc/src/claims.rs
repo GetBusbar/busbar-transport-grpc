@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The claims this transport declares, as the kind's own file (`BUSBAR-1.6.0.md` THE DESIGN, §2):
-//! the scheme it answers for and the selector forms and facts a claim over it reads. A declaration
+//! The claims this transport declares: the scheme it answers for and the selector forms and facts a claim over it reads. A declaration
 //! and nothing else, read once at registration.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
