@@ -72,8 +72,8 @@ pub enum Bad {
 
 impl Bad {
     /// The `grpc-status` a call fails with for it: `RESOURCE_EXHAUSTED` for an oversize message, on
-    /// the dial and both accept paths (gRPC's status codes: "received message larger than max";
-    /// coordinator ruling); `UNIMPLEMENTED` for
+    /// the dial and both accept paths (gRPC's status codes: "received message larger than max");
+    /// `UNIMPLEMENTED` for
     /// a compression the door does not take (gRPC's compression rules, `compression.md`);
     /// `INTERNAL` else.
     #[must_use]
@@ -131,7 +131,7 @@ impl std::fmt::Display for Bad {
                 f,
                 "the message encoding `{name}` is not supported: this server takes identity"
             ),
-            // This framer's own words (coordinator ruling (b)), naming the configured ceiling: the
+            // This framer's own words, naming the configured ceiling: the
             // same `limits.request_body_max_bytes` that bounds every inbound body.
             Self::TooLarge(n, limit) => write!(
                 f,
@@ -227,8 +227,6 @@ impl Messages {
     }
 }
 
-// ── the gRPC fields ──────────────────────────────────────────────────────────────────────────────
-
 /// The field the call's status travels in (the trailers, or a trailers-only head).
 pub const GRPC_STATUS: &str = "grpc-status";
 /// The field the status's text travels in, percent-encoded.
@@ -241,8 +239,6 @@ pub const GRPC_ENCODING: &str = "grpc-encoding";
 pub const GRPC_ACCEPT_ENCODING: &str = "grpc-accept-encoding";
 /// The one compression this door takes: none.
 pub const ACCEPT_ENCODING: &str = "identity";
-
-// ── grpc-status ──────────────────────────────────────────────────────────────────────────────────
 
 /// `OK`.
 pub const OK: u16 = 0;
@@ -287,9 +283,9 @@ pub fn status_of_http(code: u16) -> u16 {
 /// table lists so (`NO_ERROR`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `FLOW_CONTROL_ERROR`,
 /// `SETTINGS_TIMEOUT`, `FRAME_SIZE_ERROR`, `COMPRESSION_ERROR`, `CONNECT_ERROR`,
 /// `HTTP_1_1_REQUIRED`), `STREAM_CLOSED`, which it does not list, and a code HTTP/2 does not
-/// define. These last follow the coordinator's ruling for row 159 ("all others → INTERNAL"); RFC
-/// 9113 §7 permits it, saying an unknown code MAY be treated as `INTERNAL_ERROR`, and nothing about
-/// such a stream says the far end processed nothing, so it is never read as safe to retry.
+/// define. RFC 9113 §7 permits this, saying an unknown code MAY be treated as `INTERNAL_ERROR`, and
+/// nothing about such a stream says the far end processed nothing, so it is never read as safe to
+/// retry.
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
     match code {
@@ -327,9 +323,7 @@ pub fn reset_name(code: u32) -> String {
 }
 
 /// The `grpc-status` a refusal's neutral status ([`RefuseIn::status`]) stands for on a call's
-/// end: the HTTP-to-status table, and `413` as `RESOURCE_EXHAUSTED`, the table predev's gRPC line
-/// answered a refusal with (byte-equal, spec ruling 2026-09-30 "new-plane refusals follow predev
-/// bytes").
+/// end: the HTTP-to-status table, and `413` as `RESOURCE_EXHAUSTED`.
 ///
 /// [`RefuseIn::status`]: busbar_contract::abi::transport::RefuseIn::status
 #[must_use]
@@ -341,7 +335,7 @@ pub fn status_of_refusal(status: u32) -> u16 {
 }
 
 /// The `grpc-message` a refusal's neutral status ends a call with when its trailer block states
-/// no `grpc-status`: predev's words for it, byte-equal.
+/// no `grpc-status`.
 #[must_use]
 pub fn refusal_message(status: u32) -> String {
     format!("busbar answered HTTP {status}")
@@ -382,12 +376,8 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     out
 }
 
-// ── one stream's close (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────
-
-/// `text` as a `grpc-message` value in predev's bytes, for every `grpc-message` this door writes,
-/// on either accept side (spec ruling 2026-09-30: a refusal's trailers byte-equal to predev).
-/// v1.5.5 served no gRPC: the baseline is predev's gRPC line, which answered with tonic 0.14's
-/// `Status`, so the encoding is tonic's: every control byte, every byte past ASCII, and each of
+/// `text` as a `grpc-message` value, for every `grpc-message` this door writes, on either accept
+/// side. The encoding is tonic 0.14's `Status`: every control byte, every byte past ASCII, and each of
 /// `` "#%<>`?{}`` and the space percent-encoded, upper-case hex; every other byte as it is.
 #[must_use]
 pub fn encode_status_message(text: &[u8]) -> String {
@@ -414,11 +404,10 @@ pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
     block
 }
 
-/// A stream's CLOSING STATUS LINES in predev's bytes and order, which are tonic 0.14's
-/// (`Status::add_header`): `grpc-status`, then `grpc-message` where there is a message, then
-/// `grpc-status-details-bin` where there are details, the value the plane wrote, verbatim. Where
-/// predev differs from tonic is the text, never the rendering: a refusal's words and its neutral
-/// status's mapping are predev's own ([`refusal_message`], [`status_of_refusal`]; tonic has no
+/// A stream's closing status lines in tonic 0.14's bytes and order (`Status::add_header`):
+/// `grpc-status`, then `grpc-message` where there is a message, then `grpc-status-details-bin`
+/// where there are details, the value the plane wrote, verbatim. A refusal's words and its neutral
+/// status's mapping are this door's own ([`refusal_message`], [`status_of_refusal`]; tonic has no
 /// refusal), and the details go out as the value the plane wrote (already the unpadded base64
 /// tonic wrote of the raw bytes).
 ///
@@ -442,8 +431,6 @@ pub fn status_lines(code: u32, message: &[u8], details: &[u8]) -> Result<Vec<u8>
     }
     Ok(out)
 }
-
-// ── the head block ───────────────────────────────────────────────────────────────────────────────
 
 /// A head block, read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

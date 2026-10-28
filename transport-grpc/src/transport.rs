@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE ENGINE, as the kind's entry file (`BUSBAR-1.6.0.md` THE DESIGN, §2: meta, claims, and the
-//! kind-named entry): gRPC over `hyper`'s HTTP/2, both sides, run as a sans-IO framer.
+//! The engine: gRPC over `hyper`'s HTTP/2, both sides, run as a sans-IO framer.
 //!
 //! One [`Conn`] is one connection. Its HTTP/2 machine is `hyper`'s own — `client::conn::http2`
 //! on a dialled connection, `server::conn::http2` on an accepted one — driven over the host's
@@ -12,15 +11,13 @@
 //!
 //! DIALLED. The host `emit`s a stream's head block and its messages; the head's `path` names the
 //! method. The request carries `content-type: application/grpc` (or the caller's `+proto`/`+json`
-//! form) and `te: trailers`. These are THE FRAMER'S OWN HEAD LINES, stated at `locate`
-//! (`LocateIn::defaults_buf`) so the host puts them in the head BEFORE the auth signs it (THE
-//! DESIGN §6, step 5: nothing is added to the head after the auth has run): the head's own
-//! `content-type` goes out as it was signed, and only a head that states none (a host that
-//! predates the defaults) has one written here. NO `grpc-timeout` goes upstream, as predev's hop
-//! sent none: one the head carries is dropped, and the attempt's deadline is held here. The
-//! request's body ENDS (END_STREAM) once the head's `content-length` bytes are in, or on an `emit` that ends the frame:
-//! a unary server waits for exactly that. The answer comes back as frames (HEAD-FIELDS, GRPC-DOOR
-//! rulings): the HEAD, always first, a field block with no status code; one frame per message; the
+//! form) and `te: trailers`. These are the framer's own head lines, stated at `locate`
+//! (`LocateIn::defaults_buf`) so the host puts them in the head BEFORE the auth signs it (nothing
+//! is added to the head after the auth has run): the head's own `content-type` goes out as it was
+//! signed, and only a head that states none has one written here. NO `grpc-timeout` goes upstream:
+//! one the head carries is dropped, and the attempt's deadline is held here. The request's body
+//! ENDS (END_STREAM) once the head's `content-length` bytes are in, or on an `emit` that ends the
+//! frame: a unary server waits for exactly that. The answer comes back as frames: the HEAD, always first, a field block with no status code; one frame per message; the
 //! TRAILERS, a field block carrying `grpc-status` as its code; then the terminal piece, empty when
 //! the status is `OK`, else a failure whose bytes are the decoded `grpc-message`. A trailers-only
 //! answer (status in the head) yields the same three. An answer that is not gRPC fails the stream
@@ -34,7 +31,7 @@
 //! method, target and authority in the stream's head slots, never as fields), one frame per
 //! message, and the end piece (`PIECE_END`) when the far end has sent its last. A `grpc-timeout`
 //! the caller states is one of the head's fields, a fact for the plane: this side enforces no
-//! deadline and never fails a call `DEADLINE_EXCEEDED`, as predev's server enforced none. `te` is
+//! deadline and never fails a call `DEADLINE_EXCEEDED`. `te` is
 //! checked by HTTP/2 itself: a `te` other than `trailers` resets the stream with
 //! `PROTOCOL_ERROR` before it is a call, and a missing one is served; it is then dropped as
 //! hop-by-hop. The host answers on the same stream: `emit` a head block (the answer's metadata) and
@@ -90,8 +87,6 @@ pub struct Posture {
 pub struct Failure(pub String);
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-// ── a body the host feeds ────────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct ChanState {
@@ -246,8 +241,6 @@ impl Drop for ChanBody {
         self.0.let_go();
     }
 }
-
-// ── the connection ───────────────────────────────────────────────────────────────────────────────
 
 /// One connection's gRPC machine.
 pub struct Conn {
@@ -592,8 +585,6 @@ impl Conn {
     }
 }
 
-// ── the dialled side ─────────────────────────────────────────────────────────────────────────────
-
 struct Dial {
     handshake: Option<BoxFut<hyper::Result<client::SendRequest<ChanBody>>>>,
     sender: Option<client::SendRequest<ChanBody>>,
@@ -747,9 +738,8 @@ impl DialStream {
             .version(http::Version::HTTP_2)
             .header(http::header::CONTENT_TYPE, content_type)
             .header(http::header::TE, "trailers");
-        // NO `grpc-timeout` GOES UPSTREAM, as predev's hop sent none (predev
-        // `crates/busbar-a2a/src/a2a/relay.rs` `build_request`): the attempt's deadline is held
-        // here (the stream's timer), and one a head carries is dropped (`RESERVED_ON_REQUEST`).
+        // NO `grpc-timeout` goes upstream: the attempt's deadline is held here (the stream's
+        // timer), and one a head carries is dropped (`RESERVED_ON_REQUEST`).
         for (name, value) in &head.fields {
             if RESERVED_ON_REQUEST.contains(&name.as_str()) || hop_by_hop(name, []) {
                 continue;
@@ -870,7 +860,7 @@ fn advance(
                             HeaderValue::from_str(&format!("HTTP status {code}"))
                                 .expect("digits and spaces are a field value"),
                         );
-                        // Its fault is the HTTP status's own reading (1.5.5's bands), not the
+                        // Its fault is the HTTP status's own reading, not the
                         // mapped code's: a bare 400 maps to INTERNAL but is the caller's.
                         let [block, text] = trailers(id, &HeaderMap::new(), &status);
                         out.push_back(Piece {
@@ -943,10 +933,7 @@ fn advance(
 /// for it. A reset or a GOAWAY, either end's (`hyper` hands up `h2`'s error as its source), is read
 /// by its HTTP/2 error code ([`msg::status_of_reset`]), before or after the answer's head alike.
 /// Anything else (the connection lost, an I/O error) is the far end become unreachable before any
-/// status came: `UNAVAILABLE`. predev's hop read none of these by code: every transport failure,
-/// a reset mid-body included, was one refusal (predev `crates/busbar-a2a/src/a2a/relay.rs`
-/// `RelayRefusal::Transport`, classed `Network` by `classify_hop`), so the codes follow the
-/// gRPC over HTTP/2 table.
+/// status came: `UNAVAILABLE`. The codes follow the gRPC over HTTP/2 table.
 fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
     let mut at = Some(e);
     while let Some(err) = at {
@@ -973,9 +960,7 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
     )
 }
 
-/// What a dialled answer that is no message stream is called, in this framer's own words: predev's
-/// hop had no gRPC status for an oversize answer (its refusal was `BodyTooLarge`), so the words
-/// predev's server gave an oversize request are not repeated here.
+/// What a dialled answer that is no message stream is called, in this framer's own words.
 fn dial_bad_text(e: &msg::Bad) -> String {
     match e {
         msg::Bad::TooLarge(n, limit) => {
@@ -1015,8 +1000,6 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
         },
     ]
 }
-
-// ── the accepted side ────────────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct Arrivals {
@@ -1210,7 +1193,7 @@ impl Accept {
             };
             // A `grpc-timeout` the caller states is handed up with the head's fields, a fact for
             // the plane: this side enforces no deadline of its own and never fails a call
-            // `DEADLINE_EXCEEDED`, as predev's server enforced none.
+            // `DEADLINE_EXCEEDED`.
             out.push_back(Piece {
                 head: Some(words),
                 ..Piece::fields(id, Bytes::from(field_block(req.headers(), &[])))
@@ -1229,7 +1212,7 @@ impl Accept {
         }
         for (id, s) in &mut self.calls {
             if !s.reply_over && s.reply.chan.gone() {
-                // THE FAR END CANCELLED THE CALL: it reset the stream, and the connection let go
+                // The far end cancelled the call: it reset the stream, and the connection let go
                 // of the answer. Before the far end's last message its body says so too; after it
                 // (a call the far end half-closed, then cancelled) this is the only sign, and the
                 // host must hear it or it keeps answering into a stream nobody reads.
