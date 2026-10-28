@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! ONE STREAM (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l, 2026-10-05): a gRPC call whose HTTP/2 connection
+//! One stream (`SIDE_ACCEPT_STREAM`): a gRPC call whose HTTP/2 connection
 //! and head the host's own framer carries (one listener port carries every claim's streams), framed
 //! here alone. The gRPC layer is still this door's:
 //!
@@ -10,22 +10,20 @@
 //!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding` (gRPC's
 //!   compression rules); the first `grpc-encoding` field is the call's, a repeat is not read;
 //!   a `grpc-timeout` it states is a fact for the plane in the head the host keeps: this framing
-//!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`, as predev's server enforced
-//!   none;
+//!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`;
 //! * `ingest` takes the call's body and yields each length-prefixed message's PAYLOAD as one piece
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
 //! * `emit` takes one reply message's payload and yields it length-prefixed, as body bytes; once
 //!   the call is closed an `emit` writes nothing;
 //! * `finish` closes the call with the final status the unit stated: `grpc-status`, `grpc-message`
-//!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in predev's
-//!   bytes and order, which are tonic 0.14's ([`msg::status_lines`]; v1.5.5 served no gRPC), the
-//!   host's trailers;
+//!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in tonic
+//!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
-//!   mapped ([`msg::status_of_refusal`], predev's words); a body whose message was over the ceiling
-//!   closes `RESOURCE_EXHAUSTED` in this framer's words, naming the configured limit, whatever the
-//!   refusal; before any message went out the block is the whole answer (trailers-only: `:status: 200`, `content-type`, then the
-//!   status lines).
+//!   mapped ([`msg::status_of_refusal`]); a body whose message was over the ceiling closes
+//!   `RESOURCE_EXHAUSTED` in this framer's words, naming the configured limit, whatever the
+//!   refusal; before any message went out the block is the whole answer (trailers-only:
+//!   `:status: 200`, `content-type`, then the status lines).
 //!
 //! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
 
