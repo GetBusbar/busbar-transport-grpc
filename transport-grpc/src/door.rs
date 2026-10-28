@@ -497,18 +497,19 @@ slot!(
             }
             pairs.push((name, f.value().bytes()));
         }
-        let message = msg::frame(i.body());
-        let Ok(mut bytes) = msg::render_head(&pairs, Some(message.len())) else {
+        let body = i.body();
+        let Ok(bytes) = msg::render_head(&pairs, Some(msg::PREFIX + body.len())) else {
             o.error("encode: the envelope cannot be expressed on this wire");
             return Outcome::Failed;
         };
-        bytes.extend_from_slice(&message);
         let mut wire = i.sink().wire();
-        if bytes.len() > wire.cap() {
+        if bytes.len() + msg::PREFIX + body.len() > wire.cap() {
             o.error("encode: the rendered call is larger than the wire buffer");
             return Outcome::Failed;
         }
         wire.extend(&bytes);
+        wire.extend(&msg::prefix(body.len()));
+        wire.extend(body);
         o.set(|x| &x.yielded.wire_len, wire.written() as u64);
         Outcome::Ready
     }
