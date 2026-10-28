@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! What this transport declares about itself, as the kind's own file (`BUSBAR-1.6.0.md` THE
-//! DESIGN, §2): its key, the settings it reads, its status classes and the transport kind's tail its
-//! door states. Read once at registration and sealed, so it is data, held apart from the framing
+//! What this transport declares about itself: its key, the settings it reads, its status classes
+//! and the transport kind's tail its door states. Read once at registration and sealed, so it is data, held apart from the framing
 //! code it describes.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
@@ -17,7 +16,7 @@ use busbar_contract::abi::transport::{
 /// This transport's key: the scheme it claims.
 pub const KEY: &str = "grpc";
 
-/// The settings this transport reads, at their 1.5.5 paths.
+/// The settings this transport reads.
 pub mod setting {
     /// A dialled call's deadline when the host states none, in seconds.
     pub const REQUEST_TIMEOUT_SECS: &str = "limits.upstream_request_timeout_secs";
@@ -69,15 +68,9 @@ pub(crate) fn class_of(code: u16) -> u8 {
 /// What each `grpc-status` means to the BREAKER: the fault table, beside the status table and
 /// never folded into it (the status class is the fee decision's leg, and the two disagree where the
 /// money and the destination's health do). One row per code gRPC defines, this wire's own reading,
-/// held by the wire that owns the numbering (busbar ARCHITECT breaker ruling Q1). It is not a 1.5.5
-/// table: v1.5.5 served no gRPC upstream and had no gRPC breaker table. Its one reading of gRPC's
-/// status names, the Gemini dialect's (`v1.5.5 crates/busbar/src/proto/gemini/mod.rs`,
-/// `gemini_error_status_class`), agrees with these rows on every code it names but two: it put
-/// `ABORTED` with the client errors (no breaker penalty), where this row reads it transient (a
-/// conflict the far end reports, which a retry may clear), and `UNIMPLEMENTED` with the server
-/// errors (transient), where this row reads it as the caller's (a method the far end does not serve
-/// is the caller's request, and costs the destination nothing). No customer-visible parity rides on
-/// either: no 1.5.5 customer ever reached a gRPC upstream.
+/// held by the wire that owns the numbering. `ABORTED` reads transient (a conflict the far end
+/// reports, which a retry may clear); `UNIMPLEMENTED` reads as the caller's (a method the far end
+/// does not serve is the caller's request, and costs the destination nothing).
 ///
 /// - `RESOURCE_EXHAUSTED` is the upstream's quota, not the caller's mistake: transient, and the
 ///   upstream's own wait is the cooldown floor.
@@ -125,11 +118,10 @@ pub(crate) fn fault_of(code: u16) -> u8 {
 }
 
 /// How the breaker reads a BARE HTTP ANSWER (a far end, or a proxy or auth wall in front of it,
-/// answering a call with an HTTP status and no `grpc-status`), by that HTTP status: 1.5.5's bands
-/// (`v1.5.5 crates/busbar/src/breaker.rs` step 2: 401/403 `Auth` -> `HardDown`; 408, 429, 529 and
-/// 5xx transient; every other status the caller's). The call's own status is the gRPC status the
+/// answering a call with an HTTP status and no `grpc-status`), by that HTTP status: 401/403 hard
+/// (`Auth` -> `HardDown`); 408, 429, 529 and 5xx transient; every other status the caller's. The call's own status is the gRPC status the
 /// HTTP one stands for (`msg::status_of_http`); its fault is read here, by the wire it came on, so a
-/// bare 400 that the mapping calls INTERNAL records nothing, as 1.5.5 recorded nothing. Data, walked
+/// bare 400 that the mapping calls INTERNAL records nothing. Data, walked
 /// once: the first row that holds the status reads it.
 const HTTP_FAULTS: &[(u16, u16, u8)] = &[
     (401, 401, FAULT_HARD),

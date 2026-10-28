@@ -19,7 +19,7 @@
 //! * `ingest` takes what the far end sent, `timer` is the host's clock reaching a deadline this
 //!   framer asked for, and `finish` drops the connection.
 //!
-//! ONE STREAM (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l): a framing begun on that side frames one call
+//! One stream (`SIDE_ACCEPT_STREAM`): a framing begun on that side frames one call
 //! whose connection and head the host's own framer carries, and its `finish` closes the call with
 //! the final status the unit stated (the close's final tail), rendered here alone
 //! (`crate::stream`).
@@ -54,14 +54,12 @@ use crate::msg;
 use crate::stream::StreamCall;
 use crate::transport::{self, Conn, Posture};
 
-// ── the statement ────────────────────────────────────────────────────────────────────────────────
-
 use crate::claims::CLAIM_NAMES;
 use crate::meta::{class_of, fault_of, TAIL};
 pub use crate::meta::{setting, KEY};
 
 busbar_contract::statement_extensions!(
-    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    /// The Statement's extensions: this plugin's whole `declares` document.
     EXTENSIONS: [(
         busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
         include_bytes!("../declares.json")
@@ -79,8 +77,6 @@ pub const STATEMENT: Statement = {
 
 /// The protocol offer on a secured connection, in the handshake's ProtocolNameList encoding.
 const OFFER_H2: &[u8] = b"\x02h2";
-
-// ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
 /// What `open` read from the settings, and the framings it holds.
 pub struct Instance {
@@ -155,8 +151,6 @@ macro_rules! answer {
     };
 }
 
-// ── the lifecycle ────────────────────────────────────────────────────────────────────────────────
-
 impl Life for Instance {
     /// No framer op pends, so nothing is ever in flight to cancel.
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
@@ -197,11 +191,9 @@ answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
 answer!(Detach, FramingIn, FramerOut, Outcome::Refused);
 answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
 
-// ── the framer ───────────────────────────────────────────────────────────────────────────────────
-
 slot!(
-    /// `locate`: where a dialled target is and the offer its handshake makes, with THE FRAMER'S
-    /// OWN HEAD LINES for a request to it (`DEFAULT_LINES`); or, asked for an ACCEPTING
+    /// `locate`: where a dialled target is and the offer its handshake makes, with the framer's
+    /// own head lines for a request to it (`DEFAULT_LINES`); or, asked for an ACCEPTING
     /// listener (`LocateIn::accept`), the offer that listener makes: `h2` alone, the protocol a
     /// gRPC client negotiates over TLS. A listener names no far end, so no target is read and no
     /// authority, name or head line is stated.
@@ -282,12 +274,11 @@ slot!(
     }
 );
 
-/// THE FRAMER'S OWN HEAD LINES on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
+/// The framer's own head lines on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
 /// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
-/// auth signs the head (THE DESIGN §6, step 5), and the dial then sends them as signed: the content
+/// auth signs the head, and the dial then sends them as signed: the content
 /// type and `te: trailers`, in the order the dial writes them. No `grpc-timeout`: none goes
-/// upstream, as predev's hop sent none (predev `crates/busbar-a2a/src/a2a/relay.rs`
-/// `build_request`).
+/// upstream.
 const DEFAULT_LINES: &str = "content-type: application/grpc\r\nte: trailers\r\n";
 
 slot!(
