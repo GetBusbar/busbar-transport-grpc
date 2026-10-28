@@ -41,16 +41,18 @@ pub fn is_grpc_content_type(v: &[u8]) -> bool {
         && matches!(v.get(base.len()), None | Some(b'+' | b';'))
 }
 
+/// The prefix of a message whose payload is `len` bytes.
+#[must_use]
+pub fn prefix(len: usize) -> [u8; PREFIX] {
+    let n = u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes();
+    [0, n[0], n[1], n[2], n[3]]
+}
+
 /// `payload` in its length-prefixed form.
 #[must_use]
 pub fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREFIX + payload.len());
-    out.push(0);
-    out.extend_from_slice(
-        &u32::try_from(payload.len())
-            .unwrap_or(u32::MAX)
-            .to_be_bytes(),
-    );
+    out.extend_from_slice(&prefix(payload.len()));
     out.extend_from_slice(payload);
     out
 }
@@ -180,6 +182,34 @@ impl Messages {
             }
             out.push(self.buf.split_to(PREFIX + n).freeze());
         }
+        Ok(out)
+    }
+
+    /// [`Messages::push`] for bytes already shared: with nothing held back, each whole message in
+    /// `data` is a slice of it (no copy), and only a cut tail is held.
+    ///
+    /// # Errors
+    ///
+    /// A message is compressed or over the ceiling.
+    pub fn push_bytes(&mut self, mut data: Bytes) -> Result<Vec<Bytes>, Bad> {
+        if !self.buf.is_empty() {
+            return self.push(&data);
+        }
+        let mut out = Vec::new();
+        while data.len() >= PREFIX {
+            if data[0] != 0 {
+                return Err(Bad::Compressed);
+            }
+            let n = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+            if n > self.max {
+                return Err(Bad::TooLarge(n, self.max));
+            }
+            if data.len() < PREFIX + n {
+                break;
+            }
+            out.push(data.split_to(PREFIX + n));
+        }
+        self.buf.extend_from_slice(&data);
         Ok(out)
     }
 

@@ -437,9 +437,8 @@ impl Conn {
                         d.calls.len() - 1
                     }
                 };
-                let base = d.base.clone();
                 let s = &mut d.calls[idx].1;
-                if let Err(why) = s.take(&base, bytes, end, max) {
+                if let Err(why) = s.take(&d.base, bytes, end, max) {
                     s.stage = DStage::Done;
                     self.out.push_back(Piece {
                         status: Some(msg::INTERNAL),
@@ -908,7 +907,7 @@ fn advance(
                 Poll::Ready(Some(Ok(fr))) => match fr.into_data() {
                     Ok(d) => {
                         let got = msgs
-                            .push(&d)
+                            .push_bytes(d)
                             .map_err(|e| (dial_bad_text(&e), e.status(), false))?;
                         out.extend(got.into_iter().map(|m| Piece::data(id, m)));
                     }
@@ -1248,7 +1247,7 @@ impl Accept {
                     Poll::Pending => break,
                     Poll::Ready(Some(Ok(fr))) => {
                         if let Ok(d) = fr.into_data() {
-                            match msgs.push(&d) {
+                            match msgs.push_bytes(d) {
                                 Ok(got) => out.extend(got.into_iter().map(|m| Piece::data(*id, m))),
                                 Err(e) => {
                                     let (why, code) = (e.to_string(), e.status());
