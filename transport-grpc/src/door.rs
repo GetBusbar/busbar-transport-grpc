@@ -35,10 +35,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
-use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
-use busbar_contract::abi::sdk::life::{self, Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -172,11 +172,6 @@ impl Life for Instance {
         Ok(Refreshed::default())
     }
 }
-
-slot!(
-    /// `close`: answering READY, the SDK drops the instance.
-    Close, InHead, OutHead, |_, _, _out| { Outcome::Ready }
-);
 
 // A framer is not a carrier: every carrier op is refused. Nothing detaches from, or adopts onto, a
 // gRPC connection.
@@ -583,17 +578,7 @@ fn step(
 busbar_contract::plugin_door! {
     ops: Ops,
     statement: STATEMENT,
-    lifecycle: {
-        validate: Safe<life::Validate<Instance>>,
-        open: Safe<life::Open<Instance>>,
-        refresh: Safe<life::Refresh<Instance>>,
-        retire: Safe<life::Retire<Instance>>,
-        tick: Safe<life::Tick<Instance>>,
-        drive: Safe<life::Drive<Instance>>,
-        cancel: Safe<life::Cancel<Instance>>,
-        release: Safe<life::Release<Instance>>,
-        close: Safe<Close>,
-    },
+    lifecycle: life(Instance),
     kind_ops: {
         listen: Safe<Listen>,
         accept: Safe<Accept>,
