@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
@@ -509,6 +510,7 @@ impl Host {
             .collect();
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT_STREAM;
+        i.scheme = SCHEME_PLAIN;
         i.target = s(target);
         i.fields = lent.as_ptr();
         i.fields_len = lent.len();
@@ -589,6 +591,11 @@ impl Host {
         }
         let mut i: BeginIn = z();
         i.side = side;
+        i.scheme = if target.starts_with("https://") {
+            SCHEME_SECURE
+        } else {
+            SCHEME_PLAIN
+        };
         i.target = s(target);
         i.facts = &facts;
         i.sink = self.sink();
