@@ -122,6 +122,7 @@ fn script(p: &Plugin<Transport>) -> Script {
     let mut i: BeginIn = z();
     i.head = in_head();
     i.side = SIDE_DIAL;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
     i.target = AbiStr::of(target);
     i.sink = FramerSink {
         wire: wire.as_mut_ptr(),
@@ -156,6 +157,11 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
     let a = script(&linked);
     let b = script(&dropped);
     assert_eq!(a, b, "both doors answer alike");
+    assert_eq!(
+        a.last().map(String::as_str),
+        Some("begin Ready"),
+        "both doors begin the dial"
+    );
 
     // RED: a dropped-in image that answered one line differently is caught.
     let mut off = b.clone();
