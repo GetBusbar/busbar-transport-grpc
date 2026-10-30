@@ -95,15 +95,22 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
         bytes,
         &[setting::REQUEST_TIMEOUT_SECS, setting::BODY_MAX_BYTES],
     )?;
-    let count = |k: &'static str, d: u64| match v.get(k) {
+    // A count, by its key and its unit (`settings: <key> must be a count of <unit>`, the siblings'
+    // grammar).
+    let count = |k: &'static str, unit: &str, d: u64| match v.get(k) {
         None => Ok(d),
         Some(x) => x
             .as_u64()
-            .ok_or_else(|| Refusal::failed("settings: a value is not of its declared kind")),
+            .ok_or_else(|| Refusal::failed(format!("settings: {k} must be a count of {unit}"))),
     };
-    let secs = count(setting::REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
+    let secs = count(
+        setting::REQUEST_TIMEOUT_SECS,
+        "seconds",
+        DEFAULT_REQUEST_TIMEOUT_SECS,
+    )?;
     let max = count(
         setting::BODY_MAX_BYTES,
+        "bytes",
         DEFAULT_REQUEST_BODY_MAX_BYTES as u64,
     )?;
     Ok(Posture {
