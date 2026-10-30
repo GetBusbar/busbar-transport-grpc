@@ -674,6 +674,28 @@ impl Host {
         self.drain(slot::EMIT, stream)
     }
 
+    /// `emit` `bytes` on `stream` ONCE, as a host whose far end is not reading does: no `YIELD_MORE`
+    /// re-call drains what the sink could not take. Its outcome, its yield flags, and its text.
+    pub fn emit_held(&mut self, stream: u64, bytes: &[u8], end: bool) -> (Outcome, u32, String) {
+        let mut i: EmitIn = z();
+        i.framing = self.framing;
+        i.stream = stream;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.end_of_frame = u32::from(end);
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
+        self.take(r, &o);
+        (r, o.yielded.flags, text(o.head.error))
+    }
+
+    /// Re-call `emit` on `stream` with no new bytes until it has nothing more: the far end reads
+    /// again.
+    pub fn emit_drain(&mut self, stream: u64) -> Outcome {
+        self.drain(slot::EMIT, stream)
+    }
+
     /// `encode` a one-message call and `emit` it as one whole frame.
     pub fn ask(&mut self, stream: u64, path: &str, body: &[u8], deadline_ns: u64) {
         let c = self.encode(path, &[], body);
