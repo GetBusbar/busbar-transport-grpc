@@ -28,7 +28,7 @@ use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, ValidateIn};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{
     check_framer, check_framer_fields, check_head_slots, check_locate,
@@ -277,6 +277,33 @@ pub struct Host {
     pub words: Vec<(u64, String, String, String)>,
     // Kept alive while the framer may read it.
     facts_text: String,
+}
+
+/// An `AbiStr` the door wrote, as text.
+pub fn text(t: AbiStr) -> String {
+    if t.len == 0 {
+        return String::new();
+    }
+    // SAFETY: the door's string, live for the call.
+    String::from_utf8(unsafe { t.bytes() }.to_vec()).expect("UTF-8")
+}
+
+/// `validate` of `ops` over `json`: its outcome and the text it wrote into the lent reason buffer.
+pub fn validate(ops: &'static Ops, json: &'static str) -> (Outcome, String) {
+    let mut reason = [0_u8; 256];
+    let mut i: ValidateIn = z();
+    i.settings = Blob::json(json.as_bytes());
+    i.err_buf = reason.as_mut_ptr();
+    i.err_cap = reason.len();
+    let mut o: OutHead = z();
+    let r = call(
+        ops.head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    (r, text(o.error))
 }
 
 pub fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u32) -> Outcome {
@@ -743,6 +770,16 @@ impl Host {
 
     pub fn next_deadline(&self) -> Option<u64> {
         self.deadline
+    }
+
+    /// Op `index` of this instance over all-zero `in` and `out`: its outcome and its text.
+    pub fn bare<I, O>(&self, op: Option<Op>, index: u32) -> (Outcome, String) {
+        let mut i: I = z();
+        let mut o: O = z();
+        let r = call(op, self.inst, &mut i, &mut o, index);
+        // SAFETY: every `out` leads with an `OutHead`.
+        let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+        (r, text(head.error))
     }
 
     pub fn close(self) {

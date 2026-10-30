@@ -566,3 +566,71 @@ fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words(
         host.close();
     }
 }
+
+/// THE SIBLING TRANSPORTS' WORDS, both images. RED before the SDK pieces: `validate` refused a blob
+/// that is no JSON object as `settings: not JSON` (and read an array as `{}`), read past a key it
+/// does not read, and every op of the carrier role (and `detach`, `adopt`) answered a bare REFUSED.
+/// Each is now the SDK's text (`settings_reading`, `not_served!`), as tcp, stdio and http answer.
+#[test]
+fn settings_and_the_unserved_ops_answer_the_sdks_words() {
+    use busbar_contract::abi::mechanism::call::OutHead;
+    use busbar_contract::abi::transport::{
+        slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn,
+        FramerOut, FramingIn, IoOut, ListenIn, ListenOut, ReadIn, ShutIn, WriteIn,
+    };
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        assert_eq!(validate(ops, "{}"), (Outcome::Ready, String::new()));
+        for bad in ["not json", "[]"] {
+            assert_eq!(
+                validate(ops, bad),
+                (
+                    Outcome::Failed,
+                    "settings: must be a JSON object".to_owned()
+                ),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            validate(ops, r#"{"limits.nope":1}"#),
+            (
+                Outcome::Failed,
+                "settings: limits.nope is not a setting this transport reads".to_owned()
+            )
+        );
+        assert_eq!(
+            validate(ops, r#"{"limits.upstream_request_timeout_secs":"5"}"#),
+            (
+                Outcome::Failed,
+                "settings: a value is not of its declared kind".to_owned()
+            )
+        );
+        let host = Host::open(ops, "{}", ROOMY);
+        let refused = |op: &str| {
+            (
+                Outcome::Refused,
+                format!("{op}: the grpc framer does not serve this op"),
+            )
+        };
+        let o = host.ops;
+        let got = [
+            host.bare::<ListenIn, ListenOut>(o.listen, slot::LISTEN),
+            host.bare::<AcceptIn, AcceptOut>(o.accept, slot::ACCEPT),
+            host.bare::<DialIn, ConnOut>(o.dial, slot::DIAL),
+            host.bare::<ReadIn, IoOut>(o.read, slot::READ),
+            host.bare::<WriteIn, IoOut>(o.write, slot::WRITE),
+            host.bare::<ConnIn, OutHead>(o.flush, slot::FLUSH),
+            host.bare::<ShutIn, OutHead>(o.shut, slot::SHUT),
+            host.bare::<ArrivalIn, ArrivalOut>(o.arrival, slot::ARRIVAL),
+            host.bare::<FramingIn, FramerOut>(o.detach, slot::DETACH),
+            host.bare::<AdoptIn, FramerOut>(o.adopt, slot::ADOPT),
+        ];
+        let want = [
+            "listen", "accept", "dial", "read", "write", "flush", "shut", "arrival", "detach",
+            "adopt",
+        ]
+        .map(refused);
+        assert_eq!(got, want);
+        host.close();
+    }
+}
