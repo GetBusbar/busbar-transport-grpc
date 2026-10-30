@@ -35,6 +35,23 @@ fn the_bodys_messages_are_the_units_payloads() {
 }
 
 #[test]
+fn a_reply_emitted_in_pieces_is_one_message_and_the_wire_drains_in_cuts() {
+    let mut c = grpc();
+    c.emit(b"he", false);
+    c.emit(b"", false);
+    c.emit(b"llo", true);
+    c.emit(b"!", true);
+    let mut want = msg::frame(b"hello");
+    want.extend(msg::frame(b"!"));
+    let mut got = c.take_wire(3);
+    assert_eq!(got.len(), 3);
+    while c.wire_pending() {
+        got.extend(c.take_wire(4));
+    }
+    assert_eq!(got, want);
+}
+
+#[test]
 fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
     let mut c = grpc();
     c.emit(b"hi", true);
