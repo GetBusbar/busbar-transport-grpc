@@ -1634,3 +1634,32 @@ fn a_trailer_field_the_wire_cannot_carry_fails_the_refusal_in_words() {
         Some(&b"busbar%20answered%20HTTP%20500"[..])
     );
 }
+
+/// The terminal piece an accepted call's host hears after it emits `bytes` (`end` = they end the
+/// frame) as the answer's first bytes.
+fn answer_head_fails(bytes: &[u8], end: bool) -> Piece {
+    let mut a = half_closed();
+    a.emit(1, bytes, end, 0, 5 * SEC).expect("taken");
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    let t = terminal(&got, 1).cloned().expect("the stream fails");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    t
+}
+
+/// AN ACCEPTED ANSWER'S FRAME THAT ENDS INSIDE ITS HEAD BLOCK FAILS IN WORDS, as the dial side's
+/// does: the host hears `INTERNAL` and the client is answered. RED: the partial block was held, the
+/// call never answered, and nothing said.
+#[test]
+fn an_accepted_answers_frame_ending_inside_its_head_block_fails_in_words() {
+    let t = answer_head_fails(b"x-partial: yes\r\n", true);
+    assert_eq!(t.bytes.as_ref(), b"the frame ended inside the head block");
+}
+
+/// An accepted answer's malformed head block fails the call `INTERNAL` in the head reader's words.
+#[test]
+fn an_accepted_answers_malformed_head_block_fails_in_words() {
+    let t = answer_head_fails(b"not a field\r\n\r\n", false);
+    assert_eq!(t.bytes.as_ref(), b"a head line is not a field");
+}
