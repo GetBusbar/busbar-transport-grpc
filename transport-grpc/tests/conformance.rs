@@ -24,6 +24,20 @@ use common::*;
 
 const QUIET: Duration = Duration::from_millis(300);
 
+/// The most a scenario waits on the far end (idle) before it is judged: a loaded runner's stall is
+/// waited out, never read as the far end's answer.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// Pump until `stream` has its terminal piece, and say so: never index an exchange that is not
+/// over.
+fn until_over(host: &mut Host, stream: u64) {
+    assert_eq!(
+        host.pump_until(BOUND, move |got| over(got, stream).is_some()),
+        Outcome::Ready
+    );
+    assert!(over(&host.got, stream).is_some(), "stream {stream} ended");
+}
+
 /// Dial scenarios against tonic's service; answer the proof lines.
 fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<String>, Host) {
     let mut proof = Vec::new();
@@ -40,7 +54,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // Unary, with the caller's deadline five seconds out.
     host.ask(1, "/t.T/Unary", b"hello", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 1);
     let f = host.frames(1);
     proof.push(format!(
         "unary head x-answer={:?} content-type={:?}",
@@ -55,7 +69,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // Server streaming.
     host.ask(3, "/t.T/List", b"q", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 3);
     let f = host.frames(3);
     proof.push(format!("list messages {:?}", &f[1..]));
     assert_eq!(f[1..], [lpm(b"a"), lpm(b"bb"), lpm(b"ccc")]);
@@ -63,7 +77,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // A non-zero status: trailers-only, percent-encoded message, classed as the caller's fault.
     host.ask(5, "/t.T/Fail", b"k", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 5);
     proof.push(format!("fail terminal {:?}", host.terminal(5)));
     assert_eq!(
         host.terminal(5),
@@ -72,7 +86,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // An unknown method: UNIMPLEMENTED, the far end's fault.
     host.ask(7, "/t.T/Nope", b"", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 7);
     let t = host.terminal(7).expect("terminal");
     proof.push(format!("nope terminal code={} class={}", t.0, t.1));
     assert_eq!((t.0, t.1, t.2), (12, STATUS_FAR_END_FAULT, true));
@@ -127,7 +141,9 @@ fn accept(ops: &'static Ops, rt: &tokio::runtime::Runtime) -> Vec<String> {
         .await
     });
     // The call's head, its message, then the client's last.
-    host.pump_until(QUIET, |_| false);
+    let last = |got: &[Got]| got.iter().any(|g| g.stream == 1 && g.end());
+    assert_eq!(host.pump_until(BOUND, last), Outcome::Ready);
+    assert!(last(&host.got), "the client's last arrived");
     let f = host.frames(1);
     let words = host.head_words(1).expect("the call's head words");
     proof.push(format!(
