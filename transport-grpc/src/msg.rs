@@ -148,6 +148,8 @@ impl std::fmt::Display for Bad {
 pub struct Messages {
     buf: BytesMut,
     max: usize,
+    /// The stream is not one: every later push answers this, and nothing more is held.
+    failed: Option<Bad>,
 }
 
 impl Messages {
@@ -157,6 +159,7 @@ impl Messages {
         Self {
             buf: BytesMut::new(),
             max,
+            failed: None,
         }
     }
 
@@ -166,51 +169,61 @@ impl Messages {
     ///
     /// A message is compressed or over the ceiling.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, Bad> {
-        self.buf.extend_from_slice(bytes);
-        let mut out = Vec::new();
-        while self.buf.len() >= PREFIX {
-            if self.buf[0] != 0 {
-                return Err(Bad::Compressed);
-            }
-            let n =
-                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-            if n > self.max {
-                return Err(Bad::TooLarge(n, self.max));
-            }
-            if self.buf.len() < PREFIX + n {
-                break;
-            }
-            out.push(self.buf.split_to(PREFIX + n).freeze());
-        }
-        Ok(out)
+        self.push_bytes(Bytes::copy_from_slice(bytes))
     }
 
     /// [`Messages::push`] for bytes already shared: with nothing held back, each whole message in
-    /// `data` is a slice of it (no copy), and only a cut tail is held.
+    /// `data` is a slice of it (no copy), and only a cut tail is held. Once the stream failed,
+    /// every push answers that failure and holds nothing.
     ///
     /// # Errors
     ///
     /// A message is compressed or over the ceiling.
     pub fn push_bytes(&mut self, mut data: Bytes) -> Result<Vec<Bytes>, Bad> {
-        if !self.buf.is_empty() {
-            return self.push(&data);
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
         }
-        let mut out = Vec::new();
-        while data.len() >= PREFIX {
-            if data[0] != 0 {
+        let cut = if self.buf.is_empty() {
+            self.whole(&data).map(|lens| {
+                let out = lens.into_iter().map(|n| data.split_to(n)).collect();
+                self.buf.extend_from_slice(&data);
+                out
+            })
+        } else {
+            self.buf.extend_from_slice(&data);
+            self.whole(&self.buf).map(|lens| {
+                lens.into_iter()
+                    .map(|n| self.buf.split_to(n).freeze())
+                    .collect()
+            })
+        };
+        cut.inspect_err(|e| {
+            self.failed = Some(e.clone());
+            self.buf = BytesMut::new();
+        })
+    }
+
+    /// THE ONE CUT: the length (prefix and payload) of each whole message off the front of `data`,
+    /// in order; a cut tail is left for the next push.
+    fn whole(&self, data: &[u8]) -> Result<Vec<usize>, Bad> {
+        let mut lens = Vec::new();
+        let mut rest = data;
+        while rest.len() >= PREFIX {
+            if rest[0] != 0 {
                 return Err(Bad::Compressed);
             }
-            let n = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-            if n > self.max {
+            let n = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+            // Checked: on a 32-bit target a ceiling near `usize::MAX` must not wrap the length.
+            let Some(len) = PREFIX.checked_add(n).filter(|_| n <= self.max) else {
                 return Err(Bad::TooLarge(n, self.max));
-            }
-            if data.len() < PREFIX + n {
+            };
+            if rest.len() < len {
                 break;
             }
-            out.push(data.split_to(PREFIX + n));
+            lens.push(len);
+            rest = &rest[len..];
         }
-        self.buf.extend_from_slice(&data);
-        Ok(out)
+        Ok(lens)
     }
 
     /// The stream ended.
