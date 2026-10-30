@@ -1420,3 +1420,34 @@ fn a_200_answer_that_is_not_grpc_fails_unknown() {
     assert_eq!(t.status, Some(msg::UNKNOWN));
     assert_eq!(t.bytes.as_ref(), b"the answer is not gRPC");
 }
+
+/// The dialled side's terminal piece for an answer whose trailers carry `grpc-message: message`.
+fn failed_with_message(message: &[u8]) -> Piece {
+    let mut p = Pair::new();
+    p.d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    p.a.emit(1, b"\r\n", false, 0, p.now).expect("head");
+    let mut block = b"grpc-status: 13\r\ngrpc-message: ".to_vec();
+    block.extend_from_slice(message);
+    block.extend_from_slice(b"\r\n");
+    p.a.end_call(1, &block, 0).expect("end");
+    p.settle();
+    last(&p.got_d, 1).cloned().expect("terminal")
+}
+
+/// A FAR END'S `grpc-message` REACHES THE HOST AS TEXT IT CAN PRINT: decoded, invalid UTF-8 replaced,
+/// every control character escaped (a terminal escape or a forged log line arrives as visible
+/// `\u{1b}` and `\n`), and bounded in length. RED: the raw bytes, ESC and LF among them.
+#[test]
+fn a_far_ends_grpc_message_reaches_the_host_as_printable_bounded_text() {
+    let end = failed_with_message(b"%1B%5B2J%0D%0Afake%20log%20line%FF");
+    assert!(end.failed);
+    assert_eq!(
+        String::from_utf8(end.bytes.to_vec()).expect("text"),
+        "\\u{1b}[2J\\r\\nfake log line\u{fffd}"
+    );
+    let long = vec![b'a'; 20_000];
+    let end = failed_with_message(&long);
+    assert_eq!(end.bytes.len(), msg::MESSAGE_TEXT_MAX, "bounded");
+}

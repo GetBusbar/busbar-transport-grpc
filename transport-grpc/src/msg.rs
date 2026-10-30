@@ -352,6 +352,9 @@ pub fn parse_status(v: &[u8]) -> u16 {
         .unwrap_or(UNKNOWN)
 }
 
+/// The most bytes of a far end's `grpc-message` handed to the host as a failure's text.
+pub const MESSAGE_TEXT_MAX: usize = 4096;
+
 /// `grpc-message`, percent-decoded (a malformed escape stays as it was sent).
 #[must_use]
 pub fn decode_message(v: &[u8]) -> Vec<u8> {
