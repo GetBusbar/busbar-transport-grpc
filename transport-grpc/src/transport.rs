@@ -308,6 +308,12 @@ impl Conn {
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
             return Err(Failure(format!("not a target: {target}")));
         };
+        // The authority without its userinfo: a credential never goes out as `:authority` (RFC
+        // 9113 §8.3.1), and the authority is the one `locate` stated.
+        let authority = authority
+            .as_str()
+            .rsplit_once('@')
+            .map_or(authority.as_str(), |(_, host)| host);
         let base = format!("{scheme}://{authority}");
         let io = HostIo::new(now_ns);
         let conn_err = Arc::new(Mutex::new(None));
