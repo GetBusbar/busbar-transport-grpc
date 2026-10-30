@@ -586,6 +586,29 @@ impl Host {
         self.drain(slot::FINISH, 0)
     }
 
+    /// `finish` with a final tail stated by hand: `bytes`, and the `message` and `details` spans
+    /// into them, whatever they say. Its outcome and its text.
+    pub fn finish_spans(
+        &mut self,
+        status: u32,
+        bytes: &[u8],
+        message: Span,
+        details: Span,
+    ) -> (Outcome, String) {
+        let mut i: FinishIn = z();
+        i.framing = self.framing;
+        i.final_status = status;
+        i.final_message = message;
+        i.final_details = details;
+        i.final_bytes = bytes.as_ptr();
+        i.final_bytes_len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH);
+        self.take(r, &o);
+        (r, text(o.head.error))
+    }
+
     /// `begin` on `side`, over `sock`, with `agreed` the protocol connection security agreed.
     pub fn begin(&mut self, side: u32, target: &str, agreed: &str, sock: Option<Arc<Socket>>) {
         assert_eq!(
