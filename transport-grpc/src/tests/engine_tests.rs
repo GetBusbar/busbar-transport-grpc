@@ -1253,3 +1253,30 @@ fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
         "the attempt's own deadline still holds the call"
     );
 }
+
+/// A DIALLED STREAM FAILED AFTER ITS ANSWER'S HEAD IS RESET ON THE WIRE. A bidi call whose request
+/// is still open (no content-length, the frame not ended) has its answer's head in, and then its
+/// deadline passes: the host hears `DEADLINE_EXCEEDED`, and the far end hears the call reset, so it
+/// stops working on it and its stream slot is freed. RED: the request body stayed open forever and
+/// no RST_STREAM went out.
+#[test]
+fn a_dialled_stream_failed_after_its_answers_head_is_reset_on_the_wire() {
+    let mut p = Pair::new();
+    let t0 = p.now;
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Chat")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"first"));
+    p.d.emit(1, &c, false, t0 + 2 * SEC, t0).expect("emit");
+    p.settle();
+    p.a.emit(1, b"\r\n", false, 0, p.now).expect("answer head");
+    p.settle();
+    head(&p.got_d, 1);
+    assert!(terminal(&p.got_a, 1).is_none(), "the call is open");
+    p.at(t0 + 2 * SEC);
+    assert_eq!(
+        terminal(&p.got_d, 1).and_then(|t| t.status),
+        Some(msg::DEADLINE_EXCEEDED)
+    );
+    let a = terminal(&p.got_a, 1).expect("the far end hears the call reset");
+    assert!(a.failed, "{a:?}");
+    assert_eq!(a.status, Some(msg::CANCELLED));
+}
