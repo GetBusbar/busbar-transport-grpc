@@ -1280,3 +1280,16 @@ fn a_dialled_stream_failed_after_its_answers_head_is_reset_on_the_wire() {
     assert!(a.failed, "{a:?}");
     assert_eq!(a.status, Some(msg::CANCELLED));
 }
+
+/// A GRACEFUL GOAWAY THAT LEAVES THE STREAM UNPROCESSED IS `UNAVAILABLE`: a far end draining
+/// (`NO_ERROR`, last stream 0) never processed the open call, which is safe to retry
+/// (PROTOCOL-HTTP2.md, "GOAWAY Frame": a stream past the last one accepted is `UNAVAILABLE`). RED:
+/// INTERNAL, read as a reset's `NO_ERROR`.
+#[test]
+fn a_graceful_goaway_refusing_an_unprocessed_stream_is_unavailable() {
+    let mut payload = 0u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    let t = far_end_sends(open_call(false, b""), &h2(7, 0, 0, &payload));
+    assert_eq!(t.status, Some(msg::UNAVAILABLE));
+    assert_eq!(t.bytes.as_ref(), b"the connection went away: NO_ERROR");
+}
