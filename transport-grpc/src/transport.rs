@@ -594,16 +594,15 @@ impl Conn {
         if s.reply_over {
             return Ok(());
         }
-        let block = msg::terminate_block(trailers);
-        match msg::read_head(&block, usize::MAX) {
-            // A trailer the wire cannot carry fails the refusal, and the call stays open for the
-            // host's fallback close.
-            Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => s.finish(&h).map_err(Failure)?,
-            _ if status != 0 => s.fail_reply(
+        // A block that names `grpc-status` and cannot be read, or a trailer the wire cannot carry,
+        // fails the refusal, and the call stays open for the host's fallback close.
+        match msg::refusal_block(trailers).map_err(Failure)? {
+            Some(h) => s.finish(&h).map_err(Failure)?,
+            None if status != 0 => s.fail_reply(
                 msg::status_of_refusal(status),
                 msg::refusal_message(status).as_bytes(),
             ),
-            _ => s.fail_reply(msg::UNKNOWN, trailers),
+            None => s.fail_reply(msg::UNKNOWN, trailers),
         }
         Ok(())
     }

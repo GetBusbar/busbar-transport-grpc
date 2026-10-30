@@ -198,14 +198,13 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        let block = msg::terminate_block(bytes);
         let lines = if let Some(e) = &self.oversize {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else if let Some(why) = &self.cut {
             cut_lines(why)?
         } else {
-            match msg::read_head(&block, usize::MAX) {
-                Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => {
+            match msg::refusal_block(bytes).map_err(Failure)? {
+                Some(h) => {
                     let pairs: Vec<(&str, &[u8])> = h
                         .fields
                         .iter()
@@ -216,7 +215,7 @@ impl StreamCall {
                     lines.truncate(lines.len() - 2);
                     lines
                 }
-                _ if status != 0 => msg::status_lines(
+                None if status != 0 => msg::status_lines(
                     u32::from(msg::status_of_refusal(status)),
                     msg::refusal_message(status).as_bytes(),
                     &[],
@@ -224,7 +223,7 @@ impl StreamCall {
                 .map_err(|e| Failure(e.into()))?,
                 // No status stated either way: `UNKNOWN`, the refusal's bytes its message, as the
                 // connection side ends the same refusal.
-                _ => msg::status_lines(u32::from(msg::UNKNOWN), bytes, &[])
+                None => msg::status_lines(u32::from(msg::UNKNOWN), bytes, &[])
                     .map_err(|e| Failure(e.into()))?,
             }
         };

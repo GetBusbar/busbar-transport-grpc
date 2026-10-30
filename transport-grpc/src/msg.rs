@@ -446,6 +446,38 @@ pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
     block
 }
 
+/// A refusal's bytes read as a trailer block: the block, where it states a `grpc-status`; `None`
+/// where it states none, or where the bytes are words and no block at all (both close with the
+/// refusal's neutral status). Words that merely mention `grpc-status` (a failure's text relayed as
+/// the refusal, say) are words.
+///
+/// # Errors
+///
+/// A line of the bytes is a `grpc-status:` field but the bytes are no field block: the host meant
+/// a status it did not write whole, which is said, never silently replaced by the neutral status's
+/// mapping.
+pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
+    match read_head(&terminate_block(bytes), usize::MAX) {
+        Ok(Some((h, _))) => Ok(h.get(GRPC_STATUS).is_some().then_some(h)),
+        Ok(None) => Ok(None),
+        Err(why) => {
+            let status_line = |line: &[u8]| {
+                let line = line.trim_ascii_start();
+                line.len() > GRPC_STATUS.len()
+                    && line[..GRPC_STATUS.len()].eq_ignore_ascii_case(GRPC_STATUS.as_bytes())
+                    && line[GRPC_STATUS.len()..].trim_ascii_start().starts_with(b":")
+            };
+            if bytes.split(|b| *b == b'\n').any(status_line) {
+                Err(format!(
+                    "the trailer block names grpc-status but is not a field block: {why}"
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// A stream's closing status lines in tonic 0.14's bytes and order (`Status::add_header`):
 /// `grpc-status`, then `grpc-message` where there is a message, then `grpc-status-details-bin`
 /// where there are details, the value the plane wrote, verbatim. A refusal's words and its neutral
