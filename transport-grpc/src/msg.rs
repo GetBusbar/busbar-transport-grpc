@@ -49,7 +49,7 @@ pub fn prefix(len: usize) -> [u8; PREFIX] {
 }
 
 /// `payload` in its length-prefixed form.
-#[must_use]
+#[cfg(test)]
 pub fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREFIX + payload.len());
     out.extend_from_slice(&prefix(payload.len()));

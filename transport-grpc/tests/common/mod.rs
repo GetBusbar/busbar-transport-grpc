@@ -28,7 +28,7 @@ use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, ValidateIn};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{
     check_framer, check_framer_fields, check_head_slots, check_locate,
@@ -72,8 +72,6 @@ pub fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
-// ── the door, linked and dropped in ──────────────────────────────────────────────────────────────
-
 pub fn linked() -> &'static Ops {
     // SAFETY: `door()` answers the `'static` door of this crate.
     #[allow(unused_unsafe)]
@@ -84,8 +82,8 @@ pub fn linked() -> &'static Ops {
 
 /// THE IMAGE WHERE `cargo test` DID NOT BUILD IT: the coverage job. `cargo test` builds every
 /// example, this cdylib among them, beside the test binaries. The fleet's coverage job runs
-/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built, and every test that loads
-/// the dropped-in door used to fail there. So the image is built here, once per test binary, with
+/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built. So the image is built
+/// here, once per test binary, with
 /// the same cargo, manifest and profile, under this run's environment: under `cargo llvm-cov` that
 /// environment carries its instrumentation flags, so the dropped-in door is built under llvm-cov
 /// and its lines are measured like the linked door's. It goes to its own target directory beside
@@ -162,8 +160,6 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     (unsafe { &*(*d).ops().cast::<Ops>() }, lib)
 }
 
-// ── the socket ───────────────────────────────────────────────────────────────────────────────────
-
 /// The socket the host holds: what the far end wrote and the host has not ingested (and whether
 /// it has ended), and the way to the far end.
 pub struct Socket {
@@ -204,8 +200,6 @@ where
     });
     sock
 }
-
-// ── the host ─────────────────────────────────────────────────────────────────────────────────────
 
 /// One frame piece as the host read it out of its sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +271,33 @@ pub struct Host {
     pub words: Vec<(u64, String, String, String)>,
     // Kept alive while the framer may read it.
     facts_text: String,
+}
+
+/// An `AbiStr` the door wrote, as text.
+pub fn text(t: AbiStr) -> String {
+    if t.len == 0 {
+        return String::new();
+    }
+    // SAFETY: the door's string, live for the call.
+    String::from_utf8(unsafe { t.bytes() }.to_vec()).expect("UTF-8")
+}
+
+/// `validate` of `ops` over `json`: its outcome and the text it wrote into the lent reason buffer.
+pub fn validate(ops: &'static Ops, json: &'static str) -> (Outcome, String) {
+    let mut reason = [0_u8; 256];
+    let mut i: ValidateIn = z();
+    i.settings = Blob::json(json.as_bytes());
+    i.err_buf = reason.as_mut_ptr();
+    i.err_cap = reason.len();
+    let mut o: OutHead = z();
+    let r = call(
+        ops.head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    (r, text(o.error))
 }
 
 pub fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u32) -> Outcome {
@@ -745,13 +766,21 @@ impl Host {
         self.deadline
     }
 
+    /// Op `index` of this instance over all-zero `in` and `out`: its outcome and its text.
+    pub fn bare<I, O>(&self, op: Option<Op>, index: u32) -> (Outcome, String) {
+        let mut i: I = z();
+        let mut o: O = z();
+        let r = call(op, self.inst, &mut i, &mut o, index);
+        // SAFETY: every `out` leads with an `OutHead`.
+        let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+        (r, text(head.error))
+    }
+
     pub fn close(self) {
         let mut i: InHead = z();
         let mut o: OutHead = z();
         call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
     }
-
-    // ── reading what arrived ─────────────────────────────────────────────────────────────────────
 
     /// Stream `stream`'s whole frames (pieces joined up to each end-of-frame) up to its status:
     /// the head, the messages and (on an accepted stream) the far end's empty last.
@@ -802,8 +831,6 @@ pub fn lpm(payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
-
-// ── the tonic peer ───────────────────────────────────────────────────────────────────────────────
 
 /// A byte-blind codec: messages are bytes both ways.
 #[derive(Debug, Clone, Default)]
