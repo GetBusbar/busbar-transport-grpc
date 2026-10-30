@@ -1478,3 +1478,27 @@ fn a_targets_userinfo_never_reaches_the_authority() {
     let words = head(&p.got_a, 1).head.clone().expect("head words");
     assert_eq!(words.authority.as_ref(), b"peer.test:50051");
 }
+
+/// A CALL THE HOST ENDED READS NO MORE OF ITS REQUEST. The client is still uploading (no
+/// END_STREAM) when the host refuses the call: the trailers go out, the upload is stopped
+/// (RST_STREAM `NO_ERROR`, RFC 9113 §8.1), the call is let go of, and a message the client sends
+/// after it is never handed up. RED: the request body was still read, each later message queued as
+/// a piece for a call the host had finished, and the call held until the client's body ended.
+#[test]
+fn a_call_the_host_ended_reads_no_more_of_its_request() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening(Some("trailers"));
+    wire.extend(h2(0, 0, 1, &msg::frame(b"one")));
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    drop(a.pieces().drain(..));
+    a.end_call(1, b"grpc-status: 7\r\n", 0).expect("refuse");
+    a.drive(5 * SEC);
+    let sent = a.take_wire(usize::MAX);
+    assert_eq!(resets(&sent), vec![(1, 0)], "the upload is stopped");
+    a.ingest(&h2(0, 0, 1, &msg::frame(b"two")), false);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert!(got.is_empty(), "nothing more for an ended call: {got:?}");
+    assert_eq!(held(&a), 0, "the call is let go of");
+}
