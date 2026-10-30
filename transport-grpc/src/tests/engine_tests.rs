@@ -1533,6 +1533,14 @@ fn stream_into_a_host_not_reading(p: &mut Pair, dial_sends: bool, turns: usize) 
         s.pieces().clear();
         most = most.max(held_for_host(r));
     }
+    // The host takes what it was handed: it is owed a re-call (`YIELD_MORE`), and the re-call reads
+    // on with no new byte from the far end, so a far end held back by flow control never waits on
+    // a host that has nothing left to take.
+    let r = if dial_sends { &mut p.a } else { &mut p.d };
+    r.pieces().clear();
+    assert!(r.wire_pending(), "the host is owed a re-call");
+    r.drive(p.now);
+    assert!(!r.pieces().is_empty(), "the re-call reads on");
     most
 }
 
