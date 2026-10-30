@@ -1502,3 +1502,67 @@ fn a_call_the_host_ended_reads_no_more_of_its_request() {
     assert!(got.is_empty(), "nothing more for an ended call: {got:?}");
     assert_eq!(held(&a), 0, "the call is let go of");
 }
+
+/// The message bytes a connection holds for the host, handed up and not yet taken.
+fn held_for_host(c: &Conn) -> usize {
+    c.out.iter().map(|p| p.bytes.len()).sum()
+}
+
+/// Run `turns` rounds of a pair whose `sender` streams 60 kB messages on stream 1 as fast as its own
+/// backpressure lets it, while the `reader`'s host takes NOTHING it is handed; the most bytes the
+/// reader held for its host.
+fn stream_into_a_host_not_reading(p: &mut Pair, dial_sends: bool, turns: usize) -> usize {
+    let m = msg::frame(&[7u8; 60_000]);
+    let mut most = 0;
+    for _ in 0..turns {
+        let (s, r) = if dial_sends {
+            (&mut p.d, &mut p.a)
+        } else {
+            (&mut p.a, &mut p.d)
+        };
+        if !s.announce_full(1) {
+            let _ = s.emit(1, &m, false, 0, p.now);
+        }
+        s.drive(p.now);
+        r.drive(p.now);
+        let to_r = s.take_wire(usize::MAX);
+        let to_s = r.take_wire(usize::MAX);
+        r.ingest(&to_r, false);
+        s.ingest(&to_s, false);
+        // The sender's own host takes what it is handed (a writable piece, say).
+        s.pieces().clear();
+        most = most.max(held_for_host(r));
+    }
+    most
+}
+
+/// AN ACCEPTED CALL'S MESSAGES ARE BOUNDED BY THE HOST'S TAKING THEM: a client uploads faster than
+/// the host takes the pieces it is handed, and the connection stops reading the call's body once it
+/// holds its mark for the host, so HTTP/2 flow control holds the client back. RED: every message
+/// was read and queued, and the window credit returned, whatever the host had taken.
+#[test]
+fn an_accepted_upload_the_host_does_not_take_is_bounded() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Upload")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"first"));
+    p.d.emit(1, &c, false, 0, p.now).expect("open the call");
+    let most = stream_into_a_host_not_reading(&mut p, true, 400);
+    assert!(
+        most <= 3 << 20,
+        "the accepted side held {most} bytes for a host not taking them"
+    );
+    assert!(most >= 1 << 20, "it held up to its mark: {most}");
+}
+
+/// The same bound on a dialled call's answer: a server streaming faster than the host takes the
+/// pieces is held back once the connection holds its mark for the host. RED: unbounded.
+#[test]
+fn a_dialled_answer_the_host_does_not_take_is_bounded() {
+    let mut p = open_call(true, b"");
+    let most = stream_into_a_host_not_reading(&mut p, false, 400);
+    assert!(
+        most <= 3 << 20,
+        "the dialled side held {most} bytes for a host not taking them"
+    );
+    assert!(most >= 1 << 20, "it held up to its mark: {most}");
+}
