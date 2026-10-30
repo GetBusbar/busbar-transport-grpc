@@ -264,3 +264,21 @@ fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
          grpc-message: upstream%20gone\r\n"
     );
 }
+
+/// The same on one stream: a refusal whose block names `grpc-status` but is no field block fails in
+/// words, writes nothing, and leaves the call for the fallback close. RED: `busbar answered HTTP
+/// 500`.
+#[test]
+fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
+    let mut c = grpc();
+    let why = c
+        .refuse(b"grpc-status: 5\r\nbroken line\r\n", 500, false)
+        .expect_err("refused in words");
+    assert_eq!(
+        why.0,
+        "the trailer block names grpc-status but is not a field block: a head line is not a field"
+    );
+    assert_eq!(wire(&mut c), "", "nothing written");
+    c.refuse(b"", 500, false).expect("the fallback closes it");
+    assert!(wire(&mut c).contains("grpc-status: 2\r\n"));
+}
