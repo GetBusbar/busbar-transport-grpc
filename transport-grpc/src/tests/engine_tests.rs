@@ -1574,3 +1574,28 @@ fn a_dialled_answer_the_host_does_not_take_is_bounded() {
     );
     assert!(most >= 1 << 20, "it held up to its mark: {most}");
 }
+
+/// A TRAILER BLOCK'S FORBIDDEN FIELDS ARE FILTERED AS A HEAD'S ARE: connection-specific fields
+/// (RFC 9113 §8.2.2) and the answer's own `content-type` never go out in the trailers, and the
+/// call ends with the block's `grpc-status`. RED: they went to HTTP/2 as given, which refused the
+/// trailers, and the call was reset instead of ending OK.
+#[test]
+fn a_trailer_blocks_forbidden_fields_are_filtered_as_a_heads_are() {
+    let mut p = Pair::new();
+    p.d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    p.a.emit(1, b"\r\n", false, 0, p.now).expect("head");
+    p.a.end_call(
+        1,
+        b"connection: close\r\ntransfer-encoding: chunked\r\ncontent-type: text/plain\r\n\
+          grpc-status: 0\r\nx-kept: yes\r\n",
+        0,
+    )
+    .expect("end");
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the trailers");
+    assert_eq!((t.status, t.fields, t.failed), (Some(0), true, false), "{t:?}");
+    assert_eq!(field(&t.bytes, "x-kept").as_deref(), Some(&b"yes"[..]));
+    assert_eq!(field(&t.bytes, "content-type"), None);
+}
