@@ -285,3 +285,22 @@ fn a_refusals_neutral_status_maps_as_predevs_grpc_line_answered_it() {
     }
     assert_eq!(refusal_message(401), "busbar answered HTTP 401");
 }
+
+/// A MESSAGE STREAM THAT FAILED HOLDS NOTHING MORE: once a message is over the ceiling (or
+/// compressed), every later push answers the same failure and buffers none of its bytes, through
+/// either way in. RED: each push was appended to the buffer before the check, so the ceiling bounded
+/// nothing after the first failure.
+#[test]
+fn a_failed_message_stream_holds_nothing_more() {
+    let mut over = vec![0u8];
+    over.extend_from_slice(&100u32.to_be_bytes());
+    for first in [over, vec![1, 0, 0, 0, 1, b'z']] {
+        let mut m = Messages::new(4);
+        let bad = m.push(&first).expect_err("refused");
+        for _ in 0..10 {
+            assert_eq!(m.push(&[0u8; 1000]), Err(bad.clone()));
+            assert_eq!(m.push_bytes(Bytes::from(vec![0u8; 1000])), Err(bad.clone()));
+        }
+        assert_eq!(m.buf.len(), 0, "nothing held after {bad:?}");
+    }
+}
