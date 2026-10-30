@@ -143,6 +143,15 @@ fn script(p: &Plugin<Transport>) -> Script {
     seen
 }
 
+/// Two doors' scripts must be the same lines: `Err` names the first that differs.
+fn same_script(a: &Script, b: &Script) -> Result<(), String> {
+    match a.iter().zip(b).position(|(x, y)| x != y) {
+        None if a.len() == b.len() => Ok(()),
+        None => Err(format!("{} lines vs {}", a.len(), b.len())),
+        Some(i) => Err(format!("line {i}: {:?} vs {:?}", a[i], b[i])),
+    }
+}
+
 #[test]
 fn the_linked_and_the_dropped_in_door_are_one_framer() {
     let d = Dispatcher::new(DispatchConfig::default());
@@ -156,17 +165,23 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
 
     let a = script(&linked);
     let b = script(&dropped);
-    assert_eq!(a, b, "both doors answer alike");
+    assert_eq!(same_script(&a, &b), Ok(()), "both doors answer alike");
     assert_eq!(
         a.last().map(String::as_str),
         Some("begin Ready"),
         "both doors begin the dial"
     );
 
-    // RED: a dropped-in image that answered one line differently is caught.
+    // RED: the comparison the proof above rests on catches a dropped-in image that answered one
+    // line differently, or one line short.
     let mut off = b.clone();
     off[1].push('!');
-    assert_ne!(a, off, "a differing line is caught");
+    assert!(
+        same_script(&a, &off).is_err_and(|e| e.starts_with("line 1:")),
+        "a differing line is caught"
+    );
+    let short: Script = b[..b.len() - 1].to_vec();
+    assert!(same_script(&a, &short).is_err(), "a missing line is caught");
 }
 
 #[test]
