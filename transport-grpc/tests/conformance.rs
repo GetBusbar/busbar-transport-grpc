@@ -681,3 +681,40 @@ fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
         host.close();
     }
 }
+
+/// A FINAL TAIL WHOSE SPAN LIES OUTSIDE ITS BYTES IS REFUSED IN WORDS, never read as no message:
+/// `finish` fails naming the span, writes nothing, and leaves the call for the host's fallback
+/// refusal to close. RED: the close went out as `grpc-status: 5` alone, its message silently lost.
+#[test]
+fn a_final_tail_whose_span_lies_outside_its_bytes_is_refused_in_words() {
+    use busbar_contract::abi::mechanism::call::Span;
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        let at = host.wire_log.len();
+        let past = Span { offset: 2, len: 10 };
+        let none = Span { offset: 0, len: 0 };
+        assert_eq!(
+            host.finish_spans(5, b"gone", past, none),
+            (
+                Outcome::Failed,
+                "finish: the final message lies outside the close's bytes".to_owned()
+            )
+        );
+        assert_eq!(host.wire_log.len(), at, "nothing written");
+        assert_eq!(
+            host.finish_spans(5, b"gone", none, past),
+            (
+                Outcome::Failed,
+                "finish: the final details lie outside the close's bytes".to_owned()
+            )
+        );
+        assert_eq!(host.refuse_as(1, b"", 500), Outcome::Ready);
+        assert!(
+            String::from_utf8_lossy(&host.wire_log[at..]).contains("grpc-status: 2\r\n"),
+            "the fallback refusal closes the call"
+        );
+        host.close();
+    }
+}
