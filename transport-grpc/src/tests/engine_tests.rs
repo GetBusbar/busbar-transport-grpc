@@ -1451,3 +1451,17 @@ fn a_far_ends_grpc_message_reaches_the_host_as_printable_bounded_text() {
     let end = failed_with_message(&long);
     assert_eq!(end.bytes.len(), msg::MESSAGE_TEXT_MAX, "bounded");
 }
+
+/// A TARGET'S USERINFO NEVER GOES ON THE WIRE: a target stating `user:secret@` dials its host and
+/// port alone, so `:authority` carries no credential (RFC 9113 §8.3.1) and is the authority
+/// `locate` stated. RED: `:authority` was `user:secret@peer.test:50051`.
+#[test]
+fn a_targets_userinfo_never_reaches_the_authority() {
+    let mut p = Pair::new();
+    p.d = Conn::dial("http://user:secret@peer.test:50051", posture(), p.now).expect("dial");
+    p.d.emit(1, &call("/pkg.Svc/Say", &[], &[b"q"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    let words = head(&p.got_a, 1).head.clone().expect("head words");
+    assert_eq!(words.authority.as_ref(), b"peer.test:50051");
+}
