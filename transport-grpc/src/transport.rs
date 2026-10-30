@@ -117,7 +117,21 @@ pub(crate) const STREAM_LOW_WATER: usize = 256 * 1024;
 
 /// Why a stream whose host emitted past its bound (the high-water mark and one whole message
 /// more) failed: the framer bounds what it holds for a far end that is not reading.
-const OVER_BOUND: &str = "the stream's queue is past its bound: the far end is not reading";
+pub(crate) const OVER_BOUND: &str =
+    "the stream's queue is past its bound: the far end is not reading";
+
+/// The room a head block may take beside one whole message: an answer's head block is read up to
+/// `max_message_bytes` and this much, and a stream's bound counts it as part of the one message
+/// more it holds past the high-water mark.
+pub(crate) const HEAD_ALLOWANCE: usize = 64 * 1024;
+
+/// A STREAM'S BOUND: the payload bytes it may queue for the far end before a host that keeps
+/// emitting has it failed — the high-water mark, and one whole message (with its head block) more.
+pub(crate) fn stream_bound(max_message_bytes: usize) -> usize {
+    STREAM_HIGH_WATER
+        .saturating_add(max_message_bytes)
+        .saturating_add(HEAD_ALLOWANCE)
+}
 
 /// The feeding end of a [`ChanBody`].
 #[derive(Clone, Default)]
@@ -409,10 +423,10 @@ impl Conn {
     ) -> Result<(), Failure> {
         // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
         // the bytes: every step below is idempotent on it.
-        let max = self.posture.max_message_bytes.saturating_add(64 * 1024);
+        let max = self.posture.max_message_bytes.saturating_add(HEAD_ALLOWANCE);
         // A host that keeps emitting past the high-water mark (one whole message more) has the
         // stream failed: the framer bounds what it holds for a far end that is not reading.
-        let bound = STREAM_HIGH_WATER.saturating_add(max);
+        let bound = stream_bound(self.posture.max_message_bytes);
         match &mut self.side {
             Side::Dial(d) => {
                 if d.ended.contains(stream) {
