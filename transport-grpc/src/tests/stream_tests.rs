@@ -250,3 +250,17 @@ fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
         .unwrap();
     assert_eq!(wire(&mut c), "grpc-status: 7\r\ngrpc-message: no\r\n");
 }
+
+/// A REFUSAL STATING NO STATUS EITHER WAY IS `UNKNOWN` WITH ITS OWN WORDS, as the connection side
+/// ends the same refusal: no `grpc-status` in its bytes and no neutral status (`0`, none stated).
+/// RED: `busbar answered HTTP 0`, a status nobody stated and the refusal's words lost.
+#[test]
+fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
+    let mut c = grpc();
+    c.refuse(b"upstream gone", 0, false).unwrap();
+    assert_eq!(
+        wire(&mut c),
+        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 2\r\n\
+         grpc-message: upstream%20gone\r\n"
+    );
+}
