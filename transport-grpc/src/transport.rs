@@ -214,7 +214,7 @@ impl Body for ChanBody {
         let mut s = self.0 .0.lock().expect("chan");
         if s.reset {
             // The connection resets the stream on a body's error.
-            return Poll::Ready(Some(Err(std::io::Error::other(OVER_BOUND))));
+            return Poll::Ready(Some(Err(std::io::Error::other("the stream was failed"))));
         }
         if let Some(f) = s.frames.pop_front() {
             if let Some(d) = f.data_ref() {
@@ -432,6 +432,8 @@ impl Conn {
                 };
                 let s = &mut d.calls[idx].1;
                 if let Err(why) = s.take(&d.base, bytes, end, max) {
+                    // Reset, never ended: the far end must not take a cut request for a whole one.
+                    s.chan.reset();
                     s.stage = DStage::Done;
                     self.out.push_back(Piece {
                         status: Some(msg::INTERNAL),
@@ -786,6 +788,11 @@ impl Dial {
                 if conn {
                     return Err(Failure(why));
                 }
+                // A STREAM FAILED IS RESET ON THE WIRE, before its answer's head or after it: the
+                // request body is failed, so the connection resets the stream (RST_STREAM) rather
+                // than leave the far end's call open. Dropping the answer alone resets nothing
+                // while the request's body is still being piped.
+                s.chan.reset();
                 s.stage = DStage::Done;
                 out.push_back(Piece {
                     status: Some(code),
@@ -811,7 +818,7 @@ fn advance(
     cx: &mut Context<'_>,
 ) -> Result<(), (String, u16, bool)> {
     if !s.over() && s.sleep.as_mut().poll(cx).is_ready() {
-        // Dropping the exchange resets the stream on the wire.
+        // The caller resets the stream on the wire ([`Dial::step`]).
         return Err(("deadline exceeded".into(), msg::DEADLINE_EXCEEDED, false));
     }
     loop {
