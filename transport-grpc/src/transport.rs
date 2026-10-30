@@ -471,8 +471,8 @@ impl Conn {
                             return Ok(());
                         }
                         Ok(Some((head, took))) => {
-                            let rest = s.head_buf.split_off(took);
-                            s.head_buf.clear();
+                            let mut rest = std::mem::take(&mut s.head_buf);
+                            rest.drain(..took);
                             s.send_head(&head, None);
                             if !rest.is_empty() {
                                 s.reply.chan.push(Frame::data(Bytes::from(rest)));
@@ -694,7 +694,8 @@ impl DialStream {
                     }
                     return Ok(());
                 };
-                let rest = buf.split_off(took);
+                let mut rest = std::mem::take(buf);
+                rest.drain(..took);
                 let req = self.request(base, &head)?;
                 self.left = head.content_length;
                 self.stage = DStage::Queued(req);

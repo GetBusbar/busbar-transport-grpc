@@ -40,7 +40,7 @@ pub const STREAM: u64 = 1;
 pub struct StreamCall {
     messages: Messages,
     writing: Vec<u8>,
-    wire: VecDeque<u8>,
+    wire: Vec<u8>,
     out: VecDeque<Piece>,
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
@@ -82,7 +82,7 @@ impl StreamCall {
         Ok(Self {
             messages: Messages::new(max),
             writing: Vec::new(),
-            wire: VecDeque::new(),
+            wire: Vec::new(),
             out: VecDeque::new(),
             answered: false,
             closed: false,
@@ -120,12 +120,15 @@ impl StreamCall {
         if self.closed {
             return;
         }
-        self.writing.extend_from_slice(bytes);
-        if ends {
-            self.wire
-                .extend(msg::frame(&std::mem::take(&mut self.writing)));
-            self.answered = true;
+        if !ends {
+            self.writing.extend_from_slice(bytes);
+            return;
         }
+        self.wire
+            .extend_from_slice(&msg::prefix(self.writing.len() + bytes.len()));
+        self.wire.append(&mut self.writing);
+        self.wire.extend_from_slice(bytes);
+        self.answered = true;
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
@@ -196,8 +199,11 @@ impl StreamCall {
 
 impl Owed for StreamCall {
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
-        let n = cap.min(self.wire.len());
-        self.wire.drain(..n).collect()
+        if cap >= self.wire.len() {
+            return std::mem::take(&mut self.wire);
+        }
+        let rest = self.wire.split_off(cap);
+        std::mem::replace(&mut self.wire, rest)
     }
     fn wire_pending(&self) -> bool {
         !self.wire.is_empty()

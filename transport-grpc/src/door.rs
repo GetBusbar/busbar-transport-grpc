@@ -39,6 +39,7 @@ use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::transport::settings_reading;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -89,14 +90,16 @@ pub struct Instance {
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
 /// says. An absent blob reads as `{}`.
-fn read_settings(bytes: &[u8]) -> Result<Posture, &'static str> {
-    let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
-    let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
+fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
+    let v = settings_reading(
+        bytes,
+        &[setting::REQUEST_TIMEOUT_SECS, setting::BODY_MAX_BYTES],
+    )?;
     let count = |k: &'static str, d: u64| match v.get(k) {
         None => Ok(d),
         Some(x) => x
             .as_u64()
-            .ok_or("settings: a value is not of its declared kind"),
+            .ok_or_else(|| Refusal::failed("settings: a value is not of its declared kind")),
     };
     let secs = count(setting::REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
     let max = count(
@@ -139,29 +142,17 @@ macro_rules! slot {
     };
 }
 
-macro_rules! answer {
-    ($name:ident, $in:ty, $out:ty, $outcome:expr) => {
-        slot!(
-            #[doc = concat!("`", stringify!($name), "`.")]
-            $name,
-            $in,
-            $out,
-            |_, _, _out| { $outcome }
-        );
-    };
-}
-
 impl Life for Instance {
     /// No framer op pends, so nothing is ever in flight to cancel.
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
     fn validate(settings: &[u8]) -> Result<(), Refusal> {
-        read_settings(settings).map(|_| ()).map_err(Refusal::failed)
+        read_settings(settings).map(|_| ())
     }
 
     fn open(settings: &[u8], _: &[&[u8]], _: u64) -> Result<Self, Refusal> {
         Ok(Self {
-            posture: read_settings(settings).map_err(Refusal::failed)?,
+            posture: read_settings(settings)?,
             framings: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
@@ -173,18 +164,19 @@ impl Life for Instance {
     }
 }
 
-// A framer is not a carrier: every carrier op is refused. Nothing detaches from, or adopts onto, a
-// gRPC connection.
-answer!(Listen, ListenIn, ListenOut, Outcome::Refused);
-answer!(Accept, AcceptIn, AcceptOut, Outcome::Refused);
-answer!(Dial, DialIn, ConnOut, Outcome::Refused);
-answer!(Read, ReadIn, IoOut, Outcome::Refused);
-answer!(Write, WriteIn, IoOut, Outcome::Refused);
-answer!(Flush, ConnIn, OutHead, Outcome::Refused);
-answer!(Shut, ShutIn, OutHead, Outcome::Refused);
-answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
-answer!(Detach, FramingIn, FramerOut, Outcome::Refused);
-answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
+busbar_contract::not_served! {
+    state: State, role: "grpc framer";
+    Listen(ListenIn => ListenOut) "listen";
+    Accept(AcceptIn => AcceptOut) "accept";
+    Dial(DialIn => ConnOut) "dial";
+    Read(ReadIn => IoOut) "read";
+    Write(WriteIn => IoOut) "write";
+    Flush(ConnIn => OutHead) "flush";
+    Shut(ShutIn => OutHead) "shut";
+    Arrival(ArrivalIn => ArrivalOut) "arrival";
+    Detach(FramingIn => FramerOut) "detach";
+    Adopt(AdoptIn => FramerOut) "adopt";
+}
 
 slot!(
     /// `locate`: where a dialled target is and the offer its handshake makes, with the framer's
