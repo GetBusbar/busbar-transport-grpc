@@ -116,6 +116,20 @@ pub(crate) const STREAM_HIGH_WATER: usize = 1 << 20;
 /// (`PIECE_WRITABLE`).
 pub(crate) const STREAM_LOW_WATER: usize = 256 * 1024;
 
+/// THE HOST'S OWN BACKPRESSURE, the other way: what a connection holds for the host (pieces handed
+/// up and not yet taken), past which it reads no stream's body until the host takes them. A body
+/// left unread returns no flow-control credit, so HTTP/2 holds the far end back. Each piece counts
+/// [`PIECE_COST`] beside its bytes, so a flood of tiny messages is bounded too.
+const INBOUND_HIGH_WATER: usize = STREAM_HIGH_WATER;
+
+/// What one piece held for the host counts beside its bytes ([`INBOUND_HIGH_WATER`]).
+const PIECE_COST: usize = 64;
+
+/// What `out` holds for the host, as [`INBOUND_HIGH_WATER`] counts it.
+fn held_for_host(out: &VecDeque<Piece>) -> usize {
+    out.iter().map(|p| p.bytes.len() + PIECE_COST).sum()
+}
+
 /// Why a stream whose host emitted past its bound (the high-water mark and one whole message
 /// more) failed: the framer bounds what it holds for a far end that is not reading.
 pub(crate) const OVER_BOUND: &str =
@@ -267,6 +281,9 @@ pub struct Conn {
     failed: Option<Failure>,
     posture: Posture,
     side: Side,
+    /// The last drive left a body unread because the host had not taken what it was handed
+    /// ([`INBOUND_HIGH_WATER`]): the host is owed a re-call once it has.
+    held_back: bool,
 }
 
 enum Side {
@@ -278,8 +295,10 @@ impl Owed for Conn {
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
         self.io.take_wire(cap)
     }
+    /// Wire bytes still owed, or a body the last drive left unread for the host's sake: either way
+    /// the host calls again (`YIELD_MORE`), and the re-call reads on once it has taken its pieces.
     fn wire_pending(&self) -> bool {
-        self.io.wire_pending()
+        self.io.wire_pending() || self.held_back
     }
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
         &mut self.out
@@ -354,6 +373,7 @@ impl Conn {
             conn_done,
             failed: None,
             posture,
+            held_back: false,
             side: Side::Dial(Dial {
                 handshake: Some(handshake),
                 sender: None,
@@ -396,6 +416,7 @@ impl Conn {
             conn_done,
             failed: None,
             posture,
+            held_back: false,
             side: Side::Accept(Accept {
                 arrivals,
                 calls: Vec::new(),
@@ -580,12 +601,18 @@ impl Conn {
         }
         let io = self.io.clone();
         let max = self.posture.max_message_bytes;
-        let r = io.rounds(|cx| match &mut self.side {
-            Side::Dial(d) => d.step(&mut self.out, max, cx),
-            Side::Accept(a) => {
-                a.step(&mut self.out, max, cx);
-                Ok(())
-            }
+        let held_back = &mut self.held_back;
+        let r = io.rounds(|cx| {
+            let mut room = Room::of(&self.out);
+            let r = match &mut self.side {
+                Side::Dial(d) => d.step(&mut self.out, &mut room, max, cx),
+                Side::Accept(a) => {
+                    a.step(&mut self.out, &mut room, max, cx);
+                    Ok(())
+                }
+            };
+            *held_back = room.held_back;
+            r
         });
         if let Err(f) = r {
             self.failed = Some(f);
@@ -607,6 +634,34 @@ impl Conn {
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
         self.failed.as_ref()
+    }
+}
+
+/// What one drive round may still hand the host before it reads no more ([`INBOUND_HIGH_WATER`]).
+struct Room {
+    held: usize,
+    /// A body was left unread for the host's sake.
+    held_back: bool,
+}
+
+impl Room {
+    fn of(out: &VecDeque<Piece>) -> Self {
+        Self {
+            held: held_for_host(out),
+            held_back: false,
+        }
+    }
+
+    /// Whether a body may be read now; if not, it is left unread and the host is owed a re-call.
+    fn open(&mut self) -> bool {
+        let open = self.held < INBOUND_HIGH_WATER;
+        self.held_back |= !open;
+        open
+    }
+
+    /// `got` was handed up.
+    fn took(&mut self, got: &[Bytes]) {
+        self.held += got.iter().map(|m| m.len() + PIECE_COST).sum::<usize>();
     }
 }
 
@@ -804,6 +859,7 @@ impl Dial {
     fn step(
         &mut self,
         out: &mut VecDeque<Piece>,
+        room: &mut Room,
         max: usize,
         cx: &mut Context<'_>,
     ) -> Result<(), Failure> {
@@ -814,7 +870,7 @@ impl Dial {
             }
         }
         for (id, s) in &mut self.calls {
-            if let Err((why, code, conn)) = advance(*id, s, &mut self.sender, out, max, cx) {
+            if let Err((why, code, conn)) = advance(*id, s, &mut self.sender, out, room, max, cx) {
                 if conn {
                     return Err(Failure(why));
                 }
@@ -844,6 +900,7 @@ fn advance(
     s: &mut DialStream,
     sender: &mut Option<client::SendRequest<ChanBody>>,
     out: &mut VecDeque<Piece>,
+    room: &mut Room,
     max: usize,
     cx: &mut Context<'_>,
 ) -> Result<(), (String, u16, bool)> {
@@ -931,6 +988,7 @@ fn advance(
                     s.stage = DStage::Body(r.into_body(), Messages::new(max));
                 }
             },
+            DStage::Body(_, _) if !room.open() => return Ok(()),
             DStage::Body(b, msgs) => match Pin::new(&mut *b).poll_frame(cx) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(Some(Err(e))) => {
@@ -942,6 +1000,7 @@ fn advance(
                         let got = msgs
                             .push_bytes(d)
                             .map_err(|e| (dial_bad_text(&e), e.status(), false))?;
+                        room.took(&got);
                         out.extend(got.into_iter().map(|m| Piece::data(id, m)));
                     }
                     Err(other) => {
@@ -1205,7 +1264,13 @@ impl Accept {
         }
     }
 
-    fn step(&mut self, out: &mut VecDeque<Piece>, max: usize, cx: &mut Context<'_>) {
+    fn step(
+        &mut self,
+        out: &mut VecDeque<Piece>,
+        room: &mut Room,
+        max: usize,
+        cx: &mut Context<'_>,
+    ) {
         let new: Vec<_> = self
             .arrivals
             .lock()
@@ -1293,12 +1358,18 @@ impl Accept {
                 continue;
             }
             while let Some((b, msgs)) = s.body.as_mut() {
+                if !room.open() {
+                    break;
+                }
                 match Pin::new(&mut *b).poll_frame(cx) {
                     Poll::Pending => break,
                     Poll::Ready(Some(Ok(fr))) => {
                         if let Ok(d) = fr.into_data() {
                             match msgs.push_bytes(d) {
-                                Ok(got) => out.extend(got.into_iter().map(|m| Piece::data(*id, m))),
+                                Ok(got) => {
+                                    room.took(&got);
+                                    out.extend(got.into_iter().map(|m| Piece::data(*id, m)));
+                                }
                                 Err(e) => {
                                     let (why, code) = (e.to_string(), e.status());
                                     s.body = None;
