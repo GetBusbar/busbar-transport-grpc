@@ -187,7 +187,8 @@ impl StreamCall {
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
-    /// neutral `status` mapped. `head_sent`: the host already sent the call's response head
+    /// neutral `status` mapped, else (no status stated either way) `UNKNOWN` with the bytes as its
+    /// message. `head_sent`: the host already sent the call's response head
     /// (`RefuseIn::head_sent`), so the refusal is its closing lines only.
     ///
     /// # Errors
@@ -215,12 +216,16 @@ impl StreamCall {
                     lines.truncate(lines.len() - 2);
                     lines
                 }
-                _ => msg::status_lines(
+                _ if status != 0 => msg::status_lines(
                     u32::from(msg::status_of_refusal(status)),
                     msg::refusal_message(status).as_bytes(),
                     &[],
                 )
                 .map_err(|e| Failure(e.into()))?,
+                // No status stated either way: `UNKNOWN`, the refusal's bytes its message, as the
+                // connection side ends the same refusal.
+                _ => msg::status_lines(u32::from(msg::UNKNOWN), bytes, &[])
+                    .map_err(|e| Failure(e.into()))?,
             }
         };
         // Closed only once the lines are rendered: a refusal that cannot be written leaves the call
