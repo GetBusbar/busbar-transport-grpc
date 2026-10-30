@@ -49,6 +49,8 @@ pub struct StreamCall {
     /// does not take): the call closes with its status and words for it (`RESOURCE_EXHAUSTED`,
     /// `UNIMPLEMENTED`), whatever refusal the host then closes it with.
     oversize: Option<msg::Bad>,
+    /// The reply was cut ([`StreamCall::cut_reply`]), for these words.
+    cut: Option<String>,
 }
 
 impl StreamCall {
@@ -87,6 +89,7 @@ impl StreamCall {
             answered: false,
             closed: false,
             oversize: refused,
+            cut: None,
         })
     }
 
@@ -115,20 +118,40 @@ impl StreamCall {
     }
 
     /// One reply message's payload bytes (`ends` = they complete it). A call already closed takes
-    /// none: body bytes after the closing lines would follow the trailers.
-    pub fn emit(&mut self, bytes: &[u8], ends: bool) {
-        if self.closed {
-            return;
+    /// none: body bytes after the closing lines would follow the trailers. Nor does a reply that
+    /// was cut ([`StreamCall::cut`]).
+    ///
+    /// # Errors
+    ///
+    /// The reply is cut here: its message is longer than a length prefix states.
+    pub fn emit(&mut self, bytes: &[u8], ends: bool) -> Result<(), Failure> {
+        if self.closed || self.cut.is_some() {
+            return Ok(());
         }
         if !ends {
             self.writing.extend_from_slice(bytes);
-            return;
+            return Ok(());
         }
-        self.wire
-            .extend_from_slice(&msg::prefix(self.writing.len() + bytes.len()));
+        let len = self.writing.len().saturating_add(bytes.len());
+        let Some(prefix) = msg::prefix(len) else {
+            return Err(self.cut_reply(format!(
+                "the reply message is {len} bytes, longer than a gRPC length prefix states"
+            )));
+        };
+        self.wire.extend_from_slice(&prefix);
         self.wire.append(&mut self.writing);
         self.wire.extend_from_slice(bytes);
         self.answered = true;
+        Ok(())
+    }
+
+    /// Cut the reply for `why`: the message being written is dropped, no reply byte more is taken,
+    /// and the call closes `RESOURCE_EXHAUSTED` in these words, whatever close the host states (the
+    /// far end never takes a reply missing a message for a whole one).
+    fn cut_reply(&mut self, why: String) -> Failure {
+        self.writing = Vec::new();
+        self.cut = Some(why.clone());
+        Failure(why)
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
@@ -145,6 +168,8 @@ impl StreamCall {
         let block = msg::terminate_block(bytes);
         let lines = if let Some(e) = &self.oversize {
             e.close_lines().map_err(|e| Failure(e.into()))?
+        } else if let Some(why) = &self.cut {
+            cut_lines(why)?
         } else {
             match msg::read_head(&block, usize::MAX) {
                 Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => {
@@ -190,11 +215,20 @@ impl StreamCall {
         }
         // Rendered first, closed after: a final status that cannot be written leaves the call
         // open, so the host's fallback refusal can still close it with a `grpc-status`.
-        let lines = msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?;
+        let lines = match &self.cut {
+            Some(why) => cut_lines(why)?,
+            None => msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?,
+        };
         self.closed = true;
         self.wire.extend(lines);
         Ok(())
     }
+}
+
+/// The closing lines of a call whose reply was cut for `why`.
+fn cut_lines(why: &str) -> Result<Vec<u8>, Failure> {
+    msg::status_lines(u32::from(msg::RESOURCE_EXHAUSTED), why.as_bytes(), &[])
+        .map_err(|e| Failure(e.into()))
 }
 
 impl Owed for StreamCall {

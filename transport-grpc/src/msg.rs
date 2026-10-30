@@ -41,18 +41,19 @@ pub fn is_grpc_content_type(v: &[u8]) -> bool {
         && matches!(v.get(base.len()), None | Some(b'+' | b';'))
 }
 
-/// The prefix of a message whose payload is `len` bytes.
+/// The prefix of a message whose payload is `len` bytes; `None` past `u32::MAX`, a length no
+/// prefix states.
 #[must_use]
-pub fn prefix(len: usize) -> [u8; PREFIX] {
-    let n = u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes();
-    [0, n[0], n[1], n[2], n[3]]
+pub fn prefix(len: usize) -> Option<[u8; PREFIX]> {
+    let n = u32::try_from(len).ok()?.to_be_bytes();
+    Some([0, n[0], n[1], n[2], n[3]])
 }
 
 /// `payload` in its length-prefixed form.
 #[cfg(test)]
 pub fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREFIX + payload.len());
-    out.extend_from_slice(&prefix(payload.len()));
+    out.extend_from_slice(&prefix(payload.len()).expect("a test payload is short"));
     out.extend_from_slice(payload);
     out
 }

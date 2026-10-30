@@ -37,10 +37,10 @@ fn the_bodys_messages_are_the_units_payloads() {
 #[test]
 fn a_reply_emitted_in_pieces_is_one_message_and_the_wire_drains_in_cuts() {
     let mut c = grpc();
-    c.emit(b"he", false);
-    c.emit(b"", false);
-    c.emit(b"llo", true);
-    c.emit(b"!", true);
+    c.emit(b"he", false).unwrap();
+    c.emit(b"", false).unwrap();
+    c.emit(b"llo", true).unwrap();
+    c.emit(b"!", true).unwrap();
     let mut want = msg::frame(b"hello");
     want.extend(msg::frame(b"!"));
     let mut got = c.take_wire(3);
@@ -54,7 +54,7 @@ fn a_reply_emitted_in_pieces_is_one_message_and_the_wire_drains_in_cuts() {
 #[test]
 fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
     let mut c = grpc();
-    c.emit(b"hi", true);
+    c.emit(b"hi", true).unwrap();
     assert_eq!(c.take_wire(usize::MAX), msg::frame(b"hi"));
     c.finish(5, b"no such", b"AAEC").unwrap();
     assert_eq!(
@@ -152,7 +152,7 @@ fn a_stated_grpc_timeout_is_never_enforced_here() {
         c.pieces().drain(..).all(|p| !p.failed),
         "nothing fails the call"
     );
-    c.emit(b"late but answered", true);
+    c.emit(b"late but answered", true).unwrap();
     c.finish(0, b"", b"").unwrap();
     let mut answer = msg::frame(b"late but answered");
     answer.extend_from_slice(b"grpc-status: 0\r\n");
@@ -167,12 +167,12 @@ fn an_emit_after_the_close_writes_nothing() {
     let mut c = grpc();
     c.refuse(b"", 429, false).unwrap();
     drop(c.take_wire(usize::MAX));
-    c.emit(b"late", true);
+    c.emit(b"late", true).unwrap();
     assert_eq!(wire(&mut c), "", "nothing after the close");
     let mut c = grpc();
     c.finish(0, b"", b"").unwrap();
     drop(c.take_wire(usize::MAX));
-    c.emit(b"late", true);
+    c.emit(b"late", true).unwrap();
     assert_eq!(wire(&mut c), "");
 }
 

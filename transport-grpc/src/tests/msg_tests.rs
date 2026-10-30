@@ -311,9 +311,6 @@ fn a_failed_message_stream_holds_nothing_more() {
 #[test]
 fn a_payload_past_u32_max_has_no_prefix() {
     let past = usize::try_from(u64::from(u32::MAX) + 1).expect("a 64-bit host");
-    assert_eq!(format!("{:?}", prefix(past)), "None");
-    assert_eq!(
-        format!("{:?}", prefix(u32::MAX as usize)),
-        "Some([0, 255, 255, 255, 255])"
-    );
+    assert_eq!(prefix(past), None);
+    assert_eq!(prefix(u32::MAX as usize), Some([0, 255, 255, 255, 255]));
 }
