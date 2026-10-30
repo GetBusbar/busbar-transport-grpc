@@ -47,7 +47,9 @@ pub struct StreamCall {
     /// The largest message payload carried, either way.
     max: usize,
     writing: Vec<u8>,
-    wire: Vec<u8>,
+    /// The bytes owed the host's wire, taken from the front ([`Owed::take_wire`]): a deque, so a
+    /// partial take copies only what it takes, never the rest.
+    wire: VecDeque<u8>,
     out: VecDeque<Piece>,
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
@@ -94,7 +96,7 @@ impl StreamCall {
             messages: Messages::new(max),
             max,
             writing: Vec::new(),
-            wire: Vec::new(),
+            wire: VecDeque::new(),
             out: VecDeque::new(),
             answered: false,
             closed: false,
@@ -153,9 +155,9 @@ impl StreamCall {
                 "the reply message is {len} bytes, longer than a gRPC length prefix states"
             )));
         };
-        self.wire.extend_from_slice(&prefix);
-        self.wire.append(&mut self.writing);
-        self.wire.extend_from_slice(bytes);
+        self.wire.extend(prefix);
+        self.wire.extend(self.writing.drain(..));
+        self.wire.extend(bytes);
         self.answered = true;
         Ok(())
     }
@@ -263,12 +265,8 @@ fn cut_lines(why: &str) -> Result<Vec<u8>, Failure> {
 
 impl Owed for StreamCall {
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
-        let taken = if cap >= self.wire.len() {
-            std::mem::take(&mut self.wire)
-        } else {
-            let rest = self.wire.split_off(cap);
-            std::mem::replace(&mut self.wire, rest)
-        };
+        let n = cap.min(self.wire.len());
+        let taken = self.wire.drain(..n).collect();
         // Taken ahead of the pieces (`fill`), so the writable piece goes out in this same answer.
         if self.announced && !self.closed && self.queued() <= STREAM_LOW_WATER {
             self.announced = false;
