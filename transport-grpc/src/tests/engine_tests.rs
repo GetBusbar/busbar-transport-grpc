@@ -1733,3 +1733,78 @@ fn a_dialled_keep_alive_pings_and_fails_a_silent_far_end() {
     assert!(t.failed, "{t:?}");
     assert_eq!(t.status, Some(msg::UNAVAILABLE));
 }
+
+/// A DIALLED CALL THAT STATES NO DEADLINE IS HELD TO `limits.upstream_request_timeout_secs`: the host
+/// is asked back at that time, and a far end that never answers fails the call
+/// `DEADLINE_EXCEEDED` then, not before and not never.
+#[test]
+fn a_dialled_call_stating_no_deadline_fails_at_the_configured_timeout() {
+    let mut p = Pair::new();
+    let t0 = p.now;
+    let limit = posture().timeout.as_secs() * SEC;
+    p.d.emit(1, &call("/pkg.Svc/Hang", &[], &[b"q"]), true, 0, t0)
+        .expect("emit");
+    p.settle();
+    assert_eq!(p.d.next_deadline(), Some(t0 + limit), "asked back at the timeout");
+    p.at(t0 + limit - 1);
+    assert!(terminal(&p.got_d, 1).is_none(), "not before the timeout");
+    p.at(t0 + limit);
+    let t = terminal(&p.got_d, 1).expect("the call fails at the timeout");
+    assert_eq!((t.status, t.failed), (Some(msg::DEADLINE_EXCEEDED), true));
+}
+
+/// AN ACCEPTED CALL THAT IS NOT gRPC IS ANSWERED `415` HERE AND NEVER HANDED UP: a request whose
+/// content type is not gRPC's (sent by hand, as no dial of this framer would) reaches the far end as
+/// a bare HTTP 415, and the host hears nothing of it.
+#[test]
+fn an_accepted_call_that_is_not_grpc_is_answered_415_and_never_handed_up() {
+    let mut p = Pair::new();
+    let super::Side::Dial(d) = &mut p.d.side else {
+        panic!("a dialled connection");
+    };
+    let timer = p.d.io.timer();
+    let mut s = super::DialStream::new(timer.sleep_until_ns(p.now + 60 * SEC));
+    let req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("http://peer.test:50051/pkg.Svc/Say")
+        .version(http::Version::HTTP_2)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(s.chan.body())
+        .expect("a request");
+    s.chan.end();
+    s.stage = super::DStage::Queued(req);
+    d.calls.push((1, s));
+    p.settle();
+    assert!(of(&p.got_a, 1).is_empty(), "never handed up: {:?}", p.got_a);
+    assert_eq!(held(&p.a), 0);
+    let t = terminal(&p.got_d, 1).expect("answered");
+    assert_eq!(t.status, Some(msg::UNKNOWN), "415 maps to UNKNOWN");
+    let end = last(&p.got_d, 1).expect("terminal");
+    assert_eq!(end.bytes.as_ref(), b"HTTP status 415");
+}
+
+/// A DIALLED HEAD'S CONTENT TYPE MUST BE gRPC'S, and the fields this layer owns never go upstream
+/// from it: a head stating `application/json` fails `INTERNAL` in words; one stating `host` or
+/// `authority` sends neither (the call's authority is the target's).
+#[test]
+fn a_dialled_heads_content_type_and_reserved_fields_are_this_layers() {
+    let mut p = Pair::new();
+    let json: [(&str, &[u8]); 1] = [("content-type", b"application/json")];
+    p.d.emit(1, &call("/pkg.Svc/Say", &json, &[b"q"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("refused");
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    assert_eq!(t.bytes.as_ref(), b"content-type is not a gRPC content type");
+
+    let mut p = Pair::new();
+    let owned: [(&str, &[u8]); 2] = [("host", b"evil.test"), ("authority", b"evil.test")];
+    p.d.emit(1, &call("/pkg.Svc/Say", &owned, &[b"q"]), true, 0, p.now)
+        .expect("emit");
+    p.settle();
+    let h = head(&p.got_a, 1);
+    assert_eq!(field(&h.bytes, "host"), None);
+    assert_eq!(field(&h.bytes, "authority"), None);
+    let words = h.head.as_ref().expect("head words");
+    assert_eq!(words.authority.as_ref(), b"peer.test:50051");
+}
