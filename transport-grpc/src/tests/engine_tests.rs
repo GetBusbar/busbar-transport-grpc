@@ -1293,3 +1293,41 @@ fn a_graceful_goaway_refusing_an_unprocessed_stream_is_unavailable() {
     assert_eq!(t.status, Some(msg::UNAVAILABLE));
     assert_eq!(t.bytes.as_ref(), b"the connection went away: NO_ERROR");
 }
+
+/// A DIALLED FRAME THAT ENDS SHORT OF ITS HEAD'S `content-length` FAILS AT ONCE, in words: the head
+/// states 20 message bytes and the frame ends after 12. The host hears `INTERNAL` with the reason
+/// on that emit, never a `DEADLINE_EXCEEDED` minutes later. RED: the request never ended, and the
+/// call hung to its deadline with nothing said.
+#[test]
+fn a_dialled_frame_ending_short_of_its_content_length_fails_in_words() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Say")], Some(20)).expect("head");
+    c.extend_from_slice(&[0u8; 12]);
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the stream fails at once");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    assert_eq!(
+        t.bytes.as_ref(),
+        b"the frame ended 8 bytes short of the head's content-length"
+    );
+    assert_eq!(held(&p.d), 0, "the stream is over");
+}
+
+/// A dialled head whose message bytes run past its `content-length` fails the stream `INTERNAL` in
+/// words, never sending the extra bytes on as a second call's.
+#[test]
+fn a_dialled_frame_running_past_its_content_length_fails_in_words() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Say")], Some(4)).expect("head");
+    c.extend_from_slice(&msg::frame(b"q"));
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the stream fails");
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    assert_eq!(
+        t.bytes.as_ref(),
+        b"more message bytes than the head's content-length"
+    );
+}
