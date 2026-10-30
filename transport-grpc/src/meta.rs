@@ -8,6 +8,7 @@
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
+use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 use busbar_contract::abi::transport::{
     FaultRow, SettingDecl, StatusRow, TransportTail, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
     FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
@@ -141,12 +142,31 @@ pub(crate) fn fault_of_http(status: u16) -> u8 {
         .map_or(FAULT_CALLER, |(_, _, f)| *f)
 }
 
+/// The request timeout's declared default, as the decimal text a setting declaration states it in.
+pub(crate) const DEFAULT_TIMEOUT: &str = "300";
+
+/// `text` read as a decimal count (digits alone, as the declared defaults are).
+const fn decimal(text: &str) -> u64 {
+    let b = text.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    n
+}
+
+// The declared default is the timeout the door applies when the setting is absent: one fact, held
+// equal (as the SDK holds `DEFAULT_BODY_MAX` to its bound).
+const _: () = assert!(decimal(DEFAULT_TIMEOUT) == DEFAULT_REQUEST_TIMEOUT_SECS);
+
 pub(crate) const SETTINGS: &[SettingDecl] = &[
     SettingDecl {
         path: abi_str(setting::REQUEST_TIMEOUT_SECS),
         kind: SETTING_COUNT,
         _reserved: 0,
-        default: abi_str("300"),
+        default: abi_str(DEFAULT_TIMEOUT),
     },
     SettingDecl {
         path: abi_str(setting::BODY_MAX_BYTES),

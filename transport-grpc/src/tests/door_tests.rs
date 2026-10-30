@@ -95,6 +95,17 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     assert!(read_settings(br#"{"limits.upstream_request_timeout_secs":"5"}"#).is_err());
 }
 
+/// EACH DECLARED DEFAULT IS THE VALUE THE DOOR APPLIES when the setting is absent: the declaration
+/// the host shows and validates, and the posture `open` reads from `{}`, never two facts.
+#[test]
+fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
+    use crate::meta::DEFAULT_TIMEOUT;
+    use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
+    let p = read_settings(b"").expect("absent reads as {}");
+    assert_eq!(DEFAULT_TIMEOUT.parse::<u64>(), Ok(p.timeout.as_secs()));
+    assert_eq!(DEFAULT_BODY_MAX.parse::<usize>(), Ok(p.max_message_bytes));
+}
+
 /// AN ILL-TYPED SETTING IS REFUSED BY ITS NAME, in the siblings' grammar (`settings: <key> must be
 /// ...`, as http and stdio word theirs). RED: `settings: a value is not of its declared kind`, naming
 /// no setting.
