@@ -426,12 +426,29 @@ slot!(
             .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing()));
         if let Some(call) = call {
             let all = i.final_bytes();
+            // A span of no bytes (absent among them) is none; any other must lie inside the bytes.
             let at = |s: busbar_contract::abi::mechanism::call::Span| {
+                if s.len == 0 {
+                    return Some(&[][..]);
+                }
                 let start = s.offset as usize;
-                all.get(start..start.saturating_add(s.len as usize))
-                    .unwrap_or_default()
+                all.get(start..start.checked_add(s.len as usize)?)
             };
-            let (message, details) = (at(i.final_message()), at(i.final_details()));
+            let (message, details) = match (at(i.final_message()), at(i.final_details())) {
+                (Some(m), Some(d)) => (m, d),
+                (m, _) => {
+                    // Refused, and the call kept for the host's fallback refusal to close.
+                    if let Some(inst) = mine(&p) {
+                        inst.calls.lock().expect("calls").insert(i.framing(), call);
+                    }
+                    o.error(if m.is_none() {
+                        "finish: the final message lies outside the close's bytes"
+                    } else {
+                        "finish: the final details lie outside the close's bytes"
+                    });
+                    return Outcome::Failed;
+                }
+            };
             let status = i.final_status();
             let answered = on_stream(&call, i.sink(), &mut o, |c| {
                 c.finish(status, message, details)
