@@ -446,7 +446,10 @@ impl Conn {
     ) -> Result<(), Failure> {
         // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
         // the bytes: every step below is idempotent on it.
-        let max = self.posture.max_message_bytes.saturating_add(HEAD_ALLOWANCE);
+        let max = self
+            .posture
+            .max_message_bytes
+            .saturating_add(HEAD_ALLOWANCE);
         // A host that keeps emitting past the high-water mark (one whole message more) has the
         // stream failed: the framer bounds what it holds for a far end that is not reading.
         let bound = stream_bound(self.posture.max_message_bytes);

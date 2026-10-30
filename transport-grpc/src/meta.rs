@@ -8,12 +8,12 @@
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
-use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 use busbar_contract::abi::transport::{
     FaultRow, SettingDecl, StatusRow, TransportTail, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
     FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
     STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
 };
+use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 
 /// This transport's key: the scheme it claims.
 pub const KEY: &str = "grpc";

@@ -465,7 +465,9 @@ pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
                 let line = line.trim_ascii_start();
                 line.len() > GRPC_STATUS.len()
                     && line[..GRPC_STATUS.len()].eq_ignore_ascii_case(GRPC_STATUS.as_bytes())
-                    && line[GRPC_STATUS.len()..].trim_ascii_start().starts_with(b":")
+                    && line[GRPC_STATUS.len()..]
+                        .trim_ascii_start()
+                        .starts_with(b":")
             };
             if bytes.split(|b| *b == b'\n').any(status_line) {
                 Err(format!(
