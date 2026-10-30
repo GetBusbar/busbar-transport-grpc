@@ -314,3 +314,26 @@ fn a_payload_past_u32_max_has_no_prefix() {
     assert_eq!(prefix(past), None);
     assert_eq!(prefix(u32::MAX as usize), Some([0, 255, 255, 255, 255]));
 }
+
+/// A refusal's bytes are a block only where they are one: a block stating `grpc-status` is the
+/// close; words (even words naming `grpc-status`, a relayed failure's text) close with the neutral
+/// status; a broken block with a `grpc-status:` line is refused in words.
+#[test]
+fn a_refusals_bytes_are_a_block_only_where_they_are_one() {
+    let block = refusal_block(b"grpc-status: 5\r\ngrpc-message: gone\r\n").expect("a block");
+    assert_eq!(block.and_then(|h| h.get(GRPC_STATUS).map(<[u8]>::to_vec)), Some(b"5".to_vec()));
+    for words in [
+        &b"it broke"[..],
+        b"the answer ended without a grpc-status",
+        b"grpc-status 13",
+        b"x-meta: one",
+    ] {
+        assert_eq!(refusal_block(words), Ok(None), "{:?}", String::from_utf8_lossy(words));
+    }
+    for broken in [
+        &b"grpc-status: 5\r\nbroken line\r\n"[..],
+        b"content-length: x\r\nGRPC-STATUS : 7\r\n",
+    ] {
+        assert!(refusal_block(broken).is_err(), "{:?}", String::from_utf8_lossy(broken));
+    }
+}
