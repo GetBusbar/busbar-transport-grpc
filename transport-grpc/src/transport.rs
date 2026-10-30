@@ -1263,6 +1263,13 @@ impl AStream {
 /// Fields this layer owns on an answer's head, beside the hop-by-hop ones.
 const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
 
+/// Whether an answer field named `name` (lower case) is never the host's to send: one this layer
+/// owns ([`RESERVED_ON_ANSWER`]), or a connection-specific one HTTP/2 forbids in every field block
+/// (RFC 9113 §8.2.2).
+pub(crate) fn not_the_hosts(name: &str) -> bool {
+    RESERVED_ON_ANSWER.contains(&name) || hop_by_hop(name, [])
+}
+
 /// The answer fields `blocks` state, appended to `map` in order: a head's or the trailers' alike,
 /// those this layer owns ([`RESERVED_ON_ANSWER`]) and the connection-specific ones HTTP/2 forbids in
 /// every field block (RFC 9113 §8.2.2) dropped.
@@ -1277,7 +1284,7 @@ fn answer_fields<'h>(
 ) -> Result<(), String> {
     for h in blocks {
         for (name, value) in &h.fields {
-            if RESERVED_ON_ANSWER.contains(&name.as_str()) || hop_by_hop(name, []) {
+            if not_the_hosts(name) {
                 continue;
             }
             let n = HeaderName::from_bytes(name.as_bytes())
