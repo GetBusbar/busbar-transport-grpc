@@ -1663,3 +1663,22 @@ fn an_accepted_answers_malformed_head_block_fails_in_words() {
     let t = answer_head_fails(b"not a field\r\n\r\n", false);
     assert_eq!(t.bytes.as_ref(), b"a head line is not a field");
 }
+
+/// A REFUSAL WHOSE BLOCK NAMES `grpc-status` BUT IS NO FIELD BLOCK FAILS IN WORDS and leaves the
+/// call open for the host's fallback close: the status the host meant is never silently replaced by
+/// its neutral status's mapping. Words that are no block at all still close with the neutral status
+/// (`a_refusal_without_a_status_is_unknown_with_its_text`). RED: `busbar answered HTTP 500`.
+#[test]
+fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
+    let mut a = half_closed();
+    assert_eq!(
+        a.end_call(1, b"grpc-status: 5\r\ngrpc-message oops\r\n", 500),
+        Err(super::Failure(
+            "the trailer block names grpc-status but is not a field block: a head line is not a \
+             field"
+                .into()
+        ))
+    );
+    assert_eq!(held(&a), 1, "the call is still open");
+    assert_eq!(sent_message(&a, 1), None, "nothing was sent");
+}
