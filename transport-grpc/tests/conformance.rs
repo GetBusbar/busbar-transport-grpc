@@ -718,3 +718,44 @@ fn a_final_tail_whose_span_lies_outside_its_bytes_is_refused_in_words() {
         host.close();
     }
 }
+
+/// A HOST BUFFER TOO SMALL FOR `locate`'S ANSWER IS A SHORT ANSWER, never a truncated success: each
+/// buffer's needed size is stated, whichever is short (the framer's own head lines too, which every
+/// call is owed), and on the listener path the offer's. Both images.
+#[test]
+fn locate_answers_short_for_any_buffer_too_small() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let target = "https://peer.test";
+        for (k, caps) in [
+            [3, 256, 64, 256],
+            [256, 3, 64, 256],
+            [256, 256, 1, 256],
+            [256, 256, 64, 5],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (r, o, why) = host.locate_lent(target, false, caps);
+            assert_eq!(r, Outcome::Failed, "buffer {k}");
+            assert_eq!(why, "locate: a host buffer is too small", "buffer {k}");
+            assert_eq!(
+                (
+                    o.authority_needed,
+                    o.name_needed,
+                    o.alpn_needed,
+                    o.defaults_needed
+                ),
+                (13, 9, 3, 46),
+                "buffer {k}: every needed size stated"
+            );
+        }
+        let (r, o, why) = host.locate_lent("", true, [0, 0, 2, 0]);
+        assert_eq!(
+            (r, o.alpn_needed, why.as_str()),
+            (Outcome::Failed, 3, "locate: a host buffer is too small")
+        );
+        host.close();
+    }
+}

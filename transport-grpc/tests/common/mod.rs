@@ -421,6 +421,31 @@ impl Host {
         })
     }
 
+    /// `locate` with the buffers lent at the given sizes (`authority`, `name`, `alpn`, `defaults`),
+    /// as a host with less room does, judged by the kind's own check: its outcome, its `out`, and
+    /// its text.
+    pub fn locate_lent(
+        &mut self,
+        target: &str,
+        accept: bool,
+        caps: [usize; 4],
+    ) -> (Outcome, LocateOut, String) {
+        let [mut a, mut n, mut p, mut d] = caps.map(|c| vec![0_u8; c]);
+        let mut i: LocateIn = z();
+        i.target = s(target);
+        i.accept = u32::from(accept);
+        (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
+        (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
+        (i.alpn_buf, i.alpn_cap) = (p.as_mut_ptr(), p.len());
+        (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
+        let mut o: LocateOut = z();
+        let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
+        let offer = p[..(o.alpn_written as usize).min(p.len())].to_vec();
+        check_locate(r, &o, caps[0] as u64, caps[1] as u64, caps[2] as u64, &offer, caps[3] as u64)
+            .expect("locate passes the kind's check");
+        (r, o, text(o.head.error))
+    }
+
     /// Take an op's answer: judge it by the kind's own check, send its wire bytes, keep its pieces.
     fn take(&mut self, outcome: Outcome, o: &FramerOut) -> Outcome {
         let n = o.yielded.pieces_len as usize;
