@@ -95,6 +95,24 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     assert!(read_settings(br#"{"limits.upstream_request_timeout_secs":"5"}"#).is_err());
 }
 
+/// AN ILL-TYPED SETTING IS REFUSED BY ITS NAME, in the siblings' grammar (`settings: <key> must be
+/// ...`, as http and stdio word theirs). RED: `settings: a value is not of its declared kind`, naming
+/// no setting.
+#[test]
+fn an_ill_typed_setting_is_refused_by_its_name() {
+    let why = |json: &[u8]| read_settings(json)
+        .err()
+        .and_then(|r| r.text().map(str::to_owned));
+    assert_eq!(
+        why(br#"{"limits.upstream_request_timeout_secs":"5"}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds")
+    );
+    assert_eq!(
+        why(br#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
+        Some("settings: limits.request_body_max_bytes must be a count of bytes")
+    );
+}
+
 /// A BARE HTTP ANSWER'S FAULT IS READ BY ITS HTTP BAND, 1.5.5's (`v1.5.5 crates/busbar/src/breaker.rs`
 /// step 2, `Auth | Billing => HardDown`, the transient classes, the rest the caller's), over every
 /// status a far end can answer. The expected reading below is 1.5.5's if-chain, written out as it

@@ -595,7 +595,7 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
             validate(ops, r#"{"limits.upstream_request_timeout_secs":"5"}"#),
             (
                 Outcome::Failed,
-                "settings: a value is not of its declared kind".to_owned()
+                "settings: limits.upstream_request_timeout_secs must be a count of seconds".to_owned()
             )
         );
         let host = Host::open(ops, "{}", ROOMY);
