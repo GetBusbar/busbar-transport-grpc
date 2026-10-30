@@ -504,7 +504,11 @@ impl Conn {
                 }
                 if !s.head_sent {
                     s.head_buf.extend_from_slice(bytes);
-                    match msg::read_head(&s.head_buf, max) {
+                    let read = match msg::read_head(&s.head_buf, max) {
+                        Ok(None) if end => Err("the frame ended inside the head block".into()),
+                        read => read,
+                    };
+                    match read {
                         Ok(None) => return Ok(()),
                         Err(why) => {
                             s.fail_reply(msg::INTERNAL, why.as_bytes());
