@@ -355,8 +355,7 @@ fn the_callers_deadline_fails_the_call_when_it_passes_and_never_goes_upstream() 
 
 /// AN ACCEPTED CALL'S `grpc-timeout` IS A FACT FOR THE PLANE, NEVER ENFORCED HERE, as predev's
 /// server enforced none: it is handed up among the head's fields, and long past it the call is
-/// still open, with no `DEADLINE_EXCEEDED` from this side. RED before the fix: the accepted side
-/// failed the call `DEADLINE_EXCEEDED` at the stated deadline.
+/// still open, with no `DEADLINE_EXCEEDED` from this side.
 #[test]
 fn an_accepted_calls_grpc_timeout_is_handed_up_and_never_enforced() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -427,8 +426,6 @@ fn a_compressed_message_from_the_far_end_fails_the_call() {
     let d = terminal(&p.got_d, 1).expect("and answers the dialled side");
     assert_eq!(d.status, Some(msg::INTERNAL));
 }
-
-// ── te, as predev's server checked it (CORRECTION te) ────────────────────────────────────────────
 
 /// One HTTP/2 frame.
 fn h2(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -543,11 +540,10 @@ fn a_missing_te_is_served() {
 /// fail over as transient. 1.5.5's breaker read an HTTP 401 or 403 as `Auth`, which is `HardDown`
 /// (v1.5.5 `crates/busbar/src/breaker.rs`, its step 2 and its `Auth | Billing => HardDown`
 /// arm), and this framer's fault table reads UNAUTHENTICATED and PERMISSION_DENIED as hard.
-/// RED on a framer that fails the stream on a non-200 HTTP status.
 #[test]
 fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
     use busbar_contract::abi::transport::{FAULT_CALLER, FAULT_HARD, FAULT_TRANSIENT};
-    // The fault reading is the HTTP status's own, by 1.5.5's bands (BUSBAR ruling (b), 2026-10-07):
+    // The fault reading is the HTTP status's own, by 1.5.5's bands:
     // a bare 400 is INTERNAL to the caller but the caller's fault to the breaker, as 1.5.5 read it.
     for (http, grpc, fault) in [
         (401u16, msg::UNAUTHENTICATED, FAULT_HARD),
@@ -599,8 +595,6 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
     }
 }
 
-// ── a stream's lifetime ──────────────────────────────────────────────────────────────────────────
-
 /// The calls an accepted connection still holds.
 fn held(c: &Conn) -> usize {
     match &c.side {
@@ -635,9 +629,7 @@ fn cancel(a: &mut Conn) -> Vec<Piece> {
 /// A CLIENT'S CANCEL AFTER ITS HALF-CLOSE IS TOLD TO THE HOST. The client sent its last message,
 /// the host is streaming the answer, and the client resets the call: the host hears it as the
 /// stream failing `CANCELLED`, the call is let go of, and an answer emitted after it queues
-/// nothing. RED before the fix: the reset was seen only while the call's body was still read, so
-/// nothing reached the host, the call stayed held, and every later message was queued for a
-/// stream nobody reads.
+/// nothing.
 #[test]
 fn a_cancel_after_the_half_close_fails_the_stream_cancelled() {
     let mut a = half_closed();
@@ -691,9 +683,7 @@ fn an_answered_call_is_never_reported_cancelled() {
 /// A LATE EMIT ON A DIALLED STREAM THAT ENDED IS DROPPED. The far end answers a client-streaming
 /// call early (trailers-only, before the upload is done); the host's next message and its end
 /// arrive after the stream's terminal piece. They open nothing: no second terminal piece, no
-/// held call, and no deadline firing later on a stream the host already saw end. RED before the
-/// fix: the late bytes opened a fresh call whose head they were read as, and failed it INTERNAL
-/// (or let its deadline fail it), a second terminal piece on a closed stream.
+/// held call, and no deadline firing later on a stream the host already saw end.
 #[test]
 fn a_late_emit_on_an_ended_dialled_stream_opens_nothing() {
     let mut p = Pair::new();
@@ -744,8 +734,6 @@ fn ended_streams_are_remembered_as_runs() {
     e.insert(u64::MAX);
     assert!(e.contains(u64::MAX) && !e.contains(u64::MAX - 1));
 }
-
-// ── a stream's own backpressure ──────────────────────────────────────────────────────────────────
 
 /// The answer bytes an accepted call still queues for the far end, framer-side (not yet taken by
 /// the HTTP/2 connection, which takes them only as the far end grants room).
@@ -903,8 +891,6 @@ fn an_upload_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
     assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
 }
 
-// ── a refusal's bytes ────────────────────────────────────────────────────────────────────────────
-
 /// The `grpc-message` an accepted call's end carries, as it goes on the wire: in the head of a
 /// trailers-only answer, or in the trailers after one.
 fn sent_message(c: &Conn, stream: u64) -> Option<Vec<u8>> {
@@ -927,10 +913,8 @@ fn sent_message(c: &Conn, stream: u64) -> Option<Vec<u8>> {
 
 /// A REFUSAL'S `grpc-message` IS PREDEV'S BYTES. A refusal naming no `grpc-status` ends the call
 /// with its neutral status mapped and predev's words, percent-encoded as predev's gRPC line
-/// (tonic 0.14's `Status`) encoded them: the space and each of `"#%<>`?{}` beside the controls
-/// (spec ruling 2026-09-30: "the grpc transport maps it to grpc-status/trailers byte-equal to
-/// predev"). Both shapes: trailers-only, and trailers after the answer's head. RED before the fix:
-/// the space went out as it was.
+/// (tonic 0.14's `Status`) encoded them: the space and each of `"#%<>`?{}` beside the controls.
+/// Both shapes: trailers-only, and trailers after the answer's head.
 #[test]
 fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
     let mut a = half_closed();
@@ -950,13 +934,11 @@ fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
     );
 }
 
-// ── an oversize message ──────────────────────────────────────────────────────────────────────────
-
 /// AN OVERSIZE MESSAGE FAILS `RESOURCE_EXHAUSTED` NAMING THE LIMIT. A call whose message states a length
 /// past the ceiling (`limits.request_body_max_bytes`, the knob that bounds every inbound body)
 /// fails `RESOURCE_EXHAUSTED` (code 8) in this framer's own words, which print that configured ceiling
-/// (coordinator ruling (b)). Both ends see it: the accepted side's failure piece, and the dialled
-/// side's trailers and decoded message. RED before the fix: predev's server's words.
+/// Both ends see it: the accepted side's failure piece, and the dialled
+/// side's trailers and decoded message.
 #[test]
 fn an_oversize_message_fails_resource_exhausted_naming_the_limit_on_the_accepted_side() {
     let mut p = Pair::new();
@@ -992,8 +974,6 @@ fn an_oversize_message_fails_resource_exhausted_naming_the_limit_on_the_accepted
 
 /// AN OVERSIZE ANSWER ON THE DIAL is `RESOURCE_EXHAUSTED` in this framer's own words: predev's hop had no
 /// gRPC status for it (its refusal was `BodyTooLarge`), so nothing of predev's server is copied.
-/// RED before the fix: the dial handed the host predev's server wording ("Error, decoded message
-/// length too large: ...").
 #[test]
 fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
     let mut p = open_call(false, b"");
@@ -1013,8 +993,6 @@ fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
         format!("the answer's message is {over} bytes, over the limit of {limit} bytes")
     );
 }
-
-// ── a dialled stream's failure below gRPC, by its HTTP/2 code ────────────────────────────────────
 
 /// A dialled call on stream 1, sent whole and unanswered; with `after_head`, its answer's head is
 /// in and its body still open (after `partial` bytes of a message, where any).
@@ -1078,14 +1056,10 @@ fn assert_reset(code: u32, status: u16, name: &str) {
     }
 }
 
-// The gRPC over HTTP/2 table (PROTOCOL-HTTP2.md, "Errors"), one test per code. predev's hop read
-// no code (every transport failure was one refusal), so the table is the reference. RED before
-// the fix, where marked: a far end's reset before the head was UNAVAILABLE and after it INTERNAL,
-// whatever the code, and only a far end's reset was read by code at all.
+// The gRPC over HTTP/2 table (PROTOCOL-HTTP2.md, "Errors"), one test per code.
 
-/// Every HTTP/2 reset code fails the call with its mapped gRPC status. RED: UNAVAILABLE before the
-/// head, INTERNAL or UNKNOWN after it. `STREAM_CLOSED`, which the table does not list, and a code
-/// HTTP/2 does not define (RFC 9113 §7; the coordinator's "all others → INTERNAL" ruling) are
+/// Every HTTP/2 reset code fails the call with its mapped gRPC status. `STREAM_CLOSED`, which the
+/// table does not list, and a code HTTP/2 does not define (RFC 9113 §7) are
 /// `INTERNAL`, never read as safe to retry; `REFUSED_STREAM` is `UNAVAILABLE` (the far end processed
 /// nothing).
 #[test]
@@ -1174,14 +1148,10 @@ fn an_answer_cut_inside_a_message_fails_the_call_internal() {
     );
 }
 
-// ── compression ──────────────────────────────────────────────────────────────────────────────────
-
 /// A COMPRESSION THE SERVER DOES NOT TAKE IS ANSWERED `UNIMPLEMENTED` (gRPC's compression rules,
 /// `compression.md`): trailers-only, before a message is read, with `grpc-accept-encoding:
 /// identity` and this framer's words, and never handed up. A call stating `identity` is no
-/// compressed call, and is served. RED before the fix: `grpc-encoding` was never read, the call
-/// was handed up, and its compressed message failed `INTERNAL` with no `grpc-accept-encoding` to
-/// fall back on.
+/// compressed call, and is served.
 #[test]
 fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
     let mut p = Pair::new();
@@ -1250,12 +1220,9 @@ fn the_first_grpc_encoding_field_is_the_calls() {
     assert_eq!(held(&a), 0);
 }
 
-// ── no grpc-timeout upstream ─────────────────────────────────────────────────────────────────────
-
 /// NO `grpc-timeout` GOES UPSTREAM, as predev's hop sent none (predev
 /// `crates/busbar-a2a/src/a2a/relay.rs` `build_request`): not one of the dial's own, and not one
-/// the head carries. The attempt's deadline still holds the call, here. RED before the fix: the
-/// head's value went out verbatim (and, with none, the remaining deadline was written).
+/// the head carries. The attempt's deadline still holds the call, here.
 #[test]
 fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
     let mut p = Pair::new();

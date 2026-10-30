@@ -72,8 +72,6 @@ pub fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
-// ── the door, linked and dropped in ──────────────────────────────────────────────────────────────
-
 pub fn linked() -> &'static Ops {
     // SAFETY: `door()` answers the `'static` door of this crate.
     #[allow(unused_unsafe)]
@@ -84,8 +82,8 @@ pub fn linked() -> &'static Ops {
 
 /// THE IMAGE WHERE `cargo test` DID NOT BUILD IT: the coverage job. `cargo test` builds every
 /// example, this cdylib among them, beside the test binaries. The fleet's coverage job runs
-/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built, and every test that loads
-/// the dropped-in door used to fail there. So the image is built here, once per test binary, with
+/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built. So the image is built
+/// here, once per test binary, with
 /// the same cargo, manifest and profile, under this run's environment: under `cargo llvm-cov` that
 /// environment carries its instrumentation flags, so the dropped-in door is built under llvm-cov
 /// and its lines are measured like the linked door's. It goes to its own target directory beside
@@ -162,8 +160,6 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     (unsafe { &*(*d).ops().cast::<Ops>() }, lib)
 }
 
-// ── the socket ───────────────────────────────────────────────────────────────────────────────────
-
 /// The socket the host holds: what the far end wrote and the host has not ingested (and whether
 /// it has ended), and the way to the far end.
 pub struct Socket {
@@ -204,8 +200,6 @@ where
     });
     sock
 }
-
-// ── the host ─────────────────────────────────────────────────────────────────────────────────────
 
 /// One frame piece as the host read it out of its sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,8 +782,6 @@ impl Host {
         call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
     }
 
-    // ── reading what arrived ─────────────────────────────────────────────────────────────────────
-
     /// Stream `stream`'s whole frames (pieces joined up to each end-of-frame) up to its status:
     /// the head, the messages and (on an accepted stream) the far end's empty last.
     pub fn frames(&self, stream: u64) -> Vec<Vec<u8>> {
@@ -839,8 +831,6 @@ pub fn lpm(payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(payload);
     out
 }
-
-// ── the tonic peer ───────────────────────────────────────────────────────────────────────────────
 
 /// A byte-blind codec: messages are bytes both ways.
 #[derive(Debug, Clone, Default)]

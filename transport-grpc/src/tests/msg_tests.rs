@@ -5,8 +5,6 @@
 
 use super::*;
 
-// ── frame and Messages ───────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn an_empty_payload_is_still_a_five_byte_frame() {
     assert_eq!(frame(b""), vec![0, 0, 0, 0, 0]);
@@ -77,8 +75,6 @@ fn a_stream_that_ends_between_messages_is_clean() {
     assert_eq!(m.end(), Ok(()));
 }
 
-// ── grpc-status ──────────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn an_http_status_maps_to_its_grpc_status() {
     assert_eq!(status_of_http(400), INTERNAL);
@@ -106,8 +102,6 @@ fn an_out_of_range_or_unreadable_grpc_status_is_unknown() {
     assert_eq!(parse_status(b""), UNKNOWN);
     assert_eq!(parse_status(&[0xff]), UNKNOWN);
 }
-
-// ── grpc-message ─────────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn a_percent_escape_is_decoded() {
@@ -140,8 +134,6 @@ fn an_encoded_message_decodes_back_to_the_original() {
     assert_eq!(decode_message(encode_status_message(text).as_bytes()), text);
 }
 
-// ── content type ─────────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn a_grpc_content_type_is_recognised_with_or_without_a_suffix() {
     assert!(is_grpc_content_type(b"application/grpc"));
@@ -157,8 +149,6 @@ fn a_look_alike_content_type_is_not_grpc() {
     assert!(!is_grpc_content_type(b"application/grp"));
     assert!(!is_grpc_content_type(b""));
 }
-
-// ── the head block ───────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn an_incomplete_head_block_is_not_yet_a_head() {

@@ -30,7 +30,7 @@ fn the_tail_is_a_framer_that_names_no_other_transport() {
     assert_eq!(check_fault_cover(STATUS_ROWS, FAULT_ROWS), Ok(()));
     assert_eq!(check_settings(SETTINGS), Ok(()));
     assert_eq!(TAIL.role, ROLE_FRAMER);
-    // No transport names another (THE DESIGN, the transport chain). The connector picks the
+    // No transport names another. The connector picks the
     // carrier; the tail names none, so the connector serves it over the host's socket.
     assert!(COMPOSES_OVER.is_empty());
     assert_eq!(TAIL.composes_over_len(), 0);
