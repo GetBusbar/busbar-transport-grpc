@@ -627,3 +627,56 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
         host.close();
     }
 }
+
+/// ONE STREAM'S REPLY HAS THE BACKPRESSURE AND THE BOUND A CONNECTION'S STREAM HAS (the transport
+/// ABI's "A STREAM'S OWN BACKPRESSURE"). The host's far end is not reading, so what the sink cannot
+/// take stays queued: the emit that leaves the queue at its high-water mark is answered
+/// `YIELD_STREAM_FULL`; once the far end reads again and the queue drains, the stream hands one
+/// writable piece; a host that emits past the bound has the reply cut in words, and the call then
+/// closes `RESOURCE_EXHAUSTED` whatever close it states. Both images. RED: no emit was ever answered
+/// full, and the reply queue grew without bound.
+#[test]
+fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
+    use busbar_contract::abi::transport::{PIECE_WRITABLE, YIELD_STREAM_FULL};
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", Caps(4096, 4096, 8));
+        let fields = [("content-type", "application/grpc")];
+        assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
+        let m = vec![7u8; 60_000];
+        let full = (0..40).find(|_| {
+            let (r, flags, _) = host.emit_held(1, &m, true);
+            assert_eq!(r, Outcome::Ready);
+            flags & YIELD_STREAM_FULL != 0
+        });
+        assert!(full.is_some(), "the reply's queue reached its high-water mark");
+        assert_eq!(host.emit_drain(1), Outcome::Ready, "the far end reads again");
+        let writable: Vec<&Got> = host
+            .got
+            .iter()
+            .filter(|g| g.flags & PIECE_WRITABLE != 0)
+            .collect();
+        assert_eq!(writable.len(), 1, "one writable piece once drained");
+
+        let cut = (0..400).find_map(|_| match host.emit_held(1, &m, true) {
+            (Outcome::Ready, _, _) => None,
+            other => Some(other),
+        });
+        let (r, _, why) = cut.expect("a host emitting past the bound has the reply cut");
+        assert_eq!(r, Outcome::Failed);
+        assert_eq!(
+            why,
+            "the stream's queue is past its bound: the far end is not reading"
+        );
+        assert_eq!(host.emit_drain(1), Outcome::Ready);
+        let at = host.wire_log.len();
+        assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            "grpc-status: 8\r\ngrpc-message: the%20stream's%20queue%20is%20past%20its%20bound:\
+             %20the%20far%20end%20is%20not%20reading\r\n",
+            "the cut reply closes RESOURCE_EXHAUSTED, never OK"
+        );
+        host.close();
+    }
+}
