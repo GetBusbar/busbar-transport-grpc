@@ -35,7 +35,7 @@ use std::collections::VecDeque;
 use crate::hyper_io::{Owed, Piece};
 use crate::msg::{self, Messages, PREFIX};
 use crate::transport::{
-    stream_bound, Failure, OVER_BOUND, STREAM_HIGH_WATER, STREAM_LOW_WATER,
+    not_the_hosts, stream_bound, Failure, OVER_BOUND, STREAM_HIGH_WATER, STREAM_LOW_WATER,
 };
 
 /// The one stream a `SIDE_ACCEPT_STREAM` framing carries.
@@ -205,9 +205,12 @@ impl StreamCall {
         } else {
             match msg::refusal_block(bytes).map_err(Failure)? {
                 Some(h) => {
+                    // The framer's own and the connection-specific fields dropped, as the
+                    // connection side drops them: one content type, the framer's.
                     let pairs: Vec<(&str, &[u8])> = h
                         .fields
                         .iter()
+                        .filter(|(n, _)| !not_the_hosts(n))
                         .map(|(n, v)| (n.as_str(), v.as_slice()))
                         .collect();
                     let mut lines =
