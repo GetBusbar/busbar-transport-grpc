@@ -939,7 +939,9 @@ fn advance(
 
 /// A DIALLED STREAM'S FAILURE BELOW gRPC, as the status it stands for and this framer's own text
 /// for it. A reset or a GOAWAY, either end's (`hyper` hands up `h2`'s error as its source), is read
-/// by its HTTP/2 error code ([`msg::status_of_reset`]), before or after the answer's head alike.
+/// by its HTTP/2 error code ([`msg::status_of_reset`]), before or after the answer's head alike,
+/// except the far end's graceful GOAWAY (`NO_ERROR`), which refuses only streams it never
+/// processed: `UNAVAILABLE`, safe to retry.
 /// Anything else (the connection lost, an I/O error) is the far end become unreachable before any
 /// status came: `UNAVAILABLE`. The codes follow the gRPC over HTTP/2 table.
 fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
@@ -953,10 +955,15 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
                 } else {
                     "the stream was reset"
                 };
-                return (
-                    msg::status_of_reset(code),
-                    format!("{what}: {}", msg::reset_name(code)),
-                );
+                // A far end's graceful GOAWAY reaches a stream only when it is past the last one
+                // the far end accepted (`h2` fails no other stream with it): nothing was
+                // processed, and the call is safe to retry (PROTOCOL-HTTP2.md, "GOAWAY Frame").
+                let status = if h.is_go_away() && h.is_remote() && code == 0 {
+                    msg::UNAVAILABLE
+                } else {
+                    msg::status_of_reset(code)
+                };
+                return (status, format!("{what}: {}", msg::reset_name(code)));
             }
             break;
         }
