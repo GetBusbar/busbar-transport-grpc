@@ -282,3 +282,21 @@ fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
     c.refuse(b"", 500, false).expect("the fallback closes it");
     assert!(wire(&mut c).contains("grpc-status: 2\r\n"));
 }
+
+/// A REFUSAL BLOCK'S OWN `content-type` (and any connection-specific field) IS DROPPED, as the
+/// connection side drops it: the trailers-only answer states one content type, the framer's, and
+/// never a field HTTP/2 forbids (RFC 9113 §8.2.2). RED: two `content-type` lines.
+#[test]
+fn a_refusal_blocks_own_content_type_and_connection_fields_are_dropped() {
+    let mut c = grpc();
+    c.refuse(
+        b"content-type: application/grpc+proto\r\nconnection: close\r\ngrpc-status: 7\r\n",
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        wire(&mut c),
+        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 7\r\n"
+    );
+}
