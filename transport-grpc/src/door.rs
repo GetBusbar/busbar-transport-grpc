@@ -88,6 +88,16 @@ pub struct Instance {
     next: AtomicU64,
 }
 
+/// HTTP/2 keep-alive on a dialled connection: a PING this often (fixed here, not an operator
+/// setting), so a far end gone silent is found while a call waits on it.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a keep-alive PING may go unanswered before the dialled connection is failed.
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HTTP/2's adaptive flow-control window, both sides (fixed here, not an operator setting).
+const ADAPTIVE_WINDOW: bool = true;
+
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
 /// says. An absent blob reads as `{}`.
 fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
@@ -114,9 +124,9 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
         DEFAULT_REQUEST_BODY_MAX_BYTES as u64,
     )?;
     Ok(Posture {
-        keep_alive_interval: Some(Duration::from_secs(30)),
-        keep_alive_timeout: Duration::from_secs(10),
-        adaptive_window: true,
+        keep_alive_interval: Some(KEEP_ALIVE_INTERVAL),
+        keep_alive_timeout: KEEP_ALIVE_TIMEOUT,
+        adaptive_window: ADAPTIVE_WINDOW,
         timeout: Duration::from_secs(secs),
         max_message_bytes: usize::try_from(max).unwrap_or(usize::MAX),
     })
