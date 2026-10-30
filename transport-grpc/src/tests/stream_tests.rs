@@ -101,7 +101,7 @@ fn the_status_message_is_encoded_as_predev_encoded_it() {
 /// states a length past the ceiling: `ingest` fails, and the refusal the host then closes the
 /// stream with (its neutral status for a body it could not decode, the failure's text as its
 /// bytes) is rendered as `grpc-status: 8` and this framer's own words, which print the configured
-/// limit (coordinator ruling (b)). RED before the fix: the words were predev's server's.
+/// limit.
 #[test]
 fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
     let mut c = grpc();
@@ -134,8 +134,7 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
 /// A `grpc-timeout` THE CALLER STATES IS NEVER ENFORCED HERE, as predev's server enforced none:
 /// the call asks the host for no timer, and however long it runs it is never closed
 /// `DEADLINE_EXCEEDED` by this framing; the value stays in the head the host keeps, a fact for the
-/// plane. RED before the fix: the framing asked for a timer at the stated deadline and failed the
-/// call `DEADLINE_EXCEEDED` there.
+/// plane.
 #[test]
 fn a_stated_grpc_timeout_is_never_enforced_here() {
     let mut c = StreamCall::open(
@@ -162,8 +161,7 @@ fn a_stated_grpc_timeout_is_never_enforced_here() {
 
 /// AN EMIT AFTER THE CLOSE WRITES NOTHING: a reply message the host emits once the call is closed
 /// is dropped, as the dedicated listener drops one after its reply is over; it never lands behind
-/// the closing lines the host sends as trailers. RED before the fix: the message was framed into
-/// the wire after the status lines.
+/// the closing lines the host sends as trailers.
 #[test]
 fn an_emit_after_the_close_writes_nothing() {
     let mut c = grpc();
@@ -197,8 +195,7 @@ const UNIMPLEMENTED_GZIP: &str = ":status: 200\r\ncontent-type: application/grpc
 /// A COMPRESSION THE DOOR DOES NOT TAKE IS `UNIMPLEMENTED` WITH THE ENCODINGS IT TAKES (gRPC's
 /// compression rules, `compression.md`): the call's first `ingest` fails, and whatever refusal the
 /// host then closes it with, the close is `grpc-accept-encoding: identity` and `grpc-status: 12`.
-/// `identity` is no compression. RED before the fix: `grpc-encoding` was never read, the compressed
-/// message failed `INTERNAL`, and the close was the refusal's neutral status mapped.
+/// `identity` is no compression.
 #[test]
 fn a_compression_the_door_does_not_take_closes_unimplemented() {
     let mut c = open_with(&[(&b"grpc-encoding"[..], &b"gzip"[..])]);
@@ -218,7 +215,7 @@ fn a_compression_the_door_does_not_take_closes_unimplemented() {
 
 /// THE FIRST `grpc-encoding` FIELD IS THE CALL'S: a repeat is not read. A call that states
 /// `identity` and then `gzip` is served; one that states `gzip` and then `identity` is refused
-/// `UNIMPLEMENTED`. RED before the fix: the last field won, so each call was read the other way.
+/// `UNIMPLEMENTED`.
 #[test]
 fn the_first_grpc_encoding_field_is_the_calls() {
     let mut c = open_with(&[
@@ -237,10 +234,9 @@ fn the_first_grpc_encoding_field_is_the_calls() {
     assert_eq!(wire(&mut c), UNIMPLEMENTED_GZIP);
 }
 
-/// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN (Q128 grpc L1, ruling (a)): when the host states
+/// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN: when the host states
 /// `RefuseIn::head_sent`, the refusal is the call's closing lines only, the trailers after the
-/// head it answered. RED before the fix: the framer judged by its own state alone and wrote a
-/// second `:status: 200` head.
+/// head it answered.
 #[test]
 fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
     let mut c = grpc();

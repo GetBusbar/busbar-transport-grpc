@@ -131,8 +131,6 @@ fn a_non_zero_status_from_tonic_fails_the_stream_with_its_message() {
     host.close();
 }
 
-// ── TLS, ALPN h2 ─────────────────────────────────────────────────────────────────────────────────
-
 struct Tls {
     addr: std::net::SocketAddr,
     roots: rustls::RootCertStore,
@@ -232,8 +230,6 @@ fn a_connection_that_agreed_another_protocol_is_refused_at_begin() {
     assert_eq!(r, Outcome::Refused);
     host.close();
 }
-
-// ── accepted: tonic's client calls this door ─────────────────────────────────────────────────────
 
 /// A listener the test holds, and tonic's (lazy) `Channel` to it: the channel connects on its
 /// first call.

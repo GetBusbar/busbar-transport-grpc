@@ -298,8 +298,7 @@ fn locate_offers_h2_alone_on_a_secured_target_and_nothing_in_the_clear() {
 /// A TLS gRPC LISTENER OFFERS `h2`: asked for an ACCEPTING listener's offer (`LocateIn::accept`,
 /// the empty target the connector passes), `locate` answers `h2` alone, the protocol every gRPC
 /// client negotiates over TLS (tonic's TLS connector and grpc-go refuse a connection without it),
-/// and states no authority, name or head line. Both images. RED before the fix: the empty target
-/// was read as a malformed URL, `locate` answered FAILED, and the listener made no offer.
+/// and states no authority, name or head line. Both images.
 #[test]
 fn a_listener_is_offered_h2_alone() {
     let (d, _lib) = dropped();
@@ -316,10 +315,9 @@ fn a_listener_is_offered_h2_alone() {
 }
 
 /// THE FRAMER'S OWN HEAD LINES ARE STATED AT `locate`, so the host puts them in the head BEFORE the
-/// auth signs it (THE DESIGN §6, step 5): the content type and `te: trailers`, in the order the
+/// auth signs it: the content type and `te: trailers`, in the order the
 /// dial writes them, and the dial then sends them as signed. No `grpc-timeout`, whatever timeout
-/// the settings state: none goes upstream, as predev's hop sent none. Both images. RED before the
-/// fix: `locate` stated a `grpc-timeout` line.
+/// the settings state: none goes upstream. Both images.
 #[test]
 fn locate_states_the_framers_own_head_lines_before_the_auth_signs() {
     let (d, _lib) = dropped();
@@ -340,8 +338,6 @@ fn locate_states_the_framers_own_head_lines_before_the_auth_signs() {
         host.close();
     }
 }
-
-// ── ONE STREAM (`SIDE_ACCEPT_STREAM`, ARCHITECT 4l) ──────────────────────────────────────────────
 
 /// The unit's message on the close: every byte tonic 0.14 percent-encodes, and some it does not.
 const MESSAGE: &str = "not here: \u{2713} 100% {x} <y> `z` ?q #h \"s\" ok-_.~";
@@ -515,8 +511,7 @@ fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
 
 /// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` with the
 /// encodings it takes (gRPC's compression rules, `compression.md`), whatever refusal the host closes
-/// the failed stream with. Both images. RED before the fix: `grpc-encoding` was never read, the
-/// compressed message failed `INTERNAL`, and the close was the refusal's neutral status mapped.
+/// the failed stream with. Both images.
 #[test]
 fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
     let (d, _lib) = dropped();
@@ -540,11 +535,10 @@ fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
     }
 }
 
-/// AN OVERSIZE MESSAGE IS REFUSED AT THE CONFIGURED LIMIT, IN THIS FRAMER'S WORDS (coordinator
-/// ruling (b)): `limits.request_body_max_bytes` bounds a message on the accepting side, and the close
+/// AN OVERSIZE MESSAGE IS REFUSED AT THE CONFIGURED LIMIT, IN THIS FRAMER'S WORDS:
+/// `limits.request_body_max_bytes` bounds a message on the accepting side, and the close
 /// is `RESOURCE_EXHAUSTED` with text that prints the configured number, whatever refusal the host then
-/// closes the failed stream with. A non-default limit, both images. RED before the fix: predev's
-/// server's words.
+/// closes the failed stream with. A non-default limit, both images.
 #[test]
 fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words() {
     let (d, _lib) = dropped();
@@ -567,10 +561,9 @@ fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words(
     }
 }
 
-/// THE SIBLING TRANSPORTS' WORDS, both images. RED before the SDK pieces: `validate` refused a blob
-/// that is no JSON object as `settings: not JSON` (and read an array as `{}`), read past a key it
-/// does not read, and every op of the carrier role (and `detach`, `adopt`) answered a bare REFUSED.
-/// Each is now the SDK's text (`settings_reading`, `not_served!`), as tcp, stdio and http answer.
+/// THE SDK'S WORDS, both images: `validate` refuses a blob that is no JSON object and a key this
+/// transport does not read (`settings_reading`), and every op of the carrier role (and `detach`,
+/// `adopt`) is REFUSED naming the op (`not_served!`), as tcp, stdio and http answer.
 #[test]
 fn settings_and_the_unserved_ops_answer_the_sdks_words() {
     use busbar_contract::abi::mechanism::call::OutHead;

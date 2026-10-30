@@ -166,25 +166,15 @@ impl Life for Instance {
 
 busbar_contract::not_served! {
     state: State, role: "grpc framer";
-    /// `listen`.
     Listen(ListenIn => ListenOut) "listen";
-    /// `accept`.
     Accept(AcceptIn => AcceptOut) "accept";
-    /// `dial`.
     Dial(DialIn => ConnOut) "dial";
-    /// `read`.
     Read(ReadIn => IoOut) "read";
-    /// `write`.
     Write(WriteIn => IoOut) "write";
-    /// `flush`.
     Flush(ConnIn => OutHead) "flush";
-    /// `shut`.
     Shut(ShutIn => OutHead) "shut";
-    /// `arrival`.
     Arrival(ArrivalIn => ArrivalOut) "arrival";
-    /// `detach`.
     Detach(FramingIn => FramerOut) "detach";
-    /// `adopt`.
     Adopt(AdoptIn => FramerOut) "adopt";
 }
 
