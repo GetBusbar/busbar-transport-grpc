@@ -1331,3 +1331,92 @@ fn a_dialled_frame_running_past_its_content_length_fails_in_words() {
         b"more message bytes than the head's content-length"
     );
 }
+
+/// HPACK, literal without indexing, a new name: `name: value`.
+fn lit_field(block: &mut Vec<u8>, name: &str, value: &str) {
+    block.push(0x00);
+    block.push(u8::try_from(name.len()).expect("short"));
+    block.extend_from_slice(name.as_bytes());
+    block.push(u8::try_from(value.len()).expect("short"));
+    block.extend_from_slice(value.as_bytes());
+}
+
+/// A dialled call on stream 1 whose far end answers, by hand, one HEADERS frame ending the stream:
+/// `:status` `status`, then `fields`. The pieces the dial hands up.
+fn answered_by_hand(status: &str, fields: &[(&str, &str)]) -> Vec<Piece> {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, now)
+        .expect("emit");
+    let mut got: Vec<Piece> = Vec::new();
+    let turn = |d: &mut Conn, got: &mut Vec<Piece>| {
+        for _ in 0..20 {
+            d.drive(now);
+            let _ = d.take_wire(usize::MAX);
+            got.extend(d.pieces().drain(..));
+        }
+    };
+    turn(&mut d, &mut got);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut got);
+    let mut block = vec![0x08, u8::try_from(status.len()).expect("short")];
+    block.extend_from_slice(status.as_bytes());
+    for (n, v) in fields {
+        lit_field(&mut block, n, v);
+    }
+    d.ingest(&h2(1, 0x05, 1, &block), false);
+    turn(&mut d, &mut got);
+    got
+}
+
+/// A `grpc-status` THE ANSWER STATES IS USED, whatever its HTTP status (`http-grpc-status-mapping.md`:
+/// the table is only for an answer with no `grpc-status`; one that was provided must be used). A
+/// gateway's 403 carrying `grpc-status: 5` and its message is `NOT_FOUND` with that message, and the
+/// breaker reads the gRPC status (the caller's), never the 403's hard fault. RED: PERMISSION_DENIED,
+/// `HTTP status 403`, hard.
+#[test]
+fn a_non_200_answer_stating_grpc_status_is_read_by_its_grpc_status() {
+    let got = answered_by_hand(
+        "403",
+        &[
+            ("content-type", "application/grpc"),
+            ("grpc-status", "5"),
+            ("grpc-message", "no%20such%20key"),
+        ],
+    );
+    let t = terminal(&got, 1).expect("the answer's status");
+    assert_eq!((t.status, t.fields), (Some(5), true), "{got:?}");
+    assert_eq!(t.fault, None, "the gRPC status's own reading");
+    let end = last(&got, 1).expect("terminal");
+    assert_eq!((end.failed, end.bytes.as_ref()), (true, &b"no such key"[..]));
+}
+
+/// The same for a 200 whose content type is not gRPC's (or absent): the `grpc-status` it states is
+/// its status. RED: UNKNOWN, `the answer is not gRPC`.
+#[test]
+fn a_200_answer_without_a_grpc_content_type_stating_grpc_status_is_read_by_it() {
+    for ct in [Some("text/plain"), None] {
+        let mut fields = vec![("grpc-status", "14"), ("grpc-message", "draining")];
+        if let Some(ct) = ct {
+            fields.insert(0, ("content-type", ct));
+        }
+        let got = answered_by_hand("200", &fields);
+        let t = terminal(&got, 1).expect("the answer's status");
+        assert_eq!(t.status, Some(msg::UNAVAILABLE), "{ct:?}: {got:?}");
+        let end = last(&got, 1).expect("terminal");
+        assert_eq!(end.bytes.as_ref(), b"draining", "{ct:?}");
+    }
+}
+
+/// A 200 answer with no gRPC content type and no `grpc-status` is no gRPC answer: `UNKNOWN`, in this
+/// framer's words, never its body read as length-prefixed messages.
+#[test]
+fn a_200_answer_that_is_not_grpc_fails_unknown() {
+    let got = answered_by_hand("200", &[("content-type", "text/html")]);
+    let t = terminal(&got, 1).expect("the stream fails");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.status, Some(msg::UNKNOWN));
+    assert_eq!(t.bytes.as_ref(), b"the answer is not gRPC");
+}
