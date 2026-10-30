@@ -1171,6 +1171,10 @@ impl AStream {
         }
         self.reply.chan.end();
         self.reply_over = true;
+        // The call is over: no more of its request is read. Letting go of the body has the
+        // connection stop the far end's upload once the answer is out (RST_STREAM `NO_ERROR`,
+        // RFC 9113 §8.1), and nothing more is queued for the host.
+        self.body = None;
     }
 
     fn fail_reply(&mut self, code: u16, why: &[u8]) {
