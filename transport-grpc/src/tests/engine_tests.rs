@@ -628,8 +628,9 @@ fn cancel(a: &mut Conn) -> Vec<Piece> {
 
 /// A CLIENT'S CANCEL AFTER ITS HALF-CLOSE IS TOLD TO THE HOST. The client sent its last message,
 /// the host is streaming the answer, and the client resets the call: the host hears it as the
-/// stream failing `CANCELLED`, the call is let go of, and an answer emitted after it queues
-/// nothing.
+/// stream failing `CANCELLED`, the call is let go of, and an answer emitted after it (or a refusal
+/// racing the cancel) is dropped, as a STREAM ENDS ONCE says: the op is answered, nothing is queued.
+/// RED: the late emit and refusal answered FAILED `no such stream`.
 #[test]
 fn a_cancel_after_the_half_close_fails_the_stream_cancelled() {
     let mut a = half_closed();
@@ -642,11 +643,23 @@ fn a_cancel_after_the_half_close_fails_the_stream_cancelled() {
     assert!(t.failed, "the stream failed: {t:?}");
     assert_eq!(t.status, Some(msg::CANCELLED));
     assert_eq!(held(&a), 0, "the call is let go of");
-    assert!(
-        a.emit(1, &msg::frame(b"two"), false, 0, 5 * SEC).is_err(),
-        "nothing more is taken for the cancelled call"
+    assert_eq!(
+        a.emit(1, &msg::frame(b"two"), false, 0, 5 * SEC),
+        Ok(()),
+        "a late emit is dropped"
     );
+    assert_eq!(
+        a.end_call(1, b"grpc-status: 0\r\n", 0),
+        Ok(()),
+        "a late refusal is dropped"
+    );
+    a.drive(5 * SEC);
     assert!(a.pieces().is_empty(), "one terminal piece, once");
+    assert_eq!(held(&a), 0, "nothing reopened");
+    assert!(
+        a.emit(9, b"\r\n", false, 0, 5 * SEC).is_err(),
+        "a stream that never was is still no stream"
+    );
 }
 
 /// The same cancel, before the host stated the answer's head: the connection drops the call's
