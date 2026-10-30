@@ -519,7 +519,15 @@ impl Conn {
                         Ok(Some((head, took))) => {
                             let mut rest = std::mem::take(&mut s.head_buf);
                             rest.drain(..took);
-                            s.send_head(&head, None);
+                            if let Err(why) = s.send_head(&head, None) {
+                                // Failed as a malformed head block is, above.
+                                s.fail_reply(msg::INTERNAL, why.as_bytes());
+                                self.out.push_back(Piece {
+                                    status: Some(msg::INTERNAL),
+                                    ..Piece::failure(stream, &why)
+                                });
+                                return Ok(());
+                            }
                             if !rest.is_empty() {
                                 s.reply.chan.push(Frame::data(Bytes::from(rest)));
                             }
@@ -570,7 +578,8 @@ impl Conn {
     ///
     /// # Errors
     ///
-    /// This is a dialled connection, or no such stream.
+    /// This is a dialled connection, no such stream, or a trailer field the wire cannot carry (the
+    /// call is then left open for the host's fallback close).
     pub fn end_call(&mut self, stream: u64, trailers: &[u8], status: u32) -> Result<(), Failure> {
         let Side::Accept(a) = &mut self.side else {
             return Err(Failure("a dialled call is not answered".into()));
@@ -583,7 +592,9 @@ impl Conn {
         }
         let block = msg::terminate_block(trailers);
         match msg::read_head(&block, usize::MAX) {
-            Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => s.finish(&h),
+            // A trailer the wire cannot carry fails the refusal, and the call stays open for the
+            // host's fallback close.
+            Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => s.finish(&h).map_err(Failure)?,
             _ if status != 0 => s.fail_reply(
                 msg::status_of_refusal(status),
                 msg::refusal_message(status).as_bytes(),
@@ -1192,22 +1203,33 @@ struct AStream {
 }
 
 impl AStream {
-    fn send_head(&mut self, head: &Head, trailers: Option<&Head>) {
+    /// Send the answer's head: `head`'s fields, and on a trailers-only answer `trailers`'.
+    ///
+    /// # Errors
+    ///
+    /// A field the wire cannot carry ([`answer_fields`]); nothing is sent.
+    fn send_head(&mut self, head: &Head, trailers: Option<&Head>) -> Result<(), String> {
         let mut fields = HeaderMap::new();
         fields.insert(http::header::CONTENT_TYPE, self.content_type.clone());
-        answer_fields(std::iter::once(head).chain(trailers), &mut fields);
+        answer_fields(std::iter::once(head).chain(trailers), &mut fields)?;
         self.head_sent = true;
         self.reply.head(StatusCode::OK, fields);
+        Ok(())
     }
 
-    fn finish(&mut self, trailers: &Head) {
+    /// End the call with `trailers` (trailers-only before any head).
+    ///
+    /// # Errors
+    ///
+    /// A field the wire cannot carry ([`answer_fields`]); the call is left as it was.
+    fn finish(&mut self, trailers: &Head) -> Result<(), String> {
         if self.head_sent {
             let mut map = HeaderMap::new();
-            answer_fields([trailers], &mut map);
+            answer_fields([trailers], &mut map)?;
             self.reply.chan.push(Frame::trailers(map));
         } else {
             // Trailers-only: one HEADERS frame carrying the status, and END_STREAM.
-            self.send_head(&Head::default(), Some(trailers));
+            self.send_head(&Head::default(), Some(trailers))?;
         }
         self.reply.chan.end();
         self.reply_over = true;
@@ -1215,10 +1237,13 @@ impl AStream {
         // connection stop the far end's upload once the answer is out (RST_STREAM `NO_ERROR`,
         // RFC 9113 §8.1), and nothing more is queued for the host.
         self.body = None;
+        Ok(())
     }
 
     fn fail_reply(&mut self, code: u16, why: &[u8]) {
-        self.finish(&Head {
+        // This framer's own fields: a status's digits and a percent-encoded message, each always a
+        // field value.
+        let done = self.finish(&Head {
             fields: vec![
                 (msg::GRPC_STATUS.into(), code.to_string().into_bytes()),
                 (
@@ -1228,6 +1253,7 @@ impl AStream {
             ],
             content_length: None,
         });
+        debug_assert!(done.is_ok(), "{done:?}");
     }
 }
 
@@ -1237,20 +1263,28 @@ const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
 /// The answer fields `blocks` state, appended to `map` in order: a head's or the trailers' alike,
 /// those this layer owns ([`RESERVED_ON_ANSWER`]) and the connection-specific ones HTTP/2 forbids in
 /// every field block (RFC 9113 §8.2.2) dropped.
-fn answer_fields<'h>(blocks: impl IntoIterator<Item = &'h Head>, map: &mut HeaderMap) {
+///
+/// # Errors
+///
+/// A field the wire cannot carry, named in the dial side's words; `map` is then left as it was
+/// found wanting, and the caller must not send it.
+fn answer_fields<'h>(
+    blocks: impl IntoIterator<Item = &'h Head>,
+    map: &mut HeaderMap,
+) -> Result<(), String> {
     for h in blocks {
         for (name, value) in &h.fields {
             if RESERVED_ON_ANSWER.contains(&name.as_str()) || hop_by_hop(name, []) {
                 continue;
             }
-            if let (Ok(n), Ok(v)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_bytes(value),
-            ) {
-                map.append(n, v);
-            }
+            let n = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| format!("`{name}` is not a field name"))?;
+            let v = HeaderValue::from_bytes(value)
+                .map_err(|_| format!("`{name}`'s value is not a field value"))?;
+            map.append(n, v);
         }
     }
+    Ok(())
 }
 
 impl Accept {
