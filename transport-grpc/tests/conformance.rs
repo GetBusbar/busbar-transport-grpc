@@ -640,7 +640,8 @@ fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
     use busbar_contract::abi::transport::{PIECE_WRITABLE, YIELD_STREAM_FULL};
     let (d, _lib) = dropped();
     for ops in [linked(), d] {
-        let mut host = Host::open(ops, "{}", Caps(4096, 4096, 8));
+        let settings = r#"{"limits.request_body_max_bytes":65536}"#;
+        let mut host = Host::open(ops, settings, Caps(4096, 4096, 8));
         let fields = [("content-type", "application/grpc")];
         assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
         let m = vec![7u8; 60_000];
