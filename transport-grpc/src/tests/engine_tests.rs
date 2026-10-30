@@ -1599,3 +1599,38 @@ fn a_trailer_blocks_forbidden_fields_are_filtered_as_a_heads_are() {
     assert_eq!(field(&t.bytes, "x-kept").as_deref(), Some(&b"yes"[..]));
     assert_eq!(field(&t.bytes, "content-type"), None);
 }
+
+/// AN ANSWER HEAD FIELD THE WIRE CANNOT CARRY FAILS THE CALL IN WORDS, as the dial side refuses the
+/// same input: the host hears `INTERNAL` naming the field, and the client is answered. RED: the
+/// field was dropped and the call went on as if the head were whole.
+#[test]
+fn an_answer_head_field_the_wire_cannot_carry_fails_the_call_in_words() {
+    let mut a = half_closed();
+    a.emit(1, b"x bad: v\r\n\r\n", false, 0, 5 * SEC)
+        .expect("taken");
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    let t = terminal(&got, 1).expect("the stream fails");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    assert_eq!(t.bytes.as_ref(), b"`x bad` is not a field name");
+}
+
+/// A TRAILER FIELD THE WIRE CANNOT CARRY FAILS THE REFUSAL IN WORDS and leaves the call open for
+/// the host's fallback close: never trailers that silently lack a field (`grpc-status` among
+/// them). RED: the field was dropped and the refusal answered as done.
+#[test]
+fn a_trailer_field_the_wire_cannot_carry_fails_the_refusal_in_words() {
+    let mut a = half_closed();
+    a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
+    assert_eq!(
+        a.end_call(1, b"grpc-status: 0\r\nx-bad: a\x01b\r\n", 0),
+        Err(super::Failure("`x-bad`'s value is not a field value".into()))
+    );
+    assert_eq!(held(&a), 1, "the call is still open");
+    a.end_call(1, b"", 500).expect("the fallback closes it");
+    assert_eq!(
+        sent_message(&a, 1).as_deref(),
+        Some(&b"busbar%20answered%20HTTP%20500"[..])
+    );
+}
