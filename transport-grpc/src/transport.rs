@@ -1003,7 +1003,7 @@ const STATUS_FIELDS: &[&str] = &[msg::GRPC_STATUS, msg::GRPC_MESSAGE];
 
 /// The stream's end, from the fields that carry `grpc-status` (`status`): the trailers (`fields`
 /// as a field block, its code the status), then the terminal piece — empty on `OK`, else the
-/// failure whose bytes are the decoded `grpc-message`.
+/// failure whose bytes are the decoded `grpc-message`, as printable text ([`msg::message_text`]).
 fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
     let code = status
         .get(msg::GRPC_STATUS)
@@ -1017,7 +1017,7 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
     }
     let text = status
         .get(msg::GRPC_MESSAGE)
-        .map(|v| msg::decode_message(v.as_bytes()))
+        .map(|v| msg::message_text(v.as_bytes()))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| format!("grpc-status {code}").into_bytes());
     [

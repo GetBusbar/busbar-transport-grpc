@@ -1447,7 +1447,7 @@ fn a_far_ends_grpc_message_reaches_the_host_as_printable_bounded_text() {
         String::from_utf8(end.bytes.to_vec()).expect("text"),
         "\\u{1b}[2J\\r\\nfake log line\u{fffd}"
     );
-    let long = vec![b'a'; 20_000];
+    let long = vec![b'a'; 10_000];
     let end = failed_with_message(&long);
     assert_eq!(end.bytes.len(), msg::MESSAGE_TEXT_MAX, "bounded");
 }
