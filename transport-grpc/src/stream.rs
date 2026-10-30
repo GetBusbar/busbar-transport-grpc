@@ -15,7 +15,10 @@
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
 //! * `emit` takes one reply message's payload and yields it length-prefixed, as body bytes; once
-//!   the call is closed an `emit` writes nothing;
+//!   the call is closed an `emit` writes nothing. The reply has a stream's own backpressure: an
+//!   `emit` that leaves its queue at the high-water mark is answered `YIELD_STREAM_FULL`, a
+//!   writable piece follows the drain, and a host that emits past the bound has the reply cut (the
+//!   call then closes `RESOURCE_EXHAUSTED`, whatever close it states);
 //! * `finish` closes the call with the final status the unit stated: `grpc-status`, `grpc-message`
 //!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in tonic
 //!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers;
@@ -31,7 +34,9 @@ use std::collections::VecDeque;
 
 use crate::hyper_io::{Owed, Piece};
 use crate::msg::{self, Messages, PREFIX};
-use crate::transport::Failure;
+use crate::transport::{
+    stream_bound, Failure, OVER_BOUND, STREAM_HIGH_WATER, STREAM_LOW_WATER,
+};
 
 /// The one stream a `SIDE_ACCEPT_STREAM` framing carries.
 pub const STREAM: u64 = 1;
@@ -39,6 +44,8 @@ pub const STREAM: u64 = 1;
 /// One call's framing.
 pub struct StreamCall {
     messages: Messages,
+    /// The largest message payload carried, either way.
+    max: usize,
     writing: Vec<u8>,
     wire: Vec<u8>,
     out: VecDeque<Piece>,
@@ -51,6 +58,8 @@ pub struct StreamCall {
     oversize: Option<msg::Bad>,
     /// The reply was cut ([`StreamCall::cut_reply`]), for these words.
     cut: Option<String>,
+    /// An `emit` was answered `YIELD_STREAM_FULL`, and no writable piece has followed yet.
+    announced: bool,
 }
 
 impl StreamCall {
@@ -83,6 +92,7 @@ impl StreamCall {
         }
         Ok(Self {
             messages: Messages::new(max),
+            max,
             writing: Vec::new(),
             wire: Vec::new(),
             out: VecDeque::new(),
@@ -90,6 +100,7 @@ impl StreamCall {
             closed: false,
             oversize: refused,
             cut: None,
+            announced: false,
         })
     }
 
@@ -123,10 +134,14 @@ impl StreamCall {
     ///
     /// # Errors
     ///
-    /// The reply is cut here: its message is longer than a length prefix states.
+    /// The reply is cut here: its queue went past its bound (a host that kept emitting to a far
+    /// end not reading, [`stream_bound`]), or its message is longer than a length prefix states.
     pub fn emit(&mut self, bytes: &[u8], ends: bool) -> Result<(), Failure> {
         if self.closed || self.cut.is_some() {
             return Ok(());
+        }
+        if self.queued().saturating_add(bytes.len()) > stream_bound(self.max) {
+            return Err(self.cut_reply(OVER_BOUND.into()));
         }
         if !ends {
             self.writing.extend_from_slice(bytes);
@@ -143,6 +158,21 @@ impl StreamCall {
         self.wire.extend_from_slice(bytes);
         self.answered = true;
         Ok(())
+    }
+
+    /// The reply bytes queued and not yet taken by the host: the wire, and the message being
+    /// written.
+    fn queued(&self) -> usize {
+        self.wire.len().saturating_add(self.writing.len())
+    }
+
+    /// Whether the reply's queue stands at its high-water mark after an `emit`: the answer is then
+    /// `YIELD_STREAM_FULL`, and the stream hands a writable piece once the host has taken it down
+    /// to its low-water mark (the transport ABI's "A STREAM'S OWN BACKPRESSURE").
+    pub fn announce_full(&mut self) -> bool {
+        let full = !self.closed && self.cut.is_none() && self.queued() >= STREAM_HIGH_WATER;
+        self.announced |= full;
+        full
     }
 
     /// Cut the reply for `why`: the message being written is dropped, no reply byte more is taken,
@@ -233,11 +263,18 @@ fn cut_lines(why: &str) -> Result<Vec<u8>, Failure> {
 
 impl Owed for StreamCall {
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
-        if cap >= self.wire.len() {
-            return std::mem::take(&mut self.wire);
+        let taken = if cap >= self.wire.len() {
+            std::mem::take(&mut self.wire)
+        } else {
+            let rest = self.wire.split_off(cap);
+            std::mem::replace(&mut self.wire, rest)
+        };
+        // Taken ahead of the pieces (`fill`), so the writable piece goes out in this same answer.
+        if self.announced && !self.closed && self.queued() <= STREAM_LOW_WATER {
+            self.announced = false;
+            self.out.push_back(Piece::writable(STREAM));
         }
-        let rest = self.wire.split_off(cap);
-        std::mem::replace(&mut self.wire, rest)
+        taken
     }
     fn wire_pending(&self) -> bool {
         !self.wire.is_empty()

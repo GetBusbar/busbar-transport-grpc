@@ -356,11 +356,16 @@ slot!(
     Emit, EmitIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
         let (now, deadline, end) = (i.sink().now_monotonic_ns(), i.deadline_ns(), i.end_of_frame() != 0);
+        // A STREAM'S OWN BACKPRESSURE, on one stream as on a connection's: an emit that leaves its
+        // stream's queue at the high-water mark is answered `YIELD_STREAM_FULL` (after the fill, as
+        // the SDK states).
         if let Some(call) = one_stream(&p, i.framing()) {
-            return on_stream(&call, i.sink(), &mut o, |c| c.emit(bytes, end));
+            let outcome = on_stream(&call, i.sink(), &mut o, |c| c.emit(bytes, end));
+            if matches!(outcome, Outcome::Ready) && call.lock().expect("stream").announce_full() {
+                mark_stream_full(&mut o);
+            }
+            return outcome;
         }
-        // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
-        // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
         let stream = i.stream();
         with_then(
             &p,
