@@ -380,6 +380,30 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A far end's `grpc-message` value as the text the host is handed for the call's failure:
+/// percent-decoded ([`decode_message`]), read as UTF-8 with every invalid sequence replaced (U+FFFD),
+/// every control character escaped as Rust writes it (`\n`, `\u{1b}`), so no terminal escape or
+/// forged log line passes through, and cut to at most [`MESSAGE_TEXT_MAX`] bytes on a character's
+/// edge.
+#[must_use]
+pub fn message_text(v: &[u8]) -> Vec<u8> {
+    let decoded = decode_message(v);
+    let mut out = String::with_capacity(decoded.len().min(MESSAGE_TEXT_MAX));
+    for c in String::from_utf8_lossy(&decoded).chars() {
+        let before = out.len();
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+        if out.len() > MESSAGE_TEXT_MAX {
+            out.truncate(before);
+            break;
+        }
+    }
+    out.into_bytes()
+}
+
 /// `text` as a `grpc-message` value, for every `grpc-message` this door writes, on either accept
 /// side. The encoding is tonic 0.14's `Status`: every control byte, every byte past ASCII, and each of
 /// `` "#%<>`?{}`` and the space percent-encoded, upper-case hex; every other byte as it is.
