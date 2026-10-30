@@ -44,8 +44,9 @@
 //!
 //! A STREAM ENDS ONCE. A far end that resets an accepted call (before or after its last message,
 //! before or after the host's answer began) fails the stream `CANCELLED`, and nothing more is
-//! queued for it. A dialled stream that ended is remembered: an `emit` that arrives after its
-//! terminal piece is dropped, never a second call on the same stream.
+//! queued for it. A stream that ended, dialled or accepted, is remembered: an `emit` (or, accepted,
+//! a refusal) that arrives after its terminal piece is dropped, never a second call on the same
+//! stream and never a failure of its own.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -398,6 +399,7 @@ impl Conn {
             side: Side::Accept(Accept {
                 arrivals,
                 calls: Vec::new(),
+                ended: Ended::default(),
             }),
         }
     }
@@ -474,7 +476,7 @@ impl Conn {
             }
             Side::Accept(a) => {
                 let Some((_, s)) = a.calls.iter_mut().find(|(s, _)| *s == stream) else {
-                    return Err(Failure(format!("no such stream: {stream}")));
+                    return a.late(stream);
                 };
                 if bytes.is_empty() || s.reply_over {
                     return Ok(());
@@ -553,7 +555,7 @@ impl Conn {
             return Err(Failure("a dialled call is not answered".into()));
         };
         let Some((_, s)) = a.calls.iter_mut().find(|(s, _)| *s == stream) else {
-            return Err(Failure(format!("no such stream: {stream}")));
+            return a.late(stream);
         };
         if s.reply_over {
             return Ok(());
@@ -1115,6 +1117,9 @@ impl Drop for ReplyFut {
 struct Accept {
     arrivals: Arc<Mutex<Arrivals>>,
     calls: Vec<(u64, AStream)>,
+    /// Calls that have ended and been let go of. An `emit` or a refusal on one is late (it raced
+    /// the far end's cancel, or the call's own end) and is dropped, as on a dialled stream.
+    ended: Ended,
 }
 
 struct AStream {
@@ -1186,6 +1191,16 @@ impl AStream {
 const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
 
 impl Accept {
+    /// An op on `stream`, which this connection does not hold: dropped when the call ended (A
+    /// STREAM ENDS ONCE), else no such stream.
+    fn late(&self, stream: u64) -> Result<(), Failure> {
+        if self.ended.contains(stream) {
+            Ok(())
+        } else {
+            Err(Failure(format!("no such stream: {stream}")))
+        }
+    }
+
     fn step(&mut self, out: &mut VecDeque<Piece>, max: usize, cx: &mut Context<'_>) {
         let new: Vec<_> = self
             .arrivals
@@ -1326,8 +1341,14 @@ impl Accept {
                 out.push_back(Piece::writable(*id));
             }
         }
-        self.calls
-            .retain(|(_, s)| !(s.reply_over && s.body.is_none() && s.reply.chan.ended()));
+        let ended = &mut self.ended;
+        self.calls.retain(|(id, s)| {
+            let over = s.reply_over && s.body.is_none() && s.reply.chan.ended();
+            if over {
+                ended.insert(*id);
+            }
+            !over
+        });
     }
 }
 
