@@ -20,8 +20,9 @@
 //! frame: a unary server waits for exactly that. The answer comes back as frames: the HEAD, always first, a field block with no status code; one frame per message; the
 //! TRAILERS, a field block carrying `grpc-status` as its code; then the terminal piece, empty when
 //! the status is `OK`, else a failure whose bytes are the decoded `grpc-message`. A trailers-only
-//! answer (status in the head) yields the same three. An answer that is not gRPC fails the stream
-//! with its HTTP status mapped the way gRPC maps it. A stream reset or a connection gone away
+//! answer (status in the head) yields the same three. An answer that states a `grpc-status` is read
+//! by it, whatever its HTTP status or content type; one that states none and is not gRPC fails
+//! the stream with its HTTP status mapped the way gRPC maps it. A stream reset or a connection gone away
 //! (either end's) fails with the status its HTTP/2 error code stands for, before or after the
 //! answer's head alike ([`msg::status_of_reset`]); a connection lost before any status is
 //! `UNAVAILABLE`; an answer that ends with no trailers is `INTERNAL`. At the deadline the stream is
@@ -853,7 +854,11 @@ fn advance(
                         let (code, why) = wire_failure(&e);
                         (why, code, false)
                     })?;
-                    if r.status() != StatusCode::OK {
+                    // A `grpc-status` the answer states is its status, whatever its HTTP status
+                    // or content type (`http-grpc-status-mapping.md`: "If grpc-status was
+                    // provided, it must be used"); the HTTP table reads only an answer without one.
+                    let stated = r.headers().contains_key(msg::GRPC_STATUS);
+                    if !stated && r.status() != StatusCode::OK {
                         // A BARE HTTP STATUS IS AN ANSWER: a member (or a proxy or auth wall in
                         // front of it) answered the call without gRPC. Its status is the gRPC
                         // status that HTTP status stands for (`http-grpc-status-mapping.md`),
@@ -887,15 +892,16 @@ fn advance(
                         return Ok(());
                     }
                     let ct = r.headers().get(http::header::CONTENT_TYPE);
-                    if !ct.is_some_and(|v| msg::is_grpc_content_type(v.as_bytes())) {
+                    if !stated && !ct.is_some_and(|v| msg::is_grpc_content_type(v.as_bytes())) {
                         return Err(("the answer is not gRPC".into(), msg::UNKNOWN, false));
                     }
                     out.push_back(Piece::fields(
                         id,
                         Bytes::from(field_block(r.headers(), STATUS_FIELDS)),
                     ));
-                    if r.headers().contains_key(msg::GRPC_STATUS) {
-                        // Trailers-only: the status is in the head, and the body is empty.
+                    if stated {
+                        // Trailers-only: the status is in the head, and the body is empty. Its
+                        // fault is the gRPC status's own reading, as any trailers' is.
                         out.extend(trailers(id, &HeaderMap::new(), r.headers()));
                         s.stage = DStage::Done;
                         return Ok(());
