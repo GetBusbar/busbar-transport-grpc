@@ -611,7 +611,8 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
             validate(ops, r#"{"limits.upstream_request_timeout_secs":"5"}"#),
             (
                 Outcome::Failed,
-                "settings: limits.upstream_request_timeout_secs must be a count of seconds".to_owned()
+                "settings: limits.upstream_request_timeout_secs must be a count of seconds"
+                    .to_owned()
             )
         );
         let host = Host::open(ops, "{}", ROOMY);
@@ -666,8 +667,15 @@ fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
             assert_eq!(r, Outcome::Ready);
             flags & YIELD_STREAM_FULL != 0
         });
-        assert!(full.is_some(), "the reply's queue reached its high-water mark");
-        assert_eq!(host.emit_drain(1), Outcome::Ready, "the far end reads again");
+        assert!(
+            full.is_some(),
+            "the reply's queue reached its high-water mark"
+        );
+        assert_eq!(
+            host.emit_drain(1),
+            Outcome::Ready,
+            "the far end reads again"
+        );
         let writable: Vec<&Got> = host
             .got
             .iter()

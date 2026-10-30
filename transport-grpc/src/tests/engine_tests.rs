@@ -1318,7 +1318,9 @@ fn a_dialled_frame_ending_short_of_its_content_length_fails_in_words() {
     c.extend_from_slice(&[0u8; 12]);
     p.d.emit(1, &c, true, 0, p.now).expect("emit");
     p.settle();
-    let t = terminal(&p.got_d, 1).cloned().expect("the stream fails at once");
+    let t = terminal(&p.got_d, 1)
+        .cloned()
+        .expect("the stream fails at once");
     assert!(t.failed, "{t:?}");
     assert_eq!(t.status, Some(msg::INTERNAL));
     assert_eq!(
@@ -1403,7 +1405,10 @@ fn a_non_200_answer_stating_grpc_status_is_read_by_its_grpc_status() {
     assert_eq!((t.status, t.fields), (Some(5), true), "{got:?}");
     assert_eq!(t.fault, None, "the gRPC status's own reading");
     let end = last(&got, 1).expect("terminal");
-    assert_eq!((end.failed, end.bytes.as_ref()), (true, &b"no such key"[..]));
+    assert_eq!(
+        (end.failed, end.bytes.as_ref()),
+        (true, &b"no such key"[..])
+    );
 }
 
 /// The same for a 200 whose content type is not gRPC's (or absent): the `grpc-status` it states is
@@ -1595,7 +1600,11 @@ fn a_trailer_blocks_forbidden_fields_are_filtered_as_a_heads_are() {
     .expect("end");
     p.settle();
     let t = terminal(&p.got_d, 1).cloned().expect("the trailers");
-    assert_eq!((t.status, t.fields, t.failed), (Some(0), true, false), "{t:?}");
+    assert_eq!(
+        (t.status, t.fields, t.failed),
+        (Some(0), true, false),
+        "{t:?}"
+    );
     assert_eq!(field(&t.bytes, "x-kept").as_deref(), Some(&b"yes"[..]));
     assert_eq!(field(&t.bytes, "content-type"), None);
 }
@@ -1625,7 +1634,9 @@ fn a_trailer_field_the_wire_cannot_carry_fails_the_refusal_in_words() {
     a.emit(1, b"\r\n", false, 0, 5 * SEC).expect("answer head");
     assert_eq!(
         a.end_call(1, b"grpc-status: 0\r\nx-bad: a\x01b\r\n", 0),
-        Err(super::Failure("`x-bad`'s value is not a field value".into()))
+        Err(super::Failure(
+            "`x-bad`'s value is not a field value".into()
+        ))
     );
     assert_eq!(held(&a), 1, "the call is still open");
     a.end_call(1, b"", 500).expect("the fallback closes it");
@@ -1745,7 +1756,11 @@ fn a_dialled_call_stating_no_deadline_fails_at_the_configured_timeout() {
     p.d.emit(1, &call("/pkg.Svc/Hang", &[], &[b"q"]), true, 0, t0)
         .expect("emit");
     p.settle();
-    assert_eq!(p.d.next_deadline(), Some(t0 + limit), "asked back at the timeout");
+    assert_eq!(
+        p.d.next_deadline(),
+        Some(t0 + limit),
+        "asked back at the timeout"
+    );
     p.at(t0 + limit - 1);
     assert!(terminal(&p.got_d, 1).is_none(), "not before the timeout");
     p.at(t0 + limit);

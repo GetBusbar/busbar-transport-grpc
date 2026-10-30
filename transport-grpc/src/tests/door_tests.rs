@@ -88,7 +88,10 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     assert_eq!(p.max_message_bytes, 33_554_432);
     // The fixed connection posture: keep-alive pings every 30 s, failed after 10 s unanswered, and
     // the adaptive window.
-    assert_eq!(p.keep_alive_interval, Some(std::time::Duration::from_secs(30)));
+    assert_eq!(
+        p.keep_alive_interval,
+        Some(std::time::Duration::from_secs(30))
+    );
     assert_eq!(p.keep_alive_timeout, std::time::Duration::from_secs(10));
     assert!(p.adaptive_window);
     let p = read_settings(
@@ -116,9 +119,11 @@ fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
 /// no setting.
 #[test]
 fn an_ill_typed_setting_is_refused_by_its_name() {
-    let why = |json: &[u8]| read_settings(json)
-        .err()
-        .and_then(|r| r.text().map(str::to_owned));
+    let why = |json: &[u8]| {
+        read_settings(json)
+            .err()
+            .and_then(|r| r.text().map(str::to_owned))
+    };
     assert_eq!(
         why(br#"{"limits.upstream_request_timeout_secs":"5"}"#).as_deref(),
         Some("settings: limits.upstream_request_timeout_secs must be a count of seconds")
