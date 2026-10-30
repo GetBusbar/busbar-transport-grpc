@@ -357,10 +357,7 @@ slot!(
         let bytes = i.bytes();
         let (now, deadline, end) = (i.sink().now_monotonic_ns(), i.deadline_ns(), i.end_of_frame() != 0);
         if let Some(call) = one_stream(&p, i.framing()) {
-            return on_stream(&call, i.sink(), &mut o, |c| {
-                c.emit(bytes, end);
-                Ok(())
-            });
+            return on_stream(&call, i.sink(), &mut o, |c| c.emit(bytes, end));
         }
         // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
         // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
@@ -476,6 +473,10 @@ slot!(
             pairs.push((name, f.value().bytes()));
         }
         let body = i.body();
+        let Some(prefix) = msg::prefix(body.len()) else {
+            o.error("encode: the message is longer than a gRPC length prefix states");
+            return Outcome::Failed;
+        };
         let Ok(bytes) = msg::render_head(&pairs, Some(msg::PREFIX + body.len())) else {
             o.error("encode: the envelope cannot be expressed on this wire");
             return Outcome::Failed;
@@ -486,7 +487,7 @@ slot!(
             return Outcome::Failed;
         }
         wire.extend(&bytes);
-        wire.extend(&msg::prefix(body.len()));
+        wire.extend(&prefix);
         wire.extend(body);
         o.set(|x| &x.yielded.wire_len, wire.written() as u64);
         Outcome::Ready
