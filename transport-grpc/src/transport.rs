@@ -715,6 +715,13 @@ impl DialStream {
             }
             self.chan.push(Frame::data(Bytes::from(body)));
         }
+        if end {
+            if let Some(short @ 1..) = self.left {
+                return Err(format!(
+                    "the frame ended {short} bytes short of the head's content-length"
+                ));
+            }
+        }
         if self.left == Some(0) || (end && self.left.is_none()) {
             // The request's last byte: END_STREAM follows it.
             self.chan.end();
