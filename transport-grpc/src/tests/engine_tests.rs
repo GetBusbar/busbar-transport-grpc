@@ -1682,3 +1682,54 @@ fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
     assert_eq!(held(&a), 1, "the call is still open");
     assert_eq!(sent_message(&a, 1), None, "nothing was sent");
 }
+
+/// Every frame type in `wire` (an HTTP/2 frame sequence, no preface), in order.
+fn frame_types(wire: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 9 <= wire.len() {
+        let len =
+            usize::from(wire[i]) << 16 | usize::from(wire[i + 1]) << 8 | usize::from(wire[i + 2]);
+        out.push(wire[i + 3]);
+        i += 9 + len;
+    }
+    out
+}
+
+/// THE DIALLED KEEP-ALIVE IS HONOURED: with a call open on a connection whose far end has gone
+/// silent, a PING goes out at the interval, and when it is not answered within the timeout the
+/// call fails rather than wait out its deadline.
+#[test]
+fn a_dialled_keep_alive_pings_and_fails_a_silent_far_end() {
+    let now = 5 * SEC;
+    let posture = Posture {
+        keep_alive_interval: Some(Duration::from_secs(30)),
+        ..posture()
+    };
+    let mut d = Conn::dial("http://peer.test:50051", posture, now).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, now)
+        .expect("emit");
+    let turn = |d: &mut Conn, at: u64| {
+        let mut wire = Vec::new();
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            d.drive(at);
+            wire.extend(d.take_wire(usize::MAX));
+            got.extend(d.pieces().drain(..));
+        }
+        (wire, got)
+    };
+    turn(&mut d, now);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    let (sent, _) = turn(&mut d, now);
+    assert!(!frame_types(&sent).contains(&6), "no PING yet");
+    let (sent, got) = turn(&mut d, now + 30 * SEC);
+    assert!(frame_types(&sent).contains(&6), "a PING at the interval");
+    assert!(terminal(&got, 1).is_none(), "the call waits on the PING");
+    let (_, got) = turn(&mut d, now + 40 * SEC);
+    let t = terminal(&got, 1).expect("an unanswered PING fails the call");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.status, Some(msg::UNAVAILABLE));
+}

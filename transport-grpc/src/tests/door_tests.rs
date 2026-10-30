@@ -86,6 +86,11 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     let p = read_settings(b"").expect("absent reads as {}");
     assert_eq!(p.timeout.as_secs(), 300);
     assert_eq!(p.max_message_bytes, 33_554_432);
+    // The fixed connection posture: keep-alive pings every 30 s, failed after 10 s unanswered, and
+    // the adaptive window.
+    assert_eq!(p.keep_alive_interval, Some(std::time::Duration::from_secs(30)));
+    assert_eq!(p.keep_alive_timeout, std::time::Duration::from_secs(10));
+    assert!(p.adaptive_window);
     let p = read_settings(
         br#"{"limits.upstream_request_timeout_secs":5,"limits.request_body_max_bytes":1024}"#,
     )
