@@ -1195,19 +1195,7 @@ impl AStream {
     fn send_head(&mut self, head: &Head, trailers: Option<&Head>) {
         let mut fields = HeaderMap::new();
         fields.insert(http::header::CONTENT_TYPE, self.content_type.clone());
-        for h in std::iter::once(head).chain(trailers) {
-            for (name, value) in &h.fields {
-                if RESERVED_ON_ANSWER.contains(&name.as_str()) || hop_by_hop(name, []) {
-                    continue;
-                }
-                if let (Ok(n), Ok(v)) = (
-                    HeaderName::from_bytes(name.as_bytes()),
-                    HeaderValue::from_bytes(value),
-                ) {
-                    fields.append(n, v);
-                }
-            }
-        }
+        answer_fields(std::iter::once(head).chain(trailers), &mut fields);
         self.head_sent = true;
         self.reply.head(StatusCode::OK, fields);
     }
@@ -1215,14 +1203,7 @@ impl AStream {
     fn finish(&mut self, trailers: &Head) {
         if self.head_sent {
             let mut map = HeaderMap::new();
-            for (name, value) in &trailers.fields {
-                if let (Ok(n), Ok(v)) = (
-                    HeaderName::from_bytes(name.as_bytes()),
-                    HeaderValue::from_bytes(value),
-                ) {
-                    map.append(n, v);
-                }
-            }
+            answer_fields([trailers], &mut map);
             self.reply.chan.push(Frame::trailers(map));
         } else {
             // Trailers-only: one HEADERS frame carrying the status, and END_STREAM.
@@ -1252,6 +1233,25 @@ impl AStream {
 
 /// Fields this layer owns on an answer's head, beside the hop-by-hop ones.
 const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
+
+/// The answer fields `blocks` state, appended to `map` in order: a head's or the trailers' alike,
+/// those this layer owns ([`RESERVED_ON_ANSWER`]) and the connection-specific ones HTTP/2 forbids in
+/// every field block (RFC 9113 §8.2.2) dropped.
+fn answer_fields<'h>(blocks: impl IntoIterator<Item = &'h Head>, map: &mut HeaderMap) {
+    for h in blocks {
+        for (name, value) in &h.fields {
+            if RESERVED_ON_ANSWER.contains(&name.as_str()) || hop_by_hop(name, []) {
+                continue;
+            }
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value),
+            ) {
+                map.append(n, v);
+            }
+        }
+    }
+}
 
 impl Accept {
     /// An op on `stream`, which this connection does not hold: dropped when the call ended (A
