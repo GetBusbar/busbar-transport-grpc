@@ -135,13 +135,33 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    // The library the image links, as this run built it: the newest of this crate's rlibs beside
+    // the test binary. An image older than it predates the code under test.
+    let lib_built = std::fs::read_dir(profile.join("deps"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libbusbar_transport_grpc-") && n.ends_with(".rlib"))
+        })
+        .filter_map(|p| modified(&p))
+        .max();
+    // The newest image `cargo test` built, and only if it is as new as the library: a stale one
+    // (`cargo test --tests` builds no example) is never loaded as the door under test.
     let built = || {
         [
             profile.join("examples").join(&file),
             profile.join("examples").join("deps").join(&file),
         ]
         .into_iter()
-        .find(|p| p.exists())
+        .filter_map(|p| Some((modified(&p)?, p)))
+        .max()
+        .filter(|(at, _)| lib_built.is_none_or(|lib| *at >= lib))
+        .map(|(_, p)| p)
     };
     let path = built()
         .or_else(|| image_built_here(profile, &file))
