@@ -157,15 +157,12 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     // The newest image `cargo test` built, and only if it is as new as the library: a stale one
     // (`cargo test -p` this crate builds no plugin) is never loaded as the door under test.
     let built = || {
-        [
-            profile.join(&file),
-            profile.join("deps").join(&file),
-        ]
-        .into_iter()
-        .filter_map(|p| Some((modified(&p)?, p)))
-        .max()
-        .filter(|(at, _)| lib_built.is_none_or(|lib| *at >= lib))
-        .map(|(_, p)| p)
+        [profile.join(&file), profile.join("deps").join(&file)]
+            .into_iter()
+            .filter_map(|p| Some((modified(&p)?, p)))
+            .max()
+            .filter(|(at, _)| lib_built.is_none_or(|lib| *at >= lib))
+            .map(|(_, p)| p)
     };
     let path = built()
         .or_else(|| image_built_here(profile, &file))
