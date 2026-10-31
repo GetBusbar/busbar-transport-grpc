@@ -168,11 +168,12 @@ impl StreamCall {
         self.wire.len().saturating_add(self.writing.len())
     }
 
-    /// Whether the reply's queue stands at its high-water mark after an `emit`: the answer is then
-    /// `YIELD_STREAM_FULL`, and the stream hands a writable piece once the host has taken it down
-    /// to its low-water mark (the transport ABI's "A STREAM'S OWN BACKPRESSURE").
+    /// Whether drainable reply bytes stand at the high-water mark after an `emit`.
+    /// An unfinished message cannot drain until its final fragment arrives, so it must not block
+    /// that fragment with Full. The total queued-byte bound still includes unfinished messages.
+    /// Once Full is announced, draining the wire to low water yields one writable piece.
     pub fn announce_full(&mut self) -> bool {
-        let full = !self.closed && self.cut.is_none() && self.queued() >= STREAM_HIGH_WATER;
+        let full = !self.closed && self.cut.is_none() && self.wire.len() >= STREAM_HIGH_WATER;
         self.announced |= full;
         full
     }
@@ -275,7 +276,7 @@ impl Owed for StreamCall {
         let n = cap.min(self.wire.len());
         let taken = self.wire.drain(..n).collect();
         // Taken ahead of the pieces (`fill`), so the writable piece goes out in this same answer.
-        if self.announced && !self.closed && self.queued() <= STREAM_LOW_WATER {
+        if self.announced && !self.closed && self.wire.len() <= STREAM_LOW_WATER {
             self.announced = false;
             self.out.push_back(Piece::writable(STREAM));
         }
