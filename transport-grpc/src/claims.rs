@@ -48,7 +48,7 @@ pub(crate) const CLAIMS: &[Claim] = &[{
     c.status_namespace = abi_str(status_ns::GRPC);
     // A connection multiplexes calls, each its own stream; the session opens at a call's first
     // message.
-    c.session = 1;
+    c.session = crate::meta::SESSION as u8;
     c.session_bound = 1;
     c.unit0_trigger = UNIT0_FIRST_MESSAGE;
     c.status_at = STATUS_AT_TERMINAL;
