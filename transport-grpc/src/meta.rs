@@ -9,9 +9,9 @@ use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 use busbar_contract::abi::transport::{
-    FaultRow, SettingDecl, StatusRow, TransportTail, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
-    FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
-    STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    FaultRow, SettingDecl, StatusRow, TransportTail, FACT_ACCEPTS, FACT_DIALS, FAULT_CALLER,
+    FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
+    SETTING_COUNT, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
 };
 use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 
@@ -186,5 +186,8 @@ pub(crate) const TAIL: TransportTail = {
     t.role = ROLE_FRAMER;
     t.framing = FRAMING_STREAM;
     t.frame_piece_size = FRAME_PIECE_SIZE;
+    // The ops this door serves: it dials, and it serves the accepted side (`begin` on
+    // `SIDE_ACCEPT` and `SIDE_ACCEPT_STREAM`). It neither detaches nor adopts (`not_served!`).
+    t.facts = FACT_ACCEPTS | FACT_DIALS;
     t
 };

@@ -396,7 +396,13 @@ impl Host {
         i.generation = 2;
         i.settings = Blob::json(settings.as_bytes());
         let mut o: OutHead = z();
-        let r = call(self.ops.head.refresh, self.inst, &mut i, &mut o, life::REFRESH);
+        let r = call(
+            self.ops.head.refresh,
+            self.inst,
+            &mut i,
+            &mut o,
+            life::REFRESH,
+        );
         (r, text(o.error))
     }
 
