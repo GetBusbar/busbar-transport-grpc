@@ -143,6 +143,15 @@ fn script(p: &Plugin<Transport>) -> Script {
     seen
 }
 
+/// Two doors' scripts must be the same lines: `Err` names the first that differs.
+fn same_script(a: &Script, b: &Script) -> Result<(), String> {
+    match a.iter().zip(b).position(|(x, y)| x != y) {
+        None if a.len() == b.len() => Ok(()),
+        None => Err(format!("{} lines vs {}", a.len(), b.len())),
+        Some(i) => Err(format!("line {i}: {:?} vs {:?}", a[i], b[i])),
+    }
+}
+
 #[test]
 fn the_linked_and_the_dropped_in_door_are_one_framer() {
     let d = Dispatcher::new(DispatchConfig::default());
@@ -156,17 +165,23 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
 
     let a = script(&linked);
     let b = script(&dropped);
-    assert_eq!(a, b, "both doors answer alike");
+    assert_eq!(same_script(&a, &b), Ok(()), "both doors answer alike");
     assert_eq!(
         a.last().map(String::as_str),
         Some("begin Ready"),
         "both doors begin the dial"
     );
 
-    // RED: a dropped-in image that answered one line differently is caught.
+    // RED: the comparison the proof above rests on catches a dropped-in image that answered one
+    // line differently, or one line short.
     let mut off = b.clone();
     off[1].push('!');
-    assert_ne!(a, off, "a differing line is caught");
+    assert!(
+        same_script(&a, &off).is_err_and(|e| e.starts_with("line 1:")),
+        "a differing line is caught"
+    );
+    let short: Script = b[..b.len() - 1].to_vec();
+    assert!(same_script(&a, &short).is_err(), "a missing line is caught");
 }
 
 #[test]
@@ -202,4 +217,18 @@ fn the_statement_carries_the_declares_document() {
         busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
         Some(&include_bytes!("../../transport-grpc/declares.json")[..]),
     );
+}
+
+/// THE DOOR OFFERS NO AUTH POINT (ruling R2): it makes no auth call, on either side, so its
+/// Statement states an empty offered-points record and boot refuses a guest line whose auth needs
+/// a point on it, never defaulting to `{Head, HeadBody}`. RED: no record, read as
+/// `{Head, HeadBody}`.
+#[test]
+fn the_statement_offers_no_auth_point() {
+    let row = row();
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    let points =
+        busbar_contract::abi::transport::check::check_offered_points(&read.extensions.bytes)
+            .map(|p| p.0);
+    assert_eq!(points, Ok(0));
 }

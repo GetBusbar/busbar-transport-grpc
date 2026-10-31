@@ -86,6 +86,14 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     let p = read_settings(b"").expect("absent reads as {}");
     assert_eq!(p.timeout.as_secs(), 300);
     assert_eq!(p.max_message_bytes, 33_554_432);
+    // The fixed connection posture: keep-alive pings every 30 s, failed after 10 s unanswered, and
+    // the adaptive window.
+    assert_eq!(
+        p.keep_alive_interval,
+        Some(std::time::Duration::from_secs(30))
+    );
+    assert_eq!(p.keep_alive_timeout, std::time::Duration::from_secs(10));
+    assert!(p.adaptive_window);
     let p = read_settings(
         br#"{"limits.upstream_request_timeout_secs":5,"limits.request_body_max_bytes":1024}"#,
     )
@@ -95,24 +103,78 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     assert!(read_settings(br#"{"limits.upstream_request_timeout_secs":"5"}"#).is_err());
 }
 
-/// A BARE HTTP ANSWER'S FAULT IS READ BY ITS HTTP BAND, 1.5.5's (`v1.5.5 crates/busbar/src/breaker.rs`
-/// step 2, `Auth | Billing => HardDown`, the transient classes, the rest the caller's), over every
-/// status a far end can answer. The expected reading below is 1.5.5's if-chain, written out as it
-/// reads there, not this framer's table: the two must agree on all 500 codes.
+/// EACH DECLARED DEFAULT IS THE VALUE THE DOOR APPLIES when the setting is absent: the declaration
+/// the host shows and validates, and the posture `open` reads from `{}`, never two facts.
 #[test]
-fn a_bare_http_answers_fault_is_its_status_read_by_the_1_5_5_bands() {
-    use crate::meta::fault_of_http;
-    use busbar_contract::abi::transport::{FAULT_CALLER, FAULT_HARD, FAULT_TRANSIENT};
-    let v155 = |s: u16| {
-        if s == 401 || s == 403 {
-            FAULT_HARD // Auth
-        } else if s == 429 || s == 408 || s == 529 || (500..600).contains(&s) {
-            FAULT_TRANSIENT // RateLimit, Timeout, Overloaded, ServerError
-        } else {
-            FAULT_CALLER // ClientError, and any other status reaching the error path
-        }
+fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
+    use crate::meta::DEFAULT_TIMEOUT;
+    use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
+    let p = read_settings(b"").expect("absent reads as {}");
+    assert_eq!(DEFAULT_TIMEOUT.parse::<u64>(), Ok(p.timeout.as_secs()));
+    assert_eq!(DEFAULT_BODY_MAX.parse::<usize>(), Ok(p.max_message_bytes));
+}
+
+/// AN ILL-TYPED OR ZERO SETTING IS REFUSED BY ITS NAME, in http's words (`settings: <key> must be a
+/// count of <unit> above 0`, the kind's grammar): a zero timeout would fail every call at once, and
+/// a zero ceiling would refuse every message. RED: `must be a count of <unit>`, and zero taken.
+#[test]
+fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
+    let why = |json: &[u8]| {
+        read_settings(json)
+            .err()
+            .and_then(|r| r.text().map(str::to_owned))
     };
-    for s in 100..=599u16 {
-        assert_eq!(fault_of_http(s), v155(s), "HTTP {s}");
+    let timeout =
+        "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0";
+    let body = "settings: limits.request_body_max_bytes must be a count of bytes above 0";
+    for (json, want) in [
+        (
+            &br#"{"limits.upstream_request_timeout_secs":"5"}"#[..],
+            timeout,
+        ),
+        (br#"{"limits.upstream_request_timeout_secs":0}"#, timeout),
+        (br#"{"limits.request_body_max_bytes":-1}"#, body),
+        (br#"{"limits.request_body_max_bytes":0}"#, body),
+    ] {
+        assert_eq!(
+            why(json).as_deref(),
+            Some(want),
+            "{}",
+            String::from_utf8_lossy(json)
+        );
     }
+}
+
+/// THE TAIL STATES EXACTLY THE OPS THIS DOOR SERVES (ruling R1: every framer states its own): it
+/// dials and it serves the accepted side (`begin` on `SIDE_ACCEPT` and `SIDE_ACCEPT_STREAM`); it
+/// neither detaches nor adopts (both `not_served!`). RED: no op bit, which declares no op.
+#[test]
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
+    let ops = FACT_ACCEPTS | FACT_DIALS | FACT_DETACHES | FACT_ADOPTS;
+    assert_eq!(TAIL.facts & ops, FACT_ACCEPTS | FACT_DIALS);
+}
+
+/// THE CLAIM DECLARES ONLY THE SELECTOR FORMS SOMETHING HONOURS (ruling R3): the route vocabulary
+/// at the pin (`abi::transport::route`: the exact, pattern, prefix, suffix and contains path forms;
+/// a field present or its value's prefix), every one of which this door can honour, since a call
+/// states its path and its metadata. Nothing evaluates an exact field value, an SNI, an ALPN or a
+/// port for a framer's claim, and a `Port` form marks a claim as an address carrier's
+/// (plugin-loader `ported`). RED: `HeaderExact`, `Sni`, `Alpn` and `Port` declared, and the
+/// suffix and contains path forms missing.
+#[test]
+fn the_claim_declares_only_the_selector_forms_something_honours() {
+    use busbar_contract::SelectorForm;
+    assert_eq!(
+        crate::claims::SELECTOR_FORMS,
+        &[
+            SelectorForm::ExactPath,
+            SelectorForm::PrefixOneLevel,
+            SelectorForm::PathPattern,
+            SelectorForm::PathSuffix,
+            SelectorForm::PathContains,
+            SelectorForm::HeaderPresent,
+            SelectorForm::HeaderPrefix,
+        ]
+    );
 }

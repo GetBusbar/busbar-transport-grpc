@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **`grpc` transport as a droppable busbar plugin**: the `cdylib` a signed tarball of the wire
-//! carries (`kind: transport`, key `grpc`). Its logic crate's one public item, its door
-//! (`busbar_transport_grpc::door`) is exported as this image's ONE symbol,
+//! carries (`kind: transport`, key `grpc`). Its logic crate's public items are its door
+//! (`busbar_transport_grpc::door`) and the `linked` entry a linking build names (both re-exported
+//! here); the door is exported as this image's ONE symbol,
 //! `busbar_plugin_door` (`export_door!`), so the library carries exactly the door a busbar build
 //! links.
 //!
@@ -11,6 +12,8 @@
 //! reviewed exemption. No other `unsafe` exists here.
 
 #![deny(unsafe_code)]
+
+pub use busbar_transport_grpc::*;
 
 /// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
 #[allow(unsafe_code)]

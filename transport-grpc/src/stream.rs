@@ -15,7 +15,10 @@
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
 //! * `emit` takes one reply message's payload and yields it length-prefixed, as body bytes; once
-//!   the call is closed an `emit` writes nothing;
+//!   the call is closed an `emit` writes nothing. The reply has a stream's own backpressure: an
+//!   `emit` that leaves its queue at the high-water mark is answered `YIELD_STREAM_FULL`, a
+//!   writable piece follows the drain, and a host that emits past the bound has the reply cut (the
+//!   call then closes `RESOURCE_EXHAUSTED`, whatever close it states);
 //! * `finish` closes the call with the final status the unit stated: `grpc-status`, `grpc-message`
 //!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in tonic
 //!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers;
@@ -31,7 +34,9 @@ use std::collections::VecDeque;
 
 use crate::hyper_io::{Owed, Piece};
 use crate::msg::{self, Messages, PREFIX};
-use crate::transport::Failure;
+use crate::transport::{
+    not_the_hosts, stream_bound, Failure, OVER_BOUND, STREAM_HIGH_WATER, STREAM_LOW_WATER,
+};
 
 /// The one stream a `SIDE_ACCEPT_STREAM` framing carries.
 pub const STREAM: u64 = 1;
@@ -39,8 +44,12 @@ pub const STREAM: u64 = 1;
 /// One call's framing.
 pub struct StreamCall {
     messages: Messages,
+    /// The largest message payload carried, either way.
+    max: usize,
     writing: Vec<u8>,
-    wire: Vec<u8>,
+    /// The bytes owed the host's wire, taken from the front ([`Owed::take_wire`]): a deque, so a
+    /// partial take copies only what it takes, never the rest.
+    wire: VecDeque<u8>,
     out: VecDeque<Piece>,
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
@@ -49,6 +58,10 @@ pub struct StreamCall {
     /// does not take): the call closes with its status and words for it (`RESOURCE_EXHAUSTED`,
     /// `UNIMPLEMENTED`), whatever refusal the host then closes it with.
     oversize: Option<msg::Bad>,
+    /// The reply was cut ([`StreamCall::cut_reply`]), for these words.
+    cut: Option<String>,
+    /// An `emit` was answered `YIELD_STREAM_FULL`, and no writable piece has followed yet.
+    announced: bool,
 }
 
 impl StreamCall {
@@ -81,12 +94,15 @@ impl StreamCall {
         }
         Ok(Self {
             messages: Messages::new(max),
+            max,
             writing: Vec::new(),
-            wire: Vec::new(),
+            wire: VecDeque::new(),
             out: VecDeque::new(),
             answered: false,
             closed: false,
             oversize: refused,
+            cut: None,
+            announced: false,
         })
     }
 
@@ -115,24 +131,64 @@ impl StreamCall {
     }
 
     /// One reply message's payload bytes (`ends` = they complete it). A call already closed takes
-    /// none: body bytes after the closing lines would follow the trailers.
-    pub fn emit(&mut self, bytes: &[u8], ends: bool) {
-        if self.closed {
-            return;
+    /// none: body bytes after the closing lines would follow the trailers. Nor does a reply that
+    /// was cut ([`StreamCall::cut`]).
+    ///
+    /// # Errors
+    ///
+    /// The reply is cut here: its queue went past its bound (a host that kept emitting to a far
+    /// end not reading, [`stream_bound`]), or its message is longer than a length prefix states.
+    pub fn emit(&mut self, bytes: &[u8], ends: bool) -> Result<(), Failure> {
+        if self.closed || self.cut.is_some() {
+            return Ok(());
+        }
+        if self.queued().saturating_add(bytes.len()) > stream_bound(self.max) {
+            return Err(self.cut_reply(OVER_BOUND.into()));
         }
         if !ends {
             self.writing.extend_from_slice(bytes);
-            return;
+            return Ok(());
         }
-        self.wire
-            .extend_from_slice(&msg::prefix(self.writing.len() + bytes.len()));
-        self.wire.append(&mut self.writing);
-        self.wire.extend_from_slice(bytes);
+        let len = self.writing.len().saturating_add(bytes.len());
+        let Some(prefix) = msg::prefix(len) else {
+            return Err(self.cut_reply(format!(
+                "the reply message is {len} bytes, longer than a gRPC length prefix states"
+            )));
+        };
+        self.wire.extend(prefix);
+        self.wire.extend(self.writing.drain(..));
+        self.wire.extend(bytes);
         self.answered = true;
+        Ok(())
+    }
+
+    /// The reply bytes queued and not yet taken by the host: the wire, and the message being
+    /// written.
+    fn queued(&self) -> usize {
+        self.wire.len().saturating_add(self.writing.len())
+    }
+
+    /// Whether the reply's queue stands at its high-water mark after an `emit`: the answer is then
+    /// `YIELD_STREAM_FULL`, and the stream hands a writable piece once the host has taken it down
+    /// to its low-water mark (the transport ABI's "A STREAM'S OWN BACKPRESSURE").
+    pub fn announce_full(&mut self) -> bool {
+        let full = !self.closed && self.cut.is_none() && self.queued() >= STREAM_HIGH_WATER;
+        self.announced |= full;
+        full
+    }
+
+    /// Cut the reply for `why`: the message being written is dropped, no reply byte more is taken,
+    /// and the call closes `RESOURCE_EXHAUSTED` in these words, whatever close the host states (the
+    /// far end never takes a reply missing a message for a whole one).
+    fn cut_reply(&mut self, why: String) -> Failure {
+        self.writing = Vec::new();
+        self.cut = Some(why.clone());
+        Failure(why)
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
-    /// neutral `status` mapped. `head_sent`: the host already sent the call's response head
+    /// neutral `status` mapped, else (no status stated either way) `UNKNOWN` with the bytes as its
+    /// message. `head_sent`: the host already sent the call's response head
     /// (`RefuseIn::head_sent`), so the refusal is its closing lines only.
     ///
     /// # Errors
@@ -142,15 +198,19 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        let block = msg::terminate_block(bytes);
         let lines = if let Some(e) = &self.oversize {
             e.close_lines().map_err(|e| Failure(e.into()))?
+        } else if let Some(why) = &self.cut {
+            cut_lines(why)?
         } else {
-            match msg::read_head(&block, usize::MAX) {
-                Ok(Some((h, _))) if h.get(msg::GRPC_STATUS).is_some() => {
+            match msg::refusal_block(bytes).map_err(Failure)? {
+                Some(h) => {
+                    // The framer's own and the connection-specific fields dropped, as the
+                    // connection side drops them: one content type, the framer's.
                     let pairs: Vec<(&str, &[u8])> = h
                         .fields
                         .iter()
+                        .filter(|(n, _)| !not_the_hosts(n))
                         .map(|(n, v)| (n.as_str(), v.as_slice()))
                         .collect();
                     let mut lines =
@@ -158,12 +218,16 @@ impl StreamCall {
                     lines.truncate(lines.len() - 2);
                     lines
                 }
-                _ => msg::status_lines(
+                None if status != 0 => msg::status_lines(
                     u32::from(msg::status_of_refusal(status)),
                     msg::refusal_message(status).as_bytes(),
                     &[],
                 )
                 .map_err(|e| Failure(e.into()))?,
+                // No status stated either way: `UNKNOWN`, the refusal's bytes its message, as the
+                // connection side ends the same refusal.
+                None => msg::status_lines(u32::from(msg::UNKNOWN), bytes, &[])
+                    .map_err(|e| Failure(e.into()))?,
             }
         };
         // Closed only once the lines are rendered: a refusal that cannot be written leaves the call
@@ -190,20 +254,32 @@ impl StreamCall {
         }
         // Rendered first, closed after: a final status that cannot be written leaves the call
         // open, so the host's fallback refusal can still close it with a `grpc-status`.
-        let lines = msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?;
+        let lines = match &self.cut {
+            Some(why) => cut_lines(why)?,
+            None => msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?,
+        };
         self.closed = true;
         self.wire.extend(lines);
         Ok(())
     }
 }
 
+/// The closing lines of a call whose reply was cut for `why`.
+fn cut_lines(why: &str) -> Result<Vec<u8>, Failure> {
+    msg::status_lines(u32::from(msg::RESOURCE_EXHAUSTED), why.as_bytes(), &[])
+        .map_err(|e| Failure(e.into()))
+}
+
 impl Owed for StreamCall {
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
-        if cap >= self.wire.len() {
-            return std::mem::take(&mut self.wire);
+        let n = cap.min(self.wire.len());
+        let taken = self.wire.drain(..n).collect();
+        // Taken ahead of the pieces (`fill`), so the writable piece goes out in this same answer.
+        if self.announced && !self.closed && self.queued() <= STREAM_LOW_WATER {
+            self.announced = false;
+            self.out.push_back(Piece::writable(STREAM));
         }
-        let rest = self.wire.split_off(cap);
-        std::mem::replace(&mut self.wire, rest)
+        taken
     }
     fn wire_pending(&self) -> bool {
         !self.wire.is_empty()
