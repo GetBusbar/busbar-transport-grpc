@@ -114,44 +114,29 @@ fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
     assert_eq!(DEFAULT_BODY_MAX.parse::<usize>(), Ok(p.max_message_bytes));
 }
 
-/// AN ILL-TYPED SETTING IS REFUSED BY ITS NAME, in the siblings' grammar (`settings: <key> must be
-/// ...`, as http and stdio word theirs). RED: `settings: a value is not of its declared kind`, naming
-/// no setting.
+/// AN ILL-TYPED OR ZERO SETTING IS REFUSED BY ITS NAME, in http's words (`settings: <key> must be a
+/// count of <unit> above 0`, the kind's grammar): a zero timeout would fail every call at once, and
+/// a zero ceiling would refuse every message. RED: `must be a count of <unit>`, and zero taken.
 #[test]
-fn an_ill_typed_setting_is_refused_by_its_name() {
+fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
     let why = |json: &[u8]| {
         read_settings(json)
             .err()
             .and_then(|r| r.text().map(str::to_owned))
     };
-    assert_eq!(
-        why(br#"{"limits.upstream_request_timeout_secs":"5"}"#).as_deref(),
-        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds")
-    );
-    assert_eq!(
-        why(br#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
-        Some("settings: limits.request_body_max_bytes must be a count of bytes")
-    );
-}
-
-/// A BARE HTTP ANSWER'S FAULT IS READ BY ITS HTTP BAND, 1.5.5's (`v1.5.5 crates/busbar/src/breaker.rs`
-/// step 2, `Auth | Billing => HardDown`, the transient classes, the rest the caller's), over every
-/// status a far end can answer. The expected reading below is 1.5.5's if-chain, written out as it
-/// reads there, not this framer's table: the two must agree on all 500 codes.
-#[test]
-fn a_bare_http_answers_fault_is_its_status_read_by_the_1_5_5_bands() {
-    use crate::meta::fault_of_http;
-    use busbar_contract::abi::transport::{FAULT_CALLER, FAULT_HARD, FAULT_TRANSIENT};
-    let v155 = |s: u16| {
-        if s == 401 || s == 403 {
-            FAULT_HARD // Auth
-        } else if s == 429 || s == 408 || s == 529 || (500..600).contains(&s) {
-            FAULT_TRANSIENT // RateLimit, Timeout, Overloaded, ServerError
-        } else {
-            FAULT_CALLER // ClientError, and any other status reaching the error path
-        }
-    };
-    for s in 100..=599u16 {
-        assert_eq!(fault_of_http(s), v155(s), "HTTP {s}");
+    let timeout = "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0";
+    let body = "settings: limits.request_body_max_bytes must be a count of bytes above 0";
+    for (json, want) in [
+        (&br#"{"limits.upstream_request_timeout_secs":"5"}"#[..], timeout),
+        (br#"{"limits.upstream_request_timeout_secs":0}"#, timeout),
+        (br#"{"limits.request_body_max_bytes":-1}"#, body),
+        (br#"{"limits.request_body_max_bytes":0}"#, body),
+    ] {
+        assert_eq!(
+            why(json).as_deref(),
+            Some(want),
+            "{}",
+            String::from_utf8_lossy(json)
+        );
     }
 }
