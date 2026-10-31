@@ -154,3 +154,27 @@ fn the_tail_states_the_ops_the_door_serves() {
     let ops = FACT_ACCEPTS | FACT_DIALS | FACT_DETACHES | FACT_ADOPTS;
     assert_eq!(TAIL.facts & ops, FACT_ACCEPTS | FACT_DIALS);
 }
+
+/// THE CLAIM DECLARES ONLY THE SELECTOR FORMS SOMETHING HONOURS (ruling R3): the route vocabulary
+/// at the pin (`abi::transport::route`: the exact, pattern, prefix, suffix and contains path forms;
+/// a field present or its value's prefix), every one of which this door can honour, since a call
+/// states its path and its metadata. Nothing evaluates an exact field value, an SNI, an ALPN or a
+/// port for a framer's claim, and a `Port` form marks a claim as an address carrier's
+/// (plugin-loader `ported`). RED: `HeaderExact`, `Sni`, `Alpn` and `Port` declared, and the
+/// suffix and contains path forms missing.
+#[test]
+fn the_claim_declares_only_the_selector_forms_something_honours() {
+    use busbar_contract::SelectorForm;
+    assert_eq!(
+        crate::claims::SELECTOR_FORMS,
+        &[
+            SelectorForm::ExactPath,
+            SelectorForm::PrefixOneLevel,
+            SelectorForm::PathPattern,
+            SelectorForm::PathSuffix,
+            SelectorForm::PathContains,
+            SelectorForm::HeaderPresent,
+            SelectorForm::HeaderPrefix,
+        ]
+    );
+}
