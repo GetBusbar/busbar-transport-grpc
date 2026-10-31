@@ -868,3 +868,38 @@ fn every_ops_text_names_its_op() {
         host.close();
     }
 }
+
+/// A TARGET CARRYING USERINFO IS REFUSED AT `locate` AND AT `begin`, as http and ws refuse it, and
+/// never echoed: a credential never rides a URL. Both images. RED: `locate` dropped the userinfo
+/// silently and answered READY, and `begin` dialled with it.
+#[test]
+fn a_target_carrying_userinfo_is_refused_and_never_echoed() {
+    use busbar_contract::abi::transport::{slot, BeginIn, FramerOut, SIDE_DIAL};
+    let (d, _lib) = dropped();
+    let target = "https://user:secret@peer.test";
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let (r, _, why) = host.locate_lent(target, false, [256, 256, 64, 256]);
+        assert_eq!(
+            (r, why.as_str()),
+            (
+                Outcome::Failed,
+                "locate: the target carries userinfo; credentials never ride a URL"
+            )
+        );
+        let o = host.ops;
+        let (r, why) = host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, true, |i| {
+            i.side = SIDE_DIAL;
+            i.target = s(target);
+        });
+        assert_eq!(
+            (r, why.as_str()),
+            (
+                Outcome::Failed,
+                "begin: the target carries userinfo; credentials never ride a URL"
+            )
+        );
+        assert!(!why.contains("secret"));
+        host.close();
+    }
+}
