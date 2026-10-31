@@ -291,6 +291,8 @@ pub struct Conn {
     /// The last drive left a body unread because the host had not taken what it was handed
     /// ([`INBOUND_HIGH_WATER`]): the host is owed a re-call once it has.
     held_back: bool,
+    /// Drives so far: each reads the streams from one further on ([`Room::first`]).
+    turn: usize,
 }
 
 enum Side {
@@ -304,8 +306,10 @@ impl Owed for Conn {
     }
     /// Wire bytes still owed, or a body the last drive left unread for the host's sake: either way
     /// the host calls again (`YIELD_MORE`), and the re-call reads on once it has taken its pieces.
+    /// A failed connection owes no re-call: the op answers its failure once the host has taken
+    /// what it was handed.
     fn wire_pending(&self) -> bool {
-        self.io.wire_pending() || self.held_back
+        self.io.wire_pending() || (self.held_back && self.failed.is_none())
     }
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
         &mut self.out
@@ -379,6 +383,7 @@ impl Conn {
             failed: None,
             posture,
             held_back: false,
+            turn: 0,
             side: Side::Dial(Dial {
                 handshake: Some(handshake),
                 sender: None,
@@ -422,6 +427,7 @@ impl Conn {
             failed: None,
             posture,
             held_back: false,
+            turn: 0,
             side: Side::Accept(Accept {
                 arrivals,
                 calls: Vec::new(),
@@ -624,9 +630,11 @@ impl Conn {
         }
         let io = self.io.clone();
         let max = self.posture.max_message_bytes;
+        let turn = self.turn;
+        self.turn = self.turn.wrapping_add(1);
         let held_back = &mut self.held_back;
         let r = io.rounds(|cx| {
-            let mut room = Room::of(&self.out);
+            let mut room = Room::of(&self.out, turn);
             let r = match &mut self.side {
                 Side::Dial(d) => d.step(&mut self.out, &mut room, max, cx),
                 Side::Accept(a) => {
@@ -669,14 +677,24 @@ struct Room {
     held: usize,
     /// A body was left unread for the host's sake.
     held_back: bool,
+    /// The stream this drive reads first: each drive starts one further on.
+    first: usize,
 }
 
 impl Room {
-    fn of(out: &VecDeque<Piece>) -> Self {
+    fn of(out: &VecDeque<Piece>, first: usize) -> Self {
         Self {
             held: held_for_host(out),
             held_back: false,
+            first,
         }
+    }
+
+    /// The order a round reads `n` streams in: from [`Room::first`] round, so that while the host is
+    /// the bottleneck no stream fills the room ahead of the others on every drive.
+    fn order(&self, n: usize) -> impl Iterator<Item = usize> {
+        let first = if n == 0 { 0 } else { self.first % n };
+        (0..n).map(move |k| (first + k) % n)
     }
 
     /// Whether a body may be read now; if not, it is left unread and the host is owed a re-call.
@@ -897,7 +915,8 @@ impl Dial {
                 self.sender = Some(r.map_err(|e| Failure(e.to_string()))?);
             }
         }
-        for (id, s) in &mut self.calls {
+        for at in room.order(self.calls.len()) {
+            let (id, s) = &mut self.calls[at];
             if let Err((why, code, conn)) = advance(*id, s, &mut self.sender, out, room, max, cx) {
                 if conn {
                     return Err(Failure(why));
@@ -1404,7 +1423,8 @@ impl Accept {
                 },
             ));
         }
-        for (id, s) in &mut self.calls {
+        for at in room.order(self.calls.len()) {
+            let (id, s) = &mut self.calls[at];
             if !s.reply_over && s.reply.chan.gone() {
                 // The far end cancelled the call: it reset the stream, and the connection let go
                 // of the answer. Before the far end's last message its body says so too; after it
