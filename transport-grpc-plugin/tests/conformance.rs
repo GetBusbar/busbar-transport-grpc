@@ -218,3 +218,17 @@ fn the_statement_carries_the_declares_document() {
         Some(&include_bytes!("../../transport-grpc/declares.json")[..]),
     );
 }
+
+/// THE DOOR OFFERS NO AUTH POINT (ruling R2): it makes no auth call, on either side, so its
+/// Statement states an empty offered-points record and boot refuses a guest line whose auth needs
+/// a point on it, never defaulting to `{Head, HeadBody}`. RED: no record, read as
+/// `{Head, HeadBody}`.
+#[test]
+fn the_statement_offers_no_auth_point() {
+    let row = row();
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    let points =
+        busbar_contract::abi::transport::check::check_offered_points(&read.extensions.bytes)
+            .map(|p| p.0);
+    assert_eq!(points, Ok(0));
+}
