@@ -1,11 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
 [package]
 name = "busbar-transport-grpc"
 version = "1.6.0"
-publish = false            # internal workspace crate; never goes to crates.io
+publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "The gRPC transport: gRPC calls over HTTP/2, dialled and accepted, as a sans-IO framer."
 license = "Apache-2.0"
+
+[lints]
+workspace = true
 
 [lib]
 name = "busbar_transport_grpc"
