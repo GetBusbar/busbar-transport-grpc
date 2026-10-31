@@ -47,16 +47,14 @@ use busbar_contract::abi::transport::{
     LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, SIDE_ACCEPT,
     SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
 };
-use busbar_contract::transport::registry::{
-    DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
-};
+use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 
 use crate::msg;
 use crate::stream::StreamCall;
 use crate::transport::{self, Conn, Posture};
 
 use crate::claims::CLAIM_NAMES;
-use crate::meta::{class_of, fault_of, TAIL};
+use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, TAIL};
 pub use crate::meta::{setting, KEY};
 
 busbar_contract::statement_extensions!(
@@ -105,24 +103,17 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
         bytes,
         &[setting::REQUEST_TIMEOUT_SECS, setting::BODY_MAX_BYTES],
     )?;
-    // A count, by its key and its unit (`settings: <key> must be a count of <unit>`, the siblings'
-    // grammar).
-    let count = |k: &'static str, unit: &str, d: u64| match v.get(k) {
-        None => Ok(d),
-        Some(x) => x
-            .as_u64()
-            .ok_or_else(|| Refusal::failed(format!("settings: {k} must be a count of {unit}"))),
+    // A count above 0, by its key and its unit (`settings: <key> must be a count of <unit> above
+    // 0`, http's words); an absent one reads as the default its declaration states (`SETTINGS`):
+    // one source.
+    let count = |k: &'static str, unit: &str, declared: &str| match v.get(k) {
+        None => Ok(decimal(declared)),
+        Some(x) => x.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+            Refusal::failed(format!("settings: {k} must be a count of {unit} above 0"))
+        }),
     };
-    let secs = count(
-        setting::REQUEST_TIMEOUT_SECS,
-        "seconds",
-        DEFAULT_REQUEST_TIMEOUT_SECS,
-    )?;
-    let max = count(
-        setting::BODY_MAX_BYTES,
-        "bytes",
-        DEFAULT_REQUEST_BODY_MAX_BYTES as u64,
-    )?;
+    let secs = count(setting::REQUEST_TIMEOUT_SECS, "seconds", DEFAULT_TIMEOUT)?;
+    let max = count(setting::BODY_MAX_BYTES, "bytes", DEFAULT_BODY_MAX)?;
     Ok(Posture {
         keep_alive_interval: Some(KEEP_ALIVE_INTERVAL),
         keep_alive_timeout: KEEP_ALIVE_TIMEOUT,

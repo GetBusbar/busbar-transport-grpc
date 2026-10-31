@@ -146,7 +146,7 @@ pub(crate) fn fault_of_http(status: u16) -> u8 {
 pub(crate) const DEFAULT_TIMEOUT: &str = "300";
 
 /// `text` read as a decimal count (digits alone, as the declared defaults are).
-const fn decimal(text: &str) -> u64 {
+pub(crate) const fn decimal(text: &str) -> u64 {
     let b = text.as_bytes();
     let mut n = 0;
     let mut i = 0;
