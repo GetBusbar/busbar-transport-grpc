@@ -12,18 +12,20 @@ use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 use busbar_contract::SelectorForm;
 
 /// The shapes an ingress claim over this wire may take: a call is a path (`/<service>/<method>`)
-/// and its metadata, on a connection its listener's port, name and protocol pick. gRPC is the top
-/// framer of its connection, so it owns claim selection over the request that opens each call.
+/// and its metadata. gRPC is the top framer of its connection, so it owns claim selection over the
+/// request that opens each call. Only the forms something honours (ruling R3): the route
+/// vocabulary at the pin (`abi::transport::route`: the exact, pattern, prefix, suffix and contains
+/// path forms; a field present, or its value's prefix). Nothing evaluates an exact field value, an
+/// SNI, an ALPN or a port for a framer's claim, and a `Port` form would mark the claim an address
+/// carrier's.
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,
     SelectorForm::PathPattern,
-    SelectorForm::HeaderExact,
+    SelectorForm::PathSuffix,
+    SelectorForm::PathContains,
     SelectorForm::HeaderPresent,
     SelectorForm::HeaderPrefix,
-    SelectorForm::Sni,
-    SelectorForm::Alpn,
-    SelectorForm::Port,
 ];
 
 pub(crate) const SELECTOR_CODES: [u8; SELECTOR_FORMS.len()] = form_codes(SELECTOR_FORMS);
