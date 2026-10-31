@@ -691,7 +691,7 @@ fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
         assert_eq!(r, Outcome::Failed);
         assert_eq!(
             why,
-            "the stream's queue is past its bound: the far end is not reading"
+            "emit: the stream's queue is past its bound: the far end is not reading"
         );
         assert_eq!(host.emit_drain(1), Outcome::Ready);
         let at = host.wire_log.len();
@@ -817,6 +817,53 @@ fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
             host.feed(&lpm(&[7u8; 17]), false),
             Outcome::Failed,
             "the new ceiling"
+        );
+        host.close();
+    }
+}
+
+/// EVERY OP'S TEXT NAMES ITS OP (`<op>: <reason>`, the kind's grammar), the framing's own failures
+/// included: an op with no open instance, on no such framing, or failed by the framing. Both
+/// images. RED: `begin` with no instance answered a bare FAILED, and the others no op.
+#[test]
+fn every_ops_text_names_its_op() {
+    use busbar_contract::abi::transport::{
+        slot, BeginIn, EmitIn, FramerOut, FramingIn, IngestIn, RefuseIn, SIDE_ACCEPT,
+    };
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let o = host.ops;
+        assert_eq!(
+            host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, false, |i| {
+                i.side = SIDE_ACCEPT;
+            }),
+            (Outcome::Failed, "begin: no open instance".to_owned())
+        );
+        assert_eq!(
+            host.op_text::<IngestIn, FramerOut>(o.ingest, slot::INGEST, true, |i| i.framing = 999),
+            (Outcome::Failed, "ingest: no such framing".to_owned())
+        );
+        assert_eq!(
+            host.op_text::<FramingIn, FramerOut>(o.timer, slot::TIMER, true, |i| i.framing = 999),
+            (Outcome::Failed, "timer: no such framing".to_owned())
+        );
+        host.begin(SIDE_ACCEPT, "", "", None);
+        let framing = host.framing;
+        assert_eq!(
+            host.op_text::<RefuseIn, FramerOut>(o.refuse, slot::REFUSE, true, |i| {
+                i.framing = framing;
+                i.stream = 9;
+                i.has_stream = 1;
+            }),
+            (Outcome::Failed, "refuse: no such stream: 9".to_owned())
+        );
+        assert_eq!(
+            host.op_text::<EmitIn, FramerOut>(o.emit, slot::EMIT, true, |i| {
+                i.framing = framing;
+                i.stream = 9;
+            }),
+            (Outcome::Failed, "emit: no such stream: 9".to_owned())
         );
         host.close();
     }
