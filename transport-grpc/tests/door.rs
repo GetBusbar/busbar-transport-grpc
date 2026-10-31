@@ -6,7 +6,7 @@
 //! The test is the HOST (`common`): it holds an in-memory socket whose far end is tonic's service
 //! (dialled scenarios) or tonic's client (the accepted scenario), a virtual clock, and the sink.
 //! Every answer is judged by the transport kind's own check. Each scenario runs through the
-//! linked door and through the cdylib `cargo test` built from `examples/grpc_door.rs`. Both
+//! linked door and through the shipped dropped-in image, the plugin crate's cdylib. Both
 //! must print the same proof lines, and an exchange re-called through a tiny sink must equal
 //! the roomy one byte for byte.
 

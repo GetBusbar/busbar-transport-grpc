@@ -82,9 +82,10 @@ pub fn linked() -> &'static Ops {
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
-/// THE IMAGE WHERE `cargo test` DID NOT BUILD IT: the coverage job. `cargo test` builds every
-/// example, this cdylib among them, beside the test binaries. The fleet's coverage job runs
-/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built. So the image is built
+/// THE IMAGE WHERE `cargo test` DID NOT BUILD IT, or built it before the code under test: the
+/// dropped-in door is the shipped one, the plugin crate's cdylib (`busbar-transport-grpc-plugin`),
+/// which `cargo test --workspace` builds beside the test binaries; `cargo test -p` this crate, or
+/// the fleet's coverage job (`cargo llvm-cov`, `cargo test --tests`), may not. So the image is built
 /// here, once per test binary, with
 /// the same cargo, manifest and profile, under this run's environment: under `cargo llvm-cov` that
 /// environment carries its instrumentation flags, so the dropped-in door is built under llvm-cov
@@ -103,8 +104,9 @@ fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::
                 .args([
                     "build",
                     "--locked",
-                    "--example",
-                    "grpc_door",
+                    "--package",
+                    "busbar-transport-grpc-plugin",
+                    "--lib",
                     "--manifest-path",
                 ])
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
@@ -118,9 +120,9 @@ fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::
                 .expect("run cargo to build the dropped-in image");
             assert!(
                 status.success(),
-                "cargo build --example grpc_door: {status}"
+                "cargo build --package busbar-transport-grpc-plugin: {status}"
             );
-            let path = target.join(name).join("examples").join(file);
+            let path = target.join(name).join(file);
             path.exists().then_some(path)
         })
         .clone()
@@ -133,7 +135,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         .and_then(|d| d.parent())
         .expect("target/<profile>");
     let file = format!(
-        "{}grpc_door{}",
+        "{}busbar_transport_grpc_plugin{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
@@ -153,11 +155,11 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         .filter_map(|p| modified(&p))
         .max();
     // The newest image `cargo test` built, and only if it is as new as the library: a stale one
-    // (`cargo test --tests` builds no example) is never loaded as the door under test.
+    // (`cargo test -p` this crate builds no plugin) is never loaded as the door under test.
     let built = || {
         [
-            profile.join("examples").join(&file),
-            profile.join("examples").join("deps").join(&file),
+            profile.join(&file),
+            profile.join("deps").join(&file),
         ]
         .into_iter()
         .filter_map(|p| Some((modified(&p)?, p)))
@@ -168,7 +170,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     let path = built()
         .or_else(|| image_built_here(profile, &file))
         .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
-    // SAFETY: our own example, built by this `cargo test` (or by `image_built_here`).
+    // SAFETY: our own plugin cdylib, built by this `cargo test` (or by `image_built_here`).
     let lib: &'static libloading::Library = Box::leak(Box::new(
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));
