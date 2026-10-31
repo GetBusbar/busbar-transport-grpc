@@ -140,3 +140,13 @@ fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
         );
     }
 }
+
+/// THE TAIL STATES EXACTLY THE OPS THIS DOOR SERVES (ruling R1: every framer states its own): it
+/// dials and it serves the accepted side (`begin` on `SIDE_ACCEPT` and `SIDE_ACCEPT_STREAM`); it
+/// neither detaches nor adopts (both `not_served!`). RED: no op bit, which declares no op.
+#[test]
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
+    let ops = FACT_ACCEPTS | FACT_DIALS | FACT_DETACHES | FACT_ADOPTS;
+    assert_eq!(TAIL.facts & ops, FACT_ACCEPTS | FACT_DIALS);
+}
