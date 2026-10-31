@@ -309,7 +309,7 @@ impl Owed for Conn {
     /// A failed connection owes no re-call: the op answers its failure once the host has taken
     /// what it was handed.
     fn wire_pending(&self) -> bool {
-        self.io.wire_pending() || (self.held_back && self.failed.is_none())
+        self.failed.is_none() && (self.io.wire_pending() || self.held_back)
     }
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
         &mut self.out
