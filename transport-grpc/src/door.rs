@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
@@ -79,7 +79,9 @@ const OFFER_H2: &[u8] = b"\x02h2";
 
 /// What `open` read from the settings, and the framings it holds.
 pub struct Instance {
-    posture: Posture,
+    /// The settings in force: what `open` read, or the last good `refresh`, copied by each `begin`
+    /// (a framing keeps the posture it began under).
+    posture: Mutex<Posture>,
     framings: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
     calls: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
@@ -160,14 +162,18 @@ impl Life for Instance {
 
     fn open(settings: &[u8], _: &[&[u8]], _: u64) -> Result<Self, Refusal> {
         Ok(Self {
-            posture: read_settings(settings)?,
+            posture: Mutex::new(read_settings(settings)?),
             framings: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         })
     }
 
-    fn refresh(&self, _: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+    /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
+    /// force stay; good ones apply to every framing begun after it.
+    fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+        let posture = read_settings(settings)?;
+        *self.posture.lock().unwrap_or_else(PoisonError::into_inner) = posture;
         Ok(Refreshed::default())
     }
 }
@@ -282,13 +288,14 @@ slot!(
         let Some(inst) = mine(&p) else {
             return Outcome::Failed;
         };
+        let posture = *inst.posture.lock().unwrap_or_else(PoisonError::into_inner);
         if i.side() == SIDE_ACCEPT_STREAM {
             let fields = i.fields();
             let opened = StreamCall::open(
                 fields
                     .iter()
                     .map(|f| (f.name().bytes(), f.value().bytes())),
-                inst.posture.max_message_bytes,
+                posture.max_message_bytes,
             );
             let mut call = match opened {
                 Ok(call) => call,
@@ -318,7 +325,7 @@ slot!(
                     o.error("begin: the target is not text");
                     return Outcome::Failed;
                 };
-                match Conn::dial(target, inst.posture, now) {
+                match Conn::dial(target, posture, now) {
                     Ok(c) => c,
                     Err(_) => {
                         o.error("begin: the target is not a URL");
@@ -326,7 +333,7 @@ slot!(
                     }
                 }
             }
-            SIDE_ACCEPT => Conn::accept(inst.posture, now),
+            SIDE_ACCEPT => Conn::accept(posture, now),
             _ => {
                 o.error("begin: the side is neither accept nor dial");
                 return Outcome::Failed;
