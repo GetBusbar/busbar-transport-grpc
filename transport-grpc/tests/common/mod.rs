@@ -28,7 +28,9 @@ use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, ValidateIn};
+use busbar_contract::abi::mechanism::lifecycle::{
+    slot as life, OpenIn, OpenOut, RefreshIn, ValidateIn,
+};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{
     check_framer, check_framer_fields, check_head_slots, check_locate,
@@ -80,9 +82,10 @@ pub fn linked() -> &'static Ops {
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
-/// THE IMAGE WHERE `cargo test` DID NOT BUILD IT: the coverage job. `cargo test` builds every
-/// example, this cdylib among them, beside the test binaries. The fleet's coverage job runs
-/// `cargo llvm-cov`, which runs `cargo test --tests`: no example is built. So the image is built
+/// THE IMAGE WHERE `cargo test` DID NOT BUILD IT, or built it before the code under test: the
+/// dropped-in door is the shipped one, the plugin crate's cdylib (`busbar-transport-grpc-plugin`),
+/// which `cargo test --workspace` builds beside the test binaries; `cargo test -p` this crate, or
+/// the fleet's coverage job (`cargo llvm-cov`, `cargo test --tests`), may not. So the image is built
 /// here, once per test binary, with
 /// the same cargo, manifest and profile, under this run's environment: under `cargo llvm-cov` that
 /// environment carries its instrumentation flags, so the dropped-in door is built under llvm-cov
@@ -101,8 +104,9 @@ fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::
                 .args([
                     "build",
                     "--locked",
-                    "--example",
-                    "grpc_door",
+                    "--package",
+                    "busbar-transport-grpc-plugin",
+                    "--lib",
                     "--manifest-path",
                 ])
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
@@ -116,9 +120,9 @@ fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::
                 .expect("run cargo to build the dropped-in image");
             assert!(
                 status.success(),
-                "cargo build --example grpc_door: {status}"
+                "cargo build --package busbar-transport-grpc-plugin: {status}"
             );
-            let path = target.join(name).join("examples").join(file);
+            let path = target.join(name).join(file);
             path.exists().then_some(path)
         })
         .clone()
@@ -131,22 +135,39 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         .and_then(|d| d.parent())
         .expect("target/<profile>");
     let file = format!(
-        "{}grpc_door{}",
+        "{}busbar_transport_grpc_plugin{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
-    let built = || {
-        [
-            profile.join("examples").join(&file),
-            profile.join("examples").join("deps").join(&file),
-        ]
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    // The library the image links, as this run built it: the newest of this crate's rlibs beside
+    // the test binary. An image older than it predates the code under test.
+    let lib_built = std::fs::read_dir(profile.join("deps"))
         .into_iter()
-        .find(|p| p.exists())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("libbusbar_transport_grpc-") && n.ends_with(".rlib"))
+        })
+        .filter_map(|p| modified(&p))
+        .max();
+    // The newest image `cargo test` built, and only if it is as new as the library: a stale one
+    // (`cargo test -p` this crate builds no plugin) is never loaded as the door under test.
+    let built = || {
+        [profile.join(&file), profile.join("deps").join(&file)]
+            .into_iter()
+            .filter_map(|p| Some((modified(&p)?, p)))
+            .max()
+            .filter(|(at, _)| lib_built.is_none_or(|lib| *at >= lib))
+            .map(|(_, p)| p)
     };
     let path = built()
         .or_else(|| image_built_here(profile, &file))
         .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
-    // SAFETY: our own example, built by this `cargo test` (or by `image_built_here`).
+    // SAFETY: our own plugin cdylib, built by this `cargo test` (or by `image_built_here`).
     let lib: &'static libloading::Library = Box::leak(Box::new(
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));
@@ -368,6 +389,22 @@ impl Host {
         }
     }
 
+    /// `refresh` the instance with `settings`: its outcome and its text.
+    pub fn refresh(&mut self, settings: &'static str) -> (Outcome, String) {
+        let mut i: RefreshIn = z();
+        i.generation = 2;
+        i.settings = Blob::json(settings.as_bytes());
+        let mut o: OutHead = z();
+        let r = call(
+            self.ops.head.refresh,
+            self.inst,
+            &mut i,
+            &mut o,
+            life::REFRESH,
+        );
+        (r, text(o.error))
+    }
+
     fn sink(&mut self) -> FramerSink {
         FramerSink {
             wire: self.wire.as_mut_ptr(),
@@ -419,6 +456,39 @@ impl Host {
             offer,
             defaults: String::from_utf8_lossy(&d[..o.defaults_written as usize]).into_owned(),
         })
+    }
+
+    /// `locate` with the buffers lent at the given sizes (`authority`, `name`, `alpn`, `defaults`),
+    /// as a host with less room does, judged by the kind's own check: its outcome, its `out`, and
+    /// its text.
+    pub fn locate_lent(
+        &mut self,
+        target: &str,
+        accept: bool,
+        caps: [usize; 4],
+    ) -> (Outcome, LocateOut, String) {
+        let [mut a, mut n, mut p, mut d] = caps.map(|c| vec![0_u8; c]);
+        let mut i: LocateIn = z();
+        i.target = s(target);
+        i.accept = u32::from(accept);
+        (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
+        (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
+        (i.alpn_buf, i.alpn_cap) = (p.as_mut_ptr(), p.len());
+        (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
+        let mut o: LocateOut = z();
+        let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
+        let offer = p[..(o.alpn_written as usize).min(p.len())].to_vec();
+        check_locate(
+            r,
+            &o,
+            caps[0] as u64,
+            caps[1] as u64,
+            caps[2] as u64,
+            &offer,
+            caps[3] as u64,
+        )
+        .expect("locate passes the kind's check");
+        (r, o, text(o.head.error))
     }
 
     /// Take an op's answer: judge it by the kind's own check, send its wire bytes, keep its pieces.
@@ -586,6 +656,29 @@ impl Host {
         self.drain(slot::FINISH, 0)
     }
 
+    /// `finish` with a final tail stated by hand: `bytes`, and the `message` and `details` spans
+    /// into them, whatever they say. Its outcome and its text.
+    pub fn finish_spans(
+        &mut self,
+        status: u32,
+        bytes: &[u8],
+        message: Span,
+        details: Span,
+    ) -> (Outcome, String) {
+        let mut i: FinishIn = z();
+        i.framing = self.framing;
+        i.final_status = status;
+        i.final_message = message;
+        i.final_details = details;
+        i.final_bytes = bytes.as_ptr();
+        i.final_bytes_len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH);
+        self.take(r, &o);
+        (r, text(o.head.error))
+    }
+
     /// `begin` on `side`, over `sock`, with `agreed` the protocol connection security agreed.
     pub fn begin(&mut self, side: u32, target: &str, agreed: &str, sock: Option<Arc<Socket>>) {
         assert_eq!(
@@ -671,6 +764,28 @@ impl Host {
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
+        self.drain(slot::EMIT, stream)
+    }
+
+    /// `emit` `bytes` on `stream` ONCE, as a host whose far end is not reading does: no `YIELD_MORE`
+    /// re-call drains what the sink could not take. Its outcome, its yield flags, and its text.
+    pub fn emit_held(&mut self, stream: u64, bytes: &[u8], end: bool) -> (Outcome, u32, String) {
+        let mut i: EmitIn = z();
+        i.framing = self.framing;
+        i.stream = stream;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.end_of_frame = u32::from(end);
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
+        self.take(r, &o);
+        (r, o.yielded.flags, text(o.head.error))
+    }
+
+    /// Re-call `emit` on `stream` with no new bytes until it has nothing more: the far end reads
+    /// again.
+    pub fn emit_drain(&mut self, stream: u64) -> Outcome {
         self.drain(slot::EMIT, stream)
     }
 
@@ -764,6 +879,29 @@ impl Host {
 
     pub fn next_deadline(&self) -> Option<u64> {
         self.deadline
+    }
+
+    /// Op `index` over an all-zero `in` that `set` then fills, on this instance (or, `instance`
+    /// false, on none): its outcome and its text.
+    pub fn op_text<I, O>(
+        &self,
+        op: Option<Op>,
+        index: u32,
+        instance: bool,
+        set: impl FnOnce(&mut I),
+    ) -> (Outcome, String) {
+        let mut i: I = z();
+        set(&mut i);
+        let mut o: O = z();
+        let inst = if instance {
+            self.inst
+        } else {
+            std::ptr::null_mut()
+        };
+        let r = call(op, inst, &mut i, &mut o, index);
+        // SAFETY: every `out` leads with an `OutHead`.
+        let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+        (r, text(head.error))
     }
 
     /// Op `index` of this instance over all-zero `in` and `out`: its outcome and its text.

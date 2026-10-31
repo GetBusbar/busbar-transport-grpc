@@ -31,7 +31,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
@@ -40,6 +40,7 @@ use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::transport::settings_reading;
+use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -47,24 +48,33 @@ use busbar_contract::abi::transport::{
     LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, SIDE_ACCEPT,
     SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
 };
-use busbar_contract::transport::registry::{
-    DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
-};
 
 use crate::msg;
 use crate::stream::StreamCall;
 use crate::transport::{self, Conn, Posture};
 
 use crate::claims::CLAIM_NAMES;
-use crate::meta::{class_of, fault_of, TAIL};
+use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, TAIL};
 pub use crate::meta::{setting, KEY};
 
+/// THE AUTH POINTS THIS DOOR OFFERS: none (ruling R2). It makes no auth call on either side (no
+/// op pends), so it states an empty record: boot refuses a guest line whose auth needs a point on
+/// it, rather than read the default `{Head, HeadBody}` it would not honour.
+const OFFERED_POINTS: [u8; 4] = 0u32.to_le_bytes();
+
 busbar_contract::statement_extensions!(
-    /// The Statement's extensions: this plugin's whole `declares` document.
-    EXTENSIONS: [(
-        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
-        include_bytes!("../declares.json")
-    )]
+    /// The Statement's extensions: this plugin's whole `declares` document, and the auth points
+    /// it offers.
+    EXTENSIONS: [
+        (
+            busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+            include_bytes!("../declares.json")
+        ),
+        (
+            busbar_contract::abi::transport::EXT_OFFERED_POINTS,
+            &OFFERED_POINTS
+        ),
+    ]
 );
 
 /// The door's Statement: the `grpc` framer.
@@ -81,12 +91,24 @@ const OFFER_H2: &[u8] = b"\x02h2";
 
 /// What `open` read from the settings, and the framings it holds.
 pub struct Instance {
-    posture: Posture,
+    /// The settings in force: what `open` read, or the last good `refresh`, copied by each `begin`
+    /// (a framing keeps the posture it began under).
+    posture: Mutex<Posture>,
     framings: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
     calls: Mutex<HashMap<u64, Arc<Mutex<StreamCall>>>>,
     next: AtomicU64,
 }
+
+/// HTTP/2 keep-alive on a dialled connection: a PING this often (fixed here, not an operator
+/// setting), so a far end gone silent is found while a call waits on it.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a keep-alive PING may go unanswered before the dialled connection is failed.
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HTTP/2's adaptive flow-control window, both sides (fixed here, not an operator setting).
+const ADAPTIVE_WINDOW: bool = true;
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
 /// says. An absent blob reads as `{}`.
@@ -95,21 +117,21 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
         bytes,
         &[setting::REQUEST_TIMEOUT_SECS, setting::BODY_MAX_BYTES],
     )?;
-    let count = |k: &'static str, d: u64| match v.get(k) {
-        None => Ok(d),
-        Some(x) => x
-            .as_u64()
-            .ok_or_else(|| Refusal::failed("settings: a value is not of its declared kind")),
+    // A count above 0, by its key and its unit (`settings: <key> must be a count of <unit> above
+    // 0`, http's words); an absent one reads as the default its declaration states (`SETTINGS`):
+    // one source.
+    let count = |k: &'static str, unit: &str, declared: &str| match v.get(k) {
+        None => Ok(decimal(declared)),
+        Some(x) => x.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+            Refusal::failed(format!("settings: {k} must be a count of {unit} above 0"))
+        }),
     };
-    let secs = count(setting::REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
-    let max = count(
-        setting::BODY_MAX_BYTES,
-        DEFAULT_REQUEST_BODY_MAX_BYTES as u64,
-    )?;
+    let secs = count(setting::REQUEST_TIMEOUT_SECS, "seconds", DEFAULT_TIMEOUT)?;
+    let max = count(setting::BODY_MAX_BYTES, "bytes", DEFAULT_BODY_MAX)?;
     Ok(Posture {
-        keep_alive_interval: Some(Duration::from_secs(30)),
-        keep_alive_timeout: Duration::from_secs(10),
-        adaptive_window: true,
+        keep_alive_interval: Some(KEEP_ALIVE_INTERVAL),
+        keep_alive_timeout: KEEP_ALIVE_TIMEOUT,
+        adaptive_window: ADAPTIVE_WINDOW,
         timeout: Duration::from_secs(secs),
         max_message_bytes: usize::try_from(max).unwrap_or(usize::MAX),
     })
@@ -152,14 +174,18 @@ impl Life for Instance {
 
     fn open(settings: &[u8], _: &[&[u8]], _: u64) -> Result<Self, Refusal> {
         Ok(Self {
-            posture: read_settings(settings)?,
+            posture: Mutex::new(read_settings(settings)?),
             framings: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         })
     }
 
-    fn refresh(&self, _: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+    /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
+    /// force stay; good ones apply to every framing begun after it.
+    fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+        let posture = read_settings(settings)?;
+        *self.posture.lock().unwrap_or_else(PoisonError::into_inner) = posture;
         Ok(Refreshed::default())
     }
 }
@@ -205,6 +231,10 @@ slot!(
             o.error("locate: the target is not a URL");
             return Outcome::Failed;
         };
+        if carries_userinfo(&uri) {
+            o.error("locate: the target carries userinfo; credentials never ride a URL");
+            return Outcome::Failed;
+        }
         let secure = match uri.scheme_str() {
             Some("https") => true,
             Some("http") => false,
@@ -261,6 +291,12 @@ slot!(
     }
 );
 
+/// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a URL
+/// (refused outright, never read on, never echoed), as http and ws refuse it.
+fn carries_userinfo(uri: &http::Uri) -> bool {
+    uri.authority().is_some_and(|a| a.as_str().contains('@'))
+}
+
 /// The framer's own head lines on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
 /// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
 /// auth signs the head, and the dial then sends them as signed: the content
@@ -272,15 +308,17 @@ slot!(
     /// `begin`.
     Begin, BeginIn, FramerOut, |p, i, o| {
         let Some(inst) = mine(&p) else {
+            o.error("begin: no open instance");
             return Outcome::Failed;
         };
+        let posture = *inst.posture.lock().unwrap_or_else(PoisonError::into_inner);
         if i.side() == SIDE_ACCEPT_STREAM {
             let fields = i.fields();
             let opened = StreamCall::open(
                 fields
                     .iter()
                     .map(|f| (f.name().bytes(), f.value().bytes())),
-                inst.posture.max_message_bytes,
+                posture.max_message_bytes,
             );
             let mut call = match opened {
                 Ok(call) => call,
@@ -290,8 +328,7 @@ slot!(
             o.set(|x| &x.framing, token);
             fill(&mut call, i.sink(), &mut o, class_of, fault_of);
             inst.calls
-                .lock()
-                .expect("calls")
+                .lock().unwrap_or_else(PoisonError::into_inner)
                 .insert(token, Arc::new(Mutex::new(call)));
             return Outcome::Ready;
         }
@@ -310,7 +347,11 @@ slot!(
                     o.error("begin: the target is not text");
                     return Outcome::Failed;
                 };
-                match Conn::dial(target, inst.posture, now) {
+                if target.parse::<http::Uri>().is_ok_and(|u| carries_userinfo(&u)) {
+                    o.error("begin: the target carries userinfo; credentials never ride a URL");
+                    return Outcome::Failed;
+                }
+                match Conn::dial(target, posture, now) {
                     Ok(c) => c,
                     Err(_) => {
                         o.error("begin: the target is not a URL");
@@ -318,7 +359,7 @@ slot!(
                     }
                 }
             }
-            SIDE_ACCEPT => Conn::accept(inst.posture, now),
+            SIDE_ACCEPT => Conn::accept(posture, now),
             _ => {
                 o.error("begin: the side is neither accept nor dial");
                 return Outcome::Failed;
@@ -327,12 +368,11 @@ slot!(
         let token = inst.next.fetch_add(1, Ordering::Relaxed);
         let held = Arc::new(Mutex::new(conn));
         inst.framings
-            .lock()
-            .expect("framings")
+            .lock().unwrap_or_else(PoisonError::into_inner)
             .insert(token, held.clone());
         o.set(|x| &x.framing, token);
-        let mut h = held.lock().expect("framing");
-        step(&mut h, i.sink(), &mut o, |_| Ok(()))
+        let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
+        step("begin", &mut h, i.sink(), &mut o, |_| Ok(()))
     }
 );
 
@@ -342,9 +382,9 @@ slot!(
         let bytes = i.bytes();
         if let Some(call) = one_stream(&p, i.framing()) {
             let end = i.end() != 0;
-            return on_stream(&call, i.sink(), &mut o, |c| c.ingest(bytes, end));
+            return on_stream("ingest", &call, i.sink(), &mut o, |c| c.ingest(bytes, end));
         }
-        with(&p, i.framing(), i.sink(), &mut o, |c| {
+        with("ingest", &p, i.framing(), i.sink(), &mut o, |c| {
             c.ingest(bytes, i.end() != 0);
             Ok(())
         })
@@ -356,16 +396,19 @@ slot!(
     Emit, EmitIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
         let (now, deadline, end) = (i.sink().now_monotonic_ns(), i.deadline_ns(), i.end_of_frame() != 0);
+        // A STREAM'S OWN BACKPRESSURE, on one stream as on a connection's: an emit that leaves its
+        // stream's queue at the high-water mark is answered `YIELD_STREAM_FULL` (after the fill, as
+        // the SDK states).
         if let Some(call) = one_stream(&p, i.framing()) {
-            return on_stream(&call, i.sink(), &mut o, |c| {
-                c.emit(bytes, end);
-                Ok(())
-            });
+            let outcome = on_stream("emit", &call, i.sink(), &mut o, |c| c.emit(bytes, end));
+            if matches!(outcome, Outcome::Ready) && call.lock().unwrap_or_else(PoisonError::into_inner).announce_full() {
+                mark_stream_full(&mut o);
+            }
+            return outcome;
         }
-        // A STREAM'S OWN BACKPRESSURE: an emit that leaves its stream's queue at the high-water
-        // mark is answered `YIELD_STREAM_FULL` (after the fill, as the SDK states).
         let stream = i.stream();
         with_then(
+            "emit",
             &p,
             i.framing(),
             i.sink(),
@@ -392,9 +435,13 @@ slot!(
         let bytes = i.bytes();
         if let Some(call) = one_stream(&p, i.framing()) {
             let (status, head_sent) = (i.status(), i.head_sent() != 0);
-            return on_stream(&call, i.sink(), &mut o, |c| c.refuse(bytes, status, head_sent));
+            return on_stream("refuse", &call, i.sink(), &mut o, |c| {
+                c.refuse(bytes, status, head_sent)
+            });
         }
-        with(&p, i.framing(), i.sink(), &mut o, |c| c.end_call(i.stream(), bytes, i.status()))
+        with("refuse", &p, i.framing(), i.sink(), &mut o, |c| {
+            c.end_call(i.stream(), bytes, i.status())
+        })
     }
 );
 
@@ -403,9 +450,9 @@ slot!(
     Timer, FramingIn, FramerOut, |p, i, o| {
         if let Some(call) = one_stream(&p, i.framing()) {
             // One stream asks for no timer (it enforces no deadline): a call only fills.
-            return on_stream(&call, i.sink(), &mut o, |_| Ok(()));
+            return on_stream("timer", &call, i.sink(), &mut o, |_| Ok(()));
         }
-        with(&p, i.framing(), i.sink(), &mut o, |_| Ok(()))
+        with("timer", &p, i.framing(), i.sink(), &mut o, |_| Ok(()))
     }
 );
 
@@ -414,34 +461,54 @@ slot!(
     /// closes its call with the final status the close states (its final tail), as trailers.
     Finish, FinishIn, FramerOut, |p, i, o| {
         let call = mine(&p)
-            .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing()));
+            .and_then(|inst| inst.calls.lock().unwrap_or_else(PoisonError::into_inner).remove(&i.framing()));
         if let Some(call) = call {
             let all = i.final_bytes();
+            // A span of no bytes (absent among them) is none; any other must lie inside the bytes.
             let at = |s: busbar_contract::abi::mechanism::call::Span| {
+                if s.len == 0 {
+                    return Some(&[][..]);
+                }
                 let start = s.offset as usize;
-                all.get(start..start.saturating_add(s.len as usize))
-                    .unwrap_or_default()
+                all.get(start..start.checked_add(s.len as usize)?)
             };
-            let (message, details) = (at(i.final_message()), at(i.final_details()));
+            let (message, details) = match (at(i.final_message()), at(i.final_details())) {
+                (Some(m), Some(d)) => (m, d),
+                (m, _) => {
+                    // Refused, and the call kept for the host's fallback refusal to close.
+                    if let Some(inst) = mine(&p) {
+                        inst.calls.lock().unwrap_or_else(PoisonError::into_inner).insert(i.framing(), call);
+                    }
+                    o.error(if m.is_none() {
+                        "finish: the final message lies outside the close's bytes"
+                    } else {
+                        "finish: the final details lie outside the close's bytes"
+                    });
+                    return Outcome::Failed;
+                }
+            };
             let status = i.final_status();
-            let answered = on_stream(&call, i.sink(), &mut o, |c| {
+            let answered = on_stream("finish", &call, i.sink(), &mut o, |c| {
                 c.finish(status, message, details)
             });
             // A close the sink could not take whole stays until the host's re-call drains it, and a
             // close that failed stays for the host's fallback refusal to close the call.
             let keep = {
-                let c = call.lock().expect("stream");
+                let c = call.lock().unwrap_or_else(PoisonError::into_inner);
                 c.wire_pending() || !c.ended()
             };
             if keep {
                 if let Some(inst) = mine(&p) {
-                    inst.calls.lock().expect("calls").insert(i.framing(), call);
+                    inst.calls.lock().unwrap_or_else(PoisonError::into_inner).insert(i.framing(), call);
                 }
             }
             return answered;
         }
-        let removed = mine(&p)
-            .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing()));
+        let Some(inst) = mine(&p) else {
+            o.error("finish: no open instance");
+            return Outcome::Failed;
+        };
+        let removed = inst.framings.lock().unwrap_or_else(PoisonError::into_inner).remove(&i.framing());
         if removed.is_some() {
             o.set(|x| &x.yielded.flags, YIELD_ENDED);
             Outcome::Ready
@@ -476,7 +543,15 @@ slot!(
             pairs.push((name, f.value().bytes()));
         }
         let body = i.body();
-        let Ok(bytes) = msg::render_head(&pairs, Some(msg::PREFIX + body.len())) else {
+        let Some(prefix) = msg::prefix(body.len()) else {
+            o.error("encode: the message is longer than a gRPC length prefix states");
+            return Outcome::Failed;
+        };
+        // The rendered head (the envelope's fields, an auth's lines among them) is wiped once it is
+        // copied into the host's wire buffer.
+        let Ok(bytes) = msg::render_head(&pairs, Some(msg::PREFIX + body.len()))
+            .map(zeroize::Zeroizing::new)
+        else {
             o.error("encode: the envelope cannot be expressed on this wire");
             return Outcome::Failed;
         };
@@ -486,7 +561,7 @@ slot!(
             return Outcome::Failed;
         }
         wire.extend(&bytes);
-        wire.extend(&msg::prefix(body.len()));
+        wire.extend(&prefix);
         wire.extend(body);
         o.set(|x| &x.yielded.wire_len, wire.written() as u64);
         Outcome::Ready
@@ -495,37 +570,52 @@ slot!(
 
 /// The one-stream framing `token` names, where it names one.
 fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
-    mine(p).and_then(|inst| inst.calls.lock().expect("calls").get(&token).cloned())
+    mine(p).and_then(|inst| {
+        inst.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&token)
+            .cloned()
+    })
 }
 
-/// Run `f` on a one-stream framing, then fill the sink with what it owes.
+/// Run `f` on a one-stream framing, then fill the sink with what it owes. A failure is `op`'s,
+/// in its words (`<op>: <reason>`).
 fn on_stream(
+    op: &'static str,
     call: &Mutex<StreamCall>,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut StreamCall) -> Result<(), transport::Failure>,
 ) -> Outcome {
-    let mut c = call.lock().expect("stream");
+    let mut c = call.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err(e) = f(&mut c) {
-        return o.fail(Refusal::failed(e.0));
+        return o.fail(op_failed(op, &e));
     }
     fill(&mut *c, sink, o, class_of, fault_of);
     Outcome::Ready
 }
 
-/// Run `f` on framing `token`, then drive it and fill the sink.
+/// `op`'s refusal for the framing's failure `e`: `<op>: <reason>`.
+fn op_failed(op: &str, e: &transport::Failure) -> Refusal {
+    Refusal::failed(format!("{op}: {}", e.0))
+}
+
+/// Run `f` on framing `token`, then drive it and fill the sink, as `op`.
 fn with(
+    op: &'static str,
     p: &sdk::Instance<'_, State>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
-    with_then(p, token, sink, o, f, |_, _| {})
+    with_then(op, p, token, sink, o, f, |_, _| {})
 }
 
 /// [`with`], then `then` on the framing and the answer, where the op answered READY.
 fn with_then(
+    op: &'static str,
     p: &sdk::Instance<'_, State>,
     token: u64,
     sink: Lent<'_, FramerSink>,
@@ -533,34 +623,42 @@ fn with_then(
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
     then: impl FnOnce(&Conn, &mut Out<'_, FramerOut>),
 ) -> Outcome {
-    let held =
-        mine(p).and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
-    let Some(held) = held else {
-        o.error("no such framing");
-        return Outcome::Failed;
+    let Some(inst) = mine(p) else {
+        return o.fail(Refusal::failed(format!("{op}: no open instance")));
     };
-    let mut h = held.lock().expect("framing");
-    let outcome = step(&mut h, sink, o, f);
+    let held = inst
+        .framings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&token)
+        .cloned();
+    let Some(held) = held else {
+        return o.fail(Refusal::failed(format!("{op}: no such framing")));
+    };
+    let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
+    let outcome = step(op, &mut h, sink, o, f);
     if matches!(outcome, Outcome::Ready) {
         then(&h, o);
     }
     outcome
 }
 
+/// Run `f` on `c`, drive it and fill the sink, as `op`: a failure is `op`'s, in its words.
 fn step(
+    op: &'static str,
     c: &mut Conn,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
     if let Err(e) = f(c) {
-        return o.fail(Refusal::failed(e.0));
+        return o.fail(op_failed(op, &e));
     }
     c.drive(sink.now_monotonic_ns());
     let pending = c.wire_pending() || !c.pieces().is_empty();
     if let Some(e) = c.failure().cloned() {
         if !pending {
-            return o.fail(Refusal::failed(e.0));
+            return o.fail(op_failed(op, &e));
         }
     }
     fill(c, sink, o, class_of, fault_of);

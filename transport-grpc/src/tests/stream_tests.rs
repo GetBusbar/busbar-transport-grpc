@@ -37,10 +37,10 @@ fn the_bodys_messages_are_the_units_payloads() {
 #[test]
 fn a_reply_emitted_in_pieces_is_one_message_and_the_wire_drains_in_cuts() {
     let mut c = grpc();
-    c.emit(b"he", false);
-    c.emit(b"", false);
-    c.emit(b"llo", true);
-    c.emit(b"!", true);
+    c.emit(b"he", false).unwrap();
+    c.emit(b"", false).unwrap();
+    c.emit(b"llo", true).unwrap();
+    c.emit(b"!", true).unwrap();
     let mut want = msg::frame(b"hello");
     want.extend(msg::frame(b"!"));
     let mut got = c.take_wire(3);
@@ -54,7 +54,7 @@ fn a_reply_emitted_in_pieces_is_one_message_and_the_wire_drains_in_cuts() {
 #[test]
 fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
     let mut c = grpc();
-    c.emit(b"hi", true);
+    c.emit(b"hi", true).unwrap();
     assert_eq!(c.take_wire(usize::MAX), msg::frame(b"hi"));
     c.finish(5, b"no such", b"AAEC").unwrap();
     assert_eq!(
@@ -152,7 +152,7 @@ fn a_stated_grpc_timeout_is_never_enforced_here() {
         c.pieces().drain(..).all(|p| !p.failed),
         "nothing fails the call"
     );
-    c.emit(b"late but answered", true);
+    c.emit(b"late but answered", true).unwrap();
     c.finish(0, b"", b"").unwrap();
     let mut answer = msg::frame(b"late but answered");
     answer.extend_from_slice(b"grpc-status: 0\r\n");
@@ -167,12 +167,12 @@ fn an_emit_after_the_close_writes_nothing() {
     let mut c = grpc();
     c.refuse(b"", 429, false).unwrap();
     drop(c.take_wire(usize::MAX));
-    c.emit(b"late", true);
+    c.emit(b"late", true).unwrap();
     assert_eq!(wire(&mut c), "", "nothing after the close");
     let mut c = grpc();
     c.finish(0, b"", b"").unwrap();
     drop(c.take_wire(usize::MAX));
-    c.emit(b"late", true);
+    c.emit(b"late", true).unwrap();
     assert_eq!(wire(&mut c), "");
 }
 
@@ -249,4 +249,54 @@ fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
     c.refuse(b"grpc-status: 7\r\ngrpc-message: no\r\n", 0, true)
         .unwrap();
     assert_eq!(wire(&mut c), "grpc-status: 7\r\ngrpc-message: no\r\n");
+}
+
+/// A REFUSAL STATING NO STATUS EITHER WAY IS `UNKNOWN` WITH ITS OWN WORDS, as the connection side
+/// ends the same refusal: no `grpc-status` in its bytes and no neutral status (`0`, none stated).
+/// RED: `busbar answered HTTP 0`, a status nobody stated and the refusal's words lost.
+#[test]
+fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
+    let mut c = grpc();
+    c.refuse(b"upstream gone", 0, false).unwrap();
+    assert_eq!(
+        wire(&mut c),
+        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 2\r\n\
+         grpc-message: upstream%20gone\r\n"
+    );
+}
+
+/// The same on one stream: a refusal whose block names `grpc-status` but is no field block fails in
+/// words, writes nothing, and leaves the call for the fallback close. RED: `busbar answered HTTP
+/// 500`.
+#[test]
+fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
+    let mut c = grpc();
+    let why = c
+        .refuse(b"grpc-status: 5\r\nbroken line\r\n", 500, false)
+        .expect_err("refused in words");
+    assert_eq!(
+        why.0,
+        "the trailer block names grpc-status but is not a field block: a head line is not a field"
+    );
+    assert_eq!(wire(&mut c), "", "nothing written");
+    c.refuse(b"", 500, false).expect("the fallback closes it");
+    assert!(wire(&mut c).contains("grpc-status: 2\r\n"));
+}
+
+/// A REFUSAL BLOCK'S OWN `content-type` (and any connection-specific field) IS DROPPED, as the
+/// connection side drops it: the trailers-only answer states one content type, the framer's, and
+/// never a field HTTP/2 forbids (RFC 9113 §8.2.2). RED: two `content-type` lines.
+#[test]
+fn a_refusal_blocks_own_content_type_and_connection_fields_are_dropped() {
+    let mut c = grpc();
+    c.refuse(
+        b"content-type: application/grpc+proto\r\nconnection: close\r\ngrpc-status: 7\r\n",
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        wire(&mut c),
+        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 7\r\n"
+    );
 }

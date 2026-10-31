@@ -6,7 +6,7 @@
 //! The test is the HOST (`common`): it holds an in-memory socket whose far end is tonic's service
 //! (dialled scenarios) or tonic's client (the accepted scenario), a virtual clock, and the sink.
 //! Every answer is judged by the transport kind's own check. Each scenario runs through the
-//! linked door and through the cdylib `cargo test` built from `examples/grpc_door.rs`. Both
+//! linked door and through the shipped dropped-in image, the plugin crate's cdylib. Both
 //! must print the same proof lines, and an exchange re-called through a tiny sink must equal
 //! the roomy one byte for byte.
 
@@ -24,6 +24,20 @@ use common::*;
 
 const QUIET: Duration = Duration::from_millis(300);
 
+/// The most a scenario waits on the far end (idle) before it is judged: a loaded runner's stall is
+/// waited out, never read as the far end's answer.
+const BOUND: Duration = Duration::from_secs(10);
+
+/// Pump until `stream` has its terminal piece, and say so: never index an exchange that is not
+/// over.
+fn until_over(host: &mut Host, stream: u64) {
+    assert_eq!(
+        host.pump_until(BOUND, move |got| over(got, stream).is_some()),
+        Outcome::Ready
+    );
+    assert!(over(&host.got, stream).is_some(), "stream {stream} ended");
+}
+
 /// Dial scenarios against tonic's service; answer the proof lines.
 fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<String>, Host) {
     let mut proof = Vec::new();
@@ -40,7 +54,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // Unary, with the caller's deadline five seconds out.
     host.ask(1, "/t.T/Unary", b"hello", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 1);
     let f = host.frames(1);
     proof.push(format!(
         "unary head x-answer={:?} content-type={:?}",
@@ -55,7 +69,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // Server streaming.
     host.ask(3, "/t.T/List", b"q", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 3);
     let f = host.frames(3);
     proof.push(format!("list messages {:?}", &f[1..]));
     assert_eq!(f[1..], [lpm(b"a"), lpm(b"bb"), lpm(b"ccc")]);
@@ -63,7 +77,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // A non-zero status: trailers-only, percent-encoded message, classed as the caller's fault.
     host.ask(5, "/t.T/Fail", b"k", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 5);
     proof.push(format!("fail terminal {:?}", host.terminal(5)));
     assert_eq!(
         host.terminal(5),
@@ -72,7 +86,7 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
 
     // An unknown method: UNIMPLEMENTED, the far end's fault.
     host.ask(7, "/t.T/Nope", b"", t0 + 5 * SEC);
-    host.pump_until(QUIET, |_| false);
+    until_over(&mut host, 7);
     let t = host.terminal(7).expect("terminal");
     proof.push(format!("nope terminal code={} class={}", t.0, t.1));
     assert_eq!((t.0, t.1, t.2), (12, STATUS_FAR_END_FAULT, true));
@@ -127,7 +141,9 @@ fn accept(ops: &'static Ops, rt: &tokio::runtime::Runtime) -> Vec<String> {
         .await
     });
     // The call's head, its message, then the client's last.
-    host.pump_until(QUIET, |_| false);
+    let last = |got: &[Got]| got.iter().any(|g| g.stream == 1 && g.end());
+    assert_eq!(host.pump_until(BOUND, last), Outcome::Ready);
+    assert!(last(&host.got), "the client's last arrived");
     let f = host.frames(1);
     let words = host.head_words(1).expect("the call's head words");
     proof.push(format!(
@@ -595,7 +611,8 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
             validate(ops, r#"{"limits.upstream_request_timeout_secs":"5"}"#),
             (
                 Outcome::Failed,
-                "settings: a value is not of its declared kind".to_owned()
+                "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0"
+                    .to_owned()
             )
         );
         let host = Host::open(ops, "{}", ROOMY);
@@ -624,6 +641,265 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
         ]
         .map(refused);
         assert_eq!(got, want);
+        host.close();
+    }
+}
+
+/// ONE STREAM'S REPLY HAS THE BACKPRESSURE AND THE BOUND A CONNECTION'S STREAM HAS (the transport
+/// ABI's "A STREAM'S OWN BACKPRESSURE"). The host's far end is not reading, so what the sink cannot
+/// take stays queued: the emit that leaves the queue at its high-water mark is answered
+/// `YIELD_STREAM_FULL`; once the far end reads again and the queue drains, the stream hands one
+/// writable piece; a host that emits past the bound has the reply cut in words, and the call then
+/// closes `RESOURCE_EXHAUSTED` whatever close it states. Both images. RED: no emit was ever answered
+/// full, and the reply queue grew without bound.
+#[test]
+fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
+    use busbar_contract::abi::transport::{PIECE_WRITABLE, YIELD_STREAM_FULL};
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let settings = r#"{"limits.request_body_max_bytes":65536}"#;
+        let mut host = Host::open(ops, settings, Caps(4096, 4096, 8));
+        let fields = [("content-type", "application/grpc")];
+        assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
+        let m = vec![7u8; 60_000];
+        let full = (0..40).find(|_| {
+            let (r, flags, _) = host.emit_held(1, &m, true);
+            assert_eq!(r, Outcome::Ready);
+            flags & YIELD_STREAM_FULL != 0
+        });
+        assert!(
+            full.is_some(),
+            "the reply's queue reached its high-water mark"
+        );
+        assert_eq!(
+            host.emit_drain(1),
+            Outcome::Ready,
+            "the far end reads again"
+        );
+        let writable: Vec<&Got> = host
+            .got
+            .iter()
+            .filter(|g| g.flags & PIECE_WRITABLE != 0)
+            .collect();
+        assert_eq!(writable.len(), 1, "one writable piece once drained");
+
+        let cut = (0..400).find_map(|_| match host.emit_held(1, &m, true) {
+            (Outcome::Ready, _, _) => None,
+            other => Some(other),
+        });
+        let (r, _, why) = cut.expect("a host emitting past the bound has the reply cut");
+        assert_eq!(r, Outcome::Failed);
+        assert_eq!(
+            why,
+            "emit: the stream's queue is past its bound: the far end is not reading"
+        );
+        assert_eq!(host.emit_drain(1), Outcome::Ready);
+        let at = host.wire_log.len();
+        assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            "grpc-status: 8\r\ngrpc-message: the%20stream's%20queue%20is%20past%20its%20bound:\
+             %20the%20far%20end%20is%20not%20reading\r\n",
+            "the cut reply closes RESOURCE_EXHAUSTED, never OK"
+        );
+        host.close();
+    }
+}
+
+/// A FINAL TAIL WHOSE SPAN LIES OUTSIDE ITS BYTES IS REFUSED IN WORDS, never read as no message:
+/// `finish` fails naming the span, writes nothing, and leaves the call for the host's fallback
+/// refusal to close. RED: the close went out as `grpc-status: 5` alone, its message silently lost.
+#[test]
+fn a_final_tail_whose_span_lies_outside_its_bytes_is_refused_in_words() {
+    use busbar_contract::abi::mechanism::call::Span;
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        let at = host.wire_log.len();
+        let past = Span { offset: 2, len: 10 };
+        let none = Span { offset: 0, len: 0 };
+        assert_eq!(
+            host.finish_spans(5, b"gone", past, none),
+            (
+                Outcome::Failed,
+                "finish: the final message lies outside the close's bytes".to_owned()
+            )
+        );
+        assert_eq!(host.wire_log.len(), at, "nothing written");
+        assert_eq!(
+            host.finish_spans(5, b"gone", none, past),
+            (
+                Outcome::Failed,
+                "finish: the final details lie outside the close's bytes".to_owned()
+            )
+        );
+        assert_eq!(host.refuse_as(1, b"", 500), Outcome::Ready);
+        assert!(
+            String::from_utf8_lossy(&host.wire_log[at..]).contains("grpc-status: 2\r\n"),
+            "the fallback refusal closes the call"
+        );
+        host.close();
+    }
+}
+
+/// A HOST BUFFER TOO SMALL FOR `locate`'S ANSWER IS A SHORT ANSWER, never a truncated success: each
+/// buffer's needed size is stated, whichever is short (the framer's own head lines too, which every
+/// call is owed), and on the listener path the offer's. Both images.
+#[test]
+fn locate_answers_short_for_any_buffer_too_small() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let target = "https://peer.test";
+        for (k, caps) in [
+            [3, 256, 64, 256],
+            [256, 3, 64, 256],
+            [256, 256, 1, 256],
+            [256, 256, 64, 5],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (r, o, why) = host.locate_lent(target, false, caps);
+            assert_eq!(r, Outcome::Failed, "buffer {k}");
+            assert_eq!(why, "locate: a host buffer is too small", "buffer {k}");
+            assert_eq!(
+                (
+                    o.authority_needed,
+                    o.name_needed,
+                    o.alpn_needed,
+                    o.defaults_needed
+                ),
+                (13, 9, 3, 46),
+                "buffer {k}: every needed size stated"
+            );
+        }
+        let (r, o, why) = host.locate_lent("", true, [0, 0, 2, 0]);
+        assert_eq!(
+            (r, o.alpn_needed, why.as_str()),
+            (Outcome::Failed, 3, "locate: a host buffer is too small")
+        );
+        host.close();
+    }
+}
+
+/// `refresh` READS ITS SETTINGS AS `validate` DOES, and new ones apply to framings begun after it:
+/// an undeclared key or a bad value is refused in validate's words (the settings in force stay),
+/// and a new ceiling bounds the next stream's messages. Both images. RED: refresh took any blob and
+/// applied nothing.
+#[test]
+fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        assert_eq!(
+            host.refresh(r#"{"limits.nope":1}"#),
+            (
+                Outcome::Failed,
+                "settings: limits.nope is not a setting this transport reads".to_owned()
+            )
+        );
+        assert_eq!(
+            host.refresh(r#"{"limits.request_body_max_bytes":0}"#),
+            (
+                Outcome::Failed,
+                "settings: limits.request_body_max_bytes must be a count of bytes above 0"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            host.refresh(r#"{"limits.request_body_max_bytes":16}"#),
+            (Outcome::Ready, String::new())
+        );
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        assert_eq!(
+            host.feed(&lpm(&[7u8; 17]), false),
+            Outcome::Failed,
+            "the new ceiling"
+        );
+        host.close();
+    }
+}
+
+/// EVERY OP'S TEXT NAMES ITS OP (`<op>: <reason>`, the kind's grammar), the framing's own failures
+/// included: an op with no open instance, on no such framing, or failed by the framing. Both
+/// images. RED: `begin` with no instance answered a bare FAILED, and the others no op.
+#[test]
+fn every_ops_text_names_its_op() {
+    use busbar_contract::abi::transport::{
+        slot, BeginIn, EmitIn, FramerOut, FramingIn, IngestIn, RefuseIn, SIDE_ACCEPT,
+    };
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let o = host.ops;
+        assert_eq!(
+            host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, false, |i| {
+                i.side = SIDE_ACCEPT;
+            }),
+            (Outcome::Failed, "begin: no open instance".to_owned())
+        );
+        assert_eq!(
+            host.op_text::<IngestIn, FramerOut>(o.ingest, slot::INGEST, true, |i| i.framing = 999),
+            (Outcome::Failed, "ingest: no such framing".to_owned())
+        );
+        assert_eq!(
+            host.op_text::<FramingIn, FramerOut>(o.timer, slot::TIMER, true, |i| i.framing = 999),
+            (Outcome::Failed, "timer: no such framing".to_owned())
+        );
+        host.begin(SIDE_ACCEPT, "", "", None);
+        let framing = host.framing;
+        assert_eq!(
+            host.op_text::<RefuseIn, FramerOut>(o.refuse, slot::REFUSE, true, |i| {
+                i.framing = framing;
+                i.stream = 9;
+                i.has_stream = 1;
+            }),
+            (Outcome::Failed, "refuse: no such stream: 9".to_owned())
+        );
+        assert_eq!(
+            host.op_text::<EmitIn, FramerOut>(o.emit, slot::EMIT, true, |i| {
+                i.framing = framing;
+                i.stream = 9;
+            }),
+            (Outcome::Failed, "emit: no such stream: 9".to_owned())
+        );
+        host.close();
+    }
+}
+
+/// A TARGET CARRYING USERINFO IS REFUSED AT `locate` AND AT `begin`, as http and ws refuse it, and
+/// never echoed: a credential never rides a URL. Both images. RED: `locate` dropped the userinfo
+/// silently and answered READY, and `begin` dialled with it.
+#[test]
+fn a_target_carrying_userinfo_is_refused_and_never_echoed() {
+    use busbar_contract::abi::transport::{slot, BeginIn, FramerOut, SIDE_DIAL};
+    let (d, _lib) = dropped();
+    let target = "https://user:secret@peer.test";
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let (r, _, why) = host.locate_lent(target, false, [256, 256, 64, 256]);
+        assert_eq!(
+            (r, why.as_str()),
+            (
+                Outcome::Failed,
+                "locate: the target carries userinfo; credentials never ride a URL"
+            )
+        );
+        let o = host.ops;
+        let (r, why) = host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, true, |i| {
+            i.side = SIDE_DIAL;
+            i.target = s(target);
+        });
+        assert_eq!(
+            (r, why.as_str()),
+            (
+                Outcome::Failed,
+                "begin: the target carries userinfo; credentials never ride a URL"
+            )
+        );
+        assert!(!why.contains("secret"));
         host.close();
     }
 }

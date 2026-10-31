@@ -9,13 +9,18 @@ use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 use busbar_contract::abi::transport::{
-    FaultRow, SettingDecl, StatusRow, TransportTail, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
-    FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
-    STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    FaultRow, SettingDecl, StatusRow, TransportTail, FACT_ACCEPTS, FACT_DIALS, FAULT_CALLER,
+    FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
+    SETTING_COUNT, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
 };
+use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 
 /// This transport's key: the scheme it claims.
 pub const KEY: &str = "grpc";
+
+/// Whether its claim carries sessions: a connection multiplexes calls, each its own stream and
+/// session (the claim row's `session`).
+pub(crate) const SESSION: bool = true;
 
 /// The settings this transport reads.
 pub mod setting {
@@ -141,12 +146,31 @@ pub(crate) fn fault_of_http(status: u16) -> u8 {
         .map_or(FAULT_CALLER, |(_, _, f)| *f)
 }
 
+/// The request timeout's declared default, as the decimal text a setting declaration states it in.
+pub(crate) const DEFAULT_TIMEOUT: &str = "300";
+
+/// `text` read as a decimal count (digits alone, as the declared defaults are).
+pub(crate) const fn decimal(text: &str) -> u64 {
+    let b = text.as_bytes();
+    let mut n = 0;
+    let mut i = 0;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    n
+}
+
+// The declared default is the timeout the door applies when the setting is absent: one fact, held
+// equal (as the SDK holds `DEFAULT_BODY_MAX` to its bound).
+const _: () = assert!(decimal(DEFAULT_TIMEOUT) == DEFAULT_REQUEST_TIMEOUT_SECS);
+
 pub(crate) const SETTINGS: &[SettingDecl] = &[
     SettingDecl {
         path: abi_str(setting::REQUEST_TIMEOUT_SECS),
         kind: SETTING_COUNT,
         _reserved: 0,
-        default: abi_str("300"),
+        default: abi_str(DEFAULT_TIMEOUT),
     },
     SettingDecl {
         path: abi_str(setting::BODY_MAX_BYTES),
@@ -166,5 +190,8 @@ pub(crate) const TAIL: TransportTail = {
     t.role = ROLE_FRAMER;
     t.framing = FRAMING_STREAM;
     t.frame_piece_size = FRAME_PIECE_SIZE;
+    // The ops this door serves: it dials, and it serves the accepted side (`begin` on
+    // `SIDE_ACCEPT` and `SIDE_ACCEPT_STREAM`). It neither detaches nor adopts (`not_served!`).
+    t.facts = FACT_ACCEPTS | FACT_DIALS;
     t
 };

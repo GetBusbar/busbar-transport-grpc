@@ -41,18 +41,19 @@ pub fn is_grpc_content_type(v: &[u8]) -> bool {
         && matches!(v.get(base.len()), None | Some(b'+' | b';'))
 }
 
-/// The prefix of a message whose payload is `len` bytes.
+/// The prefix of a message whose payload is `len` bytes; `None` past `u32::MAX`, a length no
+/// prefix states.
 #[must_use]
-pub fn prefix(len: usize) -> [u8; PREFIX] {
-    let n = u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes();
-    [0, n[0], n[1], n[2], n[3]]
+pub fn prefix(len: usize) -> Option<[u8; PREFIX]> {
+    let n = u32::try_from(len).ok()?.to_be_bytes();
+    Some([0, n[0], n[1], n[2], n[3]])
 }
 
 /// `payload` in its length-prefixed form.
 #[cfg(test)]
 pub fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREFIX + payload.len());
-    out.extend_from_slice(&prefix(payload.len()));
+    out.extend_from_slice(&prefix(payload.len()).expect("a test payload is short"));
     out.extend_from_slice(payload);
     out
 }
@@ -148,6 +149,8 @@ impl std::fmt::Display for Bad {
 pub struct Messages {
     buf: BytesMut,
     max: usize,
+    /// The stream is not one: every later push answers this, and nothing more is held.
+    failed: Option<Bad>,
 }
 
 impl Messages {
@@ -157,6 +160,7 @@ impl Messages {
         Self {
             buf: BytesMut::new(),
             max,
+            failed: None,
         }
     }
 
@@ -166,51 +170,61 @@ impl Messages {
     ///
     /// A message is compressed or over the ceiling.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, Bad> {
-        self.buf.extend_from_slice(bytes);
-        let mut out = Vec::new();
-        while self.buf.len() >= PREFIX {
-            if self.buf[0] != 0 {
-                return Err(Bad::Compressed);
-            }
-            let n =
-                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
-            if n > self.max {
-                return Err(Bad::TooLarge(n, self.max));
-            }
-            if self.buf.len() < PREFIX + n {
-                break;
-            }
-            out.push(self.buf.split_to(PREFIX + n).freeze());
-        }
-        Ok(out)
+        self.push_bytes(Bytes::copy_from_slice(bytes))
     }
 
     /// [`Messages::push`] for bytes already shared: with nothing held back, each whole message in
-    /// `data` is a slice of it (no copy), and only a cut tail is held.
+    /// `data` is a slice of it (no copy), and only a cut tail is held. Once the stream failed,
+    /// every push answers that failure and holds nothing.
     ///
     /// # Errors
     ///
     /// A message is compressed or over the ceiling.
     pub fn push_bytes(&mut self, mut data: Bytes) -> Result<Vec<Bytes>, Bad> {
-        if !self.buf.is_empty() {
-            return self.push(&data);
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
         }
-        let mut out = Vec::new();
-        while data.len() >= PREFIX {
-            if data[0] != 0 {
+        let cut = if self.buf.is_empty() {
+            self.whole(&data).map(|lens| {
+                let out = lens.into_iter().map(|n| data.split_to(n)).collect();
+                self.buf.extend_from_slice(&data);
+                out
+            })
+        } else {
+            self.buf.extend_from_slice(&data);
+            self.whole(&self.buf).map(|lens| {
+                lens.into_iter()
+                    .map(|n| self.buf.split_to(n).freeze())
+                    .collect()
+            })
+        };
+        cut.inspect_err(|e| {
+            self.failed = Some(e.clone());
+            self.buf = BytesMut::new();
+        })
+    }
+
+    /// THE ONE CUT: the length (prefix and payload) of each whole message off the front of `data`,
+    /// in order; a cut tail is left for the next push.
+    fn whole(&self, data: &[u8]) -> Result<Vec<usize>, Bad> {
+        let mut lens = Vec::new();
+        let mut rest = data;
+        while rest.len() >= PREFIX {
+            if rest[0] != 0 {
                 return Err(Bad::Compressed);
             }
-            let n = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-            if n > self.max {
+            let n = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+            // Checked: on a 32-bit target a ceiling near `usize::MAX` must not wrap the length.
+            let Some(len) = PREFIX.checked_add(n).filter(|_| n <= self.max) else {
                 return Err(Bad::TooLarge(n, self.max));
-            }
-            if data.len() < PREFIX + n {
+            };
+            if rest.len() < len {
                 break;
             }
-            out.push(data.split_to(PREFIX + n));
+            lens.push(len);
+            rest = &rest[len..];
         }
-        self.buf.extend_from_slice(&data);
-        Ok(out)
+        Ok(lens)
     }
 
     /// The stream ended.
@@ -285,7 +299,8 @@ pub fn status_of_http(code: u16) -> u16 {
 /// `HTTP_1_1_REQUIRED`), `STREAM_CLOSED`, which it does not list, and a code HTTP/2 does not
 /// define. RFC 9113 §7 permits this, saying an unknown code MAY be treated as `INTERNAL_ERROR`, and
 /// nothing about such a stream says the far end processed nothing, so it is never read as safe to
-/// retry.
+/// retry. (The one exception is the caller's: a far end's graceful GOAWAY, `NO_ERROR`, says exactly
+/// that, and the dial reads it `UNAVAILABLE`.)
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
     match code {
@@ -351,6 +366,9 @@ pub fn parse_status(v: &[u8]) -> u16 {
         .unwrap_or(UNKNOWN)
 }
 
+/// The most bytes of a far end's `grpc-message` handed to the host as a failure's text.
+pub const MESSAGE_TEXT_MAX: usize = 4096;
+
 /// `grpc-message`, percent-decoded (a malformed escape stays as it was sent).
 #[must_use]
 pub fn decode_message(v: &[u8]) -> Vec<u8> {
@@ -374,6 +392,30 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// A far end's `grpc-message` value as the text the host is handed for the call's failure:
+/// percent-decoded ([`decode_message`]), read as UTF-8 with every invalid sequence replaced (U+FFFD),
+/// every control character escaped as Rust writes it (`\n`, `\u{1b}`), so no terminal escape or
+/// forged log line passes through, and cut to at most [`MESSAGE_TEXT_MAX`] bytes on a character's
+/// edge.
+#[must_use]
+pub fn message_text(v: &[u8]) -> Vec<u8> {
+    let decoded = decode_message(v);
+    let mut out = String::with_capacity(decoded.len().min(MESSAGE_TEXT_MAX));
+    for c in String::from_utf8_lossy(&decoded).chars() {
+        let before = out.len();
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+        if out.len() > MESSAGE_TEXT_MAX {
+            out.truncate(before);
+            break;
+        }
+    }
+    out.into_bytes()
 }
 
 /// `text` as a `grpc-message` value, for every `grpc-message` this door writes, on either accept
@@ -402,6 +444,40 @@ pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
         block.extend_from_slice(b"\r\n");
     }
     block
+}
+
+/// A refusal's bytes read as a trailer block: the block, where it states a `grpc-status`; `None`
+/// where it states none, or where the bytes are words and no block at all (both close with the
+/// refusal's neutral status). Words that merely mention `grpc-status` (a failure's text relayed as
+/// the refusal, say) are words.
+///
+/// # Errors
+///
+/// A line of the bytes is a `grpc-status:` field but the bytes are no field block: the host meant
+/// a status it did not write whole, which is said, never silently replaced by the neutral status's
+/// mapping.
+pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
+    match read_head(&terminate_block(bytes), usize::MAX) {
+        Ok(Some((h, _))) => Ok(h.get(GRPC_STATUS).is_some().then_some(h)),
+        Ok(None) => Ok(None),
+        Err(why) => {
+            let status_line = |line: &[u8]| {
+                let line = line.trim_ascii_start();
+                line.len() > GRPC_STATUS.len()
+                    && line[..GRPC_STATUS.len()].eq_ignore_ascii_case(GRPC_STATUS.as_bytes())
+                    && line[GRPC_STATUS.len()..]
+                        .trim_ascii_start()
+                        .starts_with(b":")
+            };
+            if bytes.split(|b| *b == b'\n').any(status_line) {
+                Err(format!(
+                    "the trailer block names grpc-status but is not a field block: {why}"
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// A stream's closing status lines in tonic 0.14's bytes and order (`Status::add_header`):
@@ -439,6 +515,16 @@ pub struct Head {
     pub fields: Vec<(String, Vec<u8>)>,
     /// The message stream's length, when the block states it.
     pub content_length: Option<usize>,
+}
+
+/// A head's values are wiped when it drops: a dialled head carries the auth's credential lines.
+impl Drop for Head {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (_, value) in &mut self.fields {
+            value.zeroize();
+        }
+    }
 }
 
 impl Head {
