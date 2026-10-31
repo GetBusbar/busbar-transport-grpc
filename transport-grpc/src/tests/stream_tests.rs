@@ -300,3 +300,47 @@ fn a_refusal_blocks_own_content_type_and_connection_fields_are_dropped() {
         ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 7\r\n"
     );
 }
+
+#[test]
+fn an_unfinished_large_reply_can_finish_before_drainable_wire_backpressure() {
+    let mut c = StreamCall::open(
+        [(&b"content-type"[..], &b"application/grpc"[..])].into_iter(),
+        2 * STREAM_HIGH_WATER,
+    )
+    .unwrap();
+    let mut payload = vec![b'a'; STREAM_HIGH_WATER];
+    c.emit(&payload, false).unwrap();
+    assert!(
+        !c.wire_pending(),
+        "an unfinished frame has no drainable wire"
+    );
+    assert!(
+        !c.announce_full(),
+        "Full would prevent the host submitting the final fragment"
+    );
+    assert!(c.take_wire(usize::MAX).is_empty());
+    assert!(c.pieces().is_empty(), "no spurious writable before Full");
+
+    c.emit(b"tail", true).unwrap();
+    payload.extend_from_slice(b"tail");
+    let expected = msg::frame(&payload);
+    assert!(
+        c.announce_full(),
+        "the complete, drainable reply still applies backpressure"
+    );
+    let mut got = c.take_wire(expected.len() - STREAM_LOW_WATER - 1);
+    assert!(c.pieces().is_empty(), "above low water remains full");
+    got.extend(c.take_wire(1));
+    let writable: Vec<_> = c.pieces().drain(..).collect();
+    assert_eq!(writable.len(), 1);
+    assert!(writable[0].writable);
+    assert_eq!(writable[0].stream, STREAM);
+    assert!(writable[0].bytes.is_empty());
+    got.extend(c.take_wire(usize::MAX));
+    assert_eq!(
+        got, expected,
+        "one exact framed reply, with no lost or repeated bytes"
+    );
+    assert!(c.pieces().is_empty(), "writable is announced once");
+    assert!(!c.announce_full());
+}
