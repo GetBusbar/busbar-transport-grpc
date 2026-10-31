@@ -69,6 +69,13 @@ use hyper::server::conn::http2 as server;
 
 use crate::msg::{self, Head, Messages};
 
+/// A head block the host emitted, held until it is whole: wiped when it drops, since a dialled
+/// head carries the auth's credential lines (TSEAL: until the attach slot is sealed, credentials
+/// reach the framer as plaintext, and the framer wipes the copies it owns). The copies `hyper` and
+/// `http` make of the fields it sends (a `HeaderMap`, HPACK's table) are the libraries' and are not
+/// wiped here; nor is an earlier allocation a growing buffer moved out of.
+type HeadBuf = zeroize::Zeroizing<Vec<u8>>;
+
 /// The connection posture every framing carries.
 #[derive(Debug, Clone, Copy)]
 pub struct Posture {
@@ -336,9 +343,7 @@ impl Conn {
     ///
     /// `target` is not a URL with a host.
     pub fn dial(target: &str, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
-        let uri: http::Uri = target
-            .parse()
-            .map_err(|_| Failure("not a target".into()))?;
+        let uri: http::Uri = target.parse().map_err(|_| Failure("not a target".into()))?;
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
             return Err(Failure("not a target".into()));
         };
@@ -524,8 +529,9 @@ impl Conn {
                             return Ok(());
                         }
                         Ok(Some((head, took))) => {
-                            let mut rest = std::mem::take(&mut s.head_buf);
-                            rest.drain(..took);
+                            // The head block's bytes are wiped as the buffer drops; the message
+                            // bytes after it go on.
+                            let rest = std::mem::take(&mut s.head_buf)[took..].to_vec();
                             if let Err(why) = s.send_head(&head, None) {
                                 // Failed as a malformed head block is, above.
                                 s.fail_reply(msg::INTERNAL, why.as_bytes());
@@ -746,7 +752,7 @@ impl Dial {
 
 enum DStage {
     /// The head block, still arriving.
-    Head(Vec<u8>),
+    Head(HeadBuf),
     /// A request, waiting for the connection to take it.
     Queued(Request<ChanBody>),
     /// Sent; waiting for the answer's head.
@@ -769,7 +775,7 @@ struct DialStream {
 impl DialStream {
     fn new(sleep: Pin<Box<dyn Sleep>>) -> Self {
         Self {
-            stage: DStage::Head(Vec::new()),
+            stage: DStage::Head(HeadBuf::default()),
             chan: Chan::default(),
             left: None,
             sleep,
@@ -791,8 +797,9 @@ impl DialStream {
                     }
                     return Ok(());
                 };
-                let mut rest = std::mem::take(buf);
-                rest.drain(..took);
+                // The head block's bytes (an auth's credential lines among them) are wiped as the
+                // buffer drops; the message bytes after it go on.
+                let rest = std::mem::take(buf)[took..].to_vec();
                 let req = self.request(base, &head)?;
                 self.left = head.content_length;
                 self.stage = DStage::Queued(req);
@@ -1203,7 +1210,7 @@ struct AStream {
     body: Option<(Incoming, Messages)>,
     reply: Reply,
     content_type: HeaderValue,
-    head_buf: Vec<u8>,
+    head_buf: HeadBuf,
     head_sent: bool,
     reply_over: bool,
 }
@@ -1383,7 +1390,7 @@ impl Accept {
                     body: Some((req.into_body(), Messages::new(max))),
                     reply,
                     content_type: ct,
-                    head_buf: Vec::new(),
+                    head_buf: HeadBuf::default(),
                     head_sent: false,
                     reply_over: false,
                 },

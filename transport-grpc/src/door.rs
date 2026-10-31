@@ -537,7 +537,11 @@ slot!(
             o.error("encode: the message is longer than a gRPC length prefix states");
             return Outcome::Failed;
         };
-        let Ok(bytes) = msg::render_head(&pairs, Some(msg::PREFIX + body.len())) else {
+        // The rendered head (the envelope's fields, an auth's lines among them) is wiped once it is
+        // copied into the host's wire buffer.
+        let Ok(bytes) = msg::render_head(&pairs, Some(msg::PREFIX + body.len()))
+            .map(zeroize::Zeroizing::new)
+        else {
             o.error("encode: the envelope cannot be expressed on this wire");
             return Outcome::Failed;
         };

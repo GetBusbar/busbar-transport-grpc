@@ -517,6 +517,16 @@ pub struct Head {
     pub content_length: Option<usize>,
 }
 
+/// A head's values are wiped when it drops: a dialled head carries the auth's credential lines.
+impl Drop for Head {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (_, value) in &mut self.fields {
+            value.zeroize();
+        }
+    }
+}
+
 impl Head {
     /// The value of the first field named `name` (any case).
     #[must_use]
