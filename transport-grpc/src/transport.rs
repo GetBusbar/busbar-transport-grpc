@@ -338,9 +338,9 @@ impl Conn {
     pub fn dial(target: &str, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let uri: http::Uri = target
             .parse()
-            .map_err(|_| Failure(format!("not a target: {target}")))?;
+            .map_err(|_| Failure("not a target".into()))?;
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
-            return Err(Failure(format!("not a target: {target}")));
+            return Err(Failure("not a target".into()));
         };
         // The authority without its userinfo: a credential never goes out as `:authority` (RFC
         // 9113 §8.3.1), and the authority is the one `locate` stated.

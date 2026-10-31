@@ -219,6 +219,10 @@ slot!(
             o.error("locate: the target is not a URL");
             return Outcome::Failed;
         };
+        if carries_userinfo(&uri) {
+            o.error("locate: the target carries userinfo; credentials never ride a URL");
+            return Outcome::Failed;
+        }
         let secure = match uri.scheme_str() {
             Some("https") => true,
             Some("http") => false,
@@ -275,6 +279,12 @@ slot!(
     }
 );
 
+/// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a URL
+/// (refused outright, never read on, never echoed), as http and ws refuse it.
+fn carries_userinfo(uri: &http::Uri) -> bool {
+    uri.authority().is_some_and(|a| a.as_str().contains('@'))
+}
+
 /// The framer's own head lines on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
 /// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
 /// auth signs the head, and the dial then sends them as signed: the content
@@ -326,6 +336,10 @@ slot!(
                     o.error("begin: the target is not text");
                     return Outcome::Failed;
                 };
+                if target.parse::<http::Uri>().is_ok_and(|u| carries_userinfo(&u)) {
+                    o.error("begin: the target carries userinfo; credentials never ride a URL");
+                    return Outcome::Failed;
+                }
                 match Conn::dial(target, posture, now) {
                     Ok(c) => c,
                     Err(_) => {
