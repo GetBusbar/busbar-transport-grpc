@@ -1823,3 +1823,73 @@ fn a_dialled_heads_content_type_and_reserved_fields_are_this_layers() {
     let words = h.head.as_ref().expect("head words");
     assert_eq!(words.authority.as_ref(), b"peer.test:50051");
 }
+
+/// A CONNECTION THAT FAILS WHILE IT HOLDS A BODY BACK FOR THE HOST STILL SAYS SO: the far end goes
+/// away while the dialled side holds its mark for a host not taking its pieces, and once the host
+/// has taken them the connection owes nothing more, so the op answers the failure. RED: the held
+/// body kept the host owed a re-call forever, and the failure was never answered.
+#[test]
+fn a_connection_failing_while_it_holds_a_body_back_still_says_so() {
+    let mut p = open_call(true, b"");
+    stream_into_a_host_not_reading(&mut p, false, 400);
+    // Hold back again, then the far end goes away mid-call.
+    let m = msg::frame(&[7u8; 60_000]);
+    for _ in 0..40 {
+        if !p.a.announce_full(1) {
+            let _ = p.a.emit(1, &m, false, 0, p.now);
+        }
+        p.a.drive(p.now);
+        p.d.drive(p.now);
+        let to_d = p.a.take_wire(usize::MAX);
+        p.d.ingest(&to_d, false);
+    }
+    p.d.drive(p.now);
+    p.d.ingest(&[], true);
+    p.d.drive(p.now);
+    assert!(p.d.failure().is_some(), "the connection failed");
+    p.d.pieces().clear();
+    assert!(!p.d.wire_pending(), "a failed connection owes no re-call");
+}
+
+/// ONE BUSY STREAM DOES NOT STARVE ANOTHER while the host holds the connection at its mark: two
+/// accepted calls both upload far faster than the host takes its pieces, and each drive reads from
+/// a different stream first, so both keep making headway. RED: the first stream filled the room on
+/// every drive, and once the connection was at its mark the second was never read.
+#[test]
+fn one_busy_stream_does_not_starve_another_while_the_host_is_slow() {
+    let mut p = Pair::new();
+    let m = msg::frame(&[7u8; 60_000]);
+    for id in [1, 3] {
+        let mut c = msg::render_head(&[("path", b"/pkg.Svc/Upload")], None).expect("head");
+        c.extend_from_slice(&m);
+        p.d.emit(id, &c, false, 0, p.now).expect("open");
+    }
+    // Pieces of each accepted call (1 and 2) the host takes once the connection is saturated.
+    let mut late = [0usize; 2];
+    for turn in 0..300 {
+        for id in [1, 3] {
+            for _ in 0..4 {
+                if p.d.announce_full(id) {
+                    break;
+                }
+                let _ = p.d.emit(id, &m, false, 0, p.now);
+            }
+        }
+        p.d.drive(p.now);
+        p.a.drive(p.now);
+        let to_a = p.d.take_wire(usize::MAX);
+        let to_d = p.a.take_wire(usize::MAX);
+        p.a.ingest(&to_a, false);
+        p.d.ingest(&to_d, false);
+        p.d.pieces().clear();
+        // The host takes two pieces a turn, oldest first.
+        for _ in 0..2 {
+            if let Some(piece) = p.a.pieces().pop_front() {
+                if turn >= 150 && !piece.bytes.is_empty() && !piece.fields {
+                    late[usize::from(piece.stream == 2)] += 1;
+                }
+            }
+        }
+    }
+    assert!(late[0] > 20 && late[1] > 20, "both streams read: {late:?}");
+}
