@@ -4,9 +4,12 @@ name = "busbar-transport-grpc-plugin"
 version = "1.6.0"
 publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "First-party signed kind:transport plugin cdylib: the grpc transport, packaged as a droppable busbar plugin. Drop the signed tarball into plugins/."
 license = "Apache-2.0"
+
+[lints]
+workspace = true
 
 [lib]
 # cdylib: the DROPPED-IN door (a signed tarball in `plugins/`), exporting `busbar_plugin_door`.
