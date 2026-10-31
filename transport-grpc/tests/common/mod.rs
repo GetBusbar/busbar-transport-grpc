@@ -882,6 +882,29 @@ impl Host {
         self.deadline
     }
 
+    /// Op `index` over an all-zero `in` that `set` then fills, on this instance (or, `instance`
+    /// false, on none): its outcome and its text.
+    pub fn op_text<I, O>(
+        &self,
+        op: Option<Op>,
+        index: u32,
+        instance: bool,
+        set: impl FnOnce(&mut I),
+    ) -> (Outcome, String) {
+        let mut i: I = z();
+        set(&mut i);
+        let mut o: O = z();
+        let inst = if instance {
+            self.inst
+        } else {
+            std::ptr::null_mut()
+        };
+        let r = call(op, inst, &mut i, &mut o, index);
+        // SAFETY: every `out` leads with an `OutHead`.
+        let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+        (r, text(head.error))
+    }
+
     /// Op `index` of this instance over all-zero `in` and `out`: its outcome and its text.
     pub fn bare<I, O>(&self, op: Option<Op>, index: u32) -> (Outcome, String) {
         let mut i: I = z();
