@@ -57,12 +57,24 @@ use crate::claims::CLAIM_NAMES;
 use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, TAIL};
 pub use crate::meta::{setting, KEY};
 
+/// THE AUTH POINTS THIS DOOR OFFERS: none (ruling R2). It makes no auth call on either side (no
+/// op pends), so it states an empty record: boot refuses a guest line whose auth needs a point on
+/// it, rather than read the default `{Head, HeadBody}` it would not honour.
+const OFFERED_POINTS: [u8; 4] = 0u32.to_le_bytes();
+
 busbar_contract::statement_extensions!(
-    /// The Statement's extensions: this plugin's whole `declares` document.
-    EXTENSIONS: [(
-        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
-        include_bytes!("../declares.json")
-    )]
+    /// The Statement's extensions: this plugin's whole `declares` document, and the auth points
+    /// it offers.
+    EXTENSIONS: [
+        (
+            busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+            include_bytes!("../declares.json")
+        ),
+        (
+            busbar_contract::abi::transport::EXT_OFFERED_POINTS,
+            &OFFERED_POINTS
+        ),
+    ]
 );
 
 /// The door's Statement: the `grpc` framer.
