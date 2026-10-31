@@ -124,10 +124,14 @@ fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
             .err()
             .and_then(|r| r.text().map(str::to_owned))
     };
-    let timeout = "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0";
+    let timeout =
+        "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0";
     let body = "settings: limits.request_body_max_bytes must be a count of bytes above 0";
     for (json, want) in [
-        (&br#"{"limits.upstream_request_timeout_secs":"5"}"#[..], timeout),
+        (
+            &br#"{"limits.upstream_request_timeout_secs":"5"}"#[..],
+            timeout,
+        ),
         (br#"{"limits.upstream_request_timeout_secs":0}"#, timeout),
         (br#"{"limits.request_body_max_bytes":-1}"#, body),
         (br#"{"limits.request_body_max_bytes":0}"#, body),

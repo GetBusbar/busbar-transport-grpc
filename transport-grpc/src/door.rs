@@ -40,6 +40,7 @@ use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::transport::settings_reading;
+use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -47,7 +48,6 @@ use busbar_contract::abi::transport::{
     LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, SIDE_ACCEPT,
     SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
 };
-use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 
 use crate::msg;
 use crate::stream::StreamCall;

@@ -813,7 +813,11 @@ fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
             (Outcome::Ready, String::new())
         );
         host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
-        assert_eq!(host.feed(&lpm(&[7u8; 17]), false), Outcome::Failed, "the new ceiling");
+        assert_eq!(
+            host.feed(&lpm(&[7u8; 17]), false),
+            Outcome::Failed,
+            "the new ceiling"
+        );
         host.close();
     }
 }
