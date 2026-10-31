@@ -26,8 +26,20 @@ mod msg;
 mod stream;
 mod transport;
 
-/// The door: this plugin's one public item.
+/// The door: the one entry, linked here and exported by the dropped-in build alike.
 pub use door::door;
+
+/// The transport axis entry the composition root folds for this transport: its key, the layers it
+/// declares and its door.
+pub mod linked {
+    /// The row's registry key.
+    pub const KEY: &str = crate::meta::KEY;
+    /// The layers this transport declares it can be built over: none (no transport names another).
+    pub const COMPOSES_OVER: &[&str] = &[];
+    /// Whether this transport carries sessions: a connection multiplexes calls, each a session.
+    pub const SESSION: bool = crate::meta::SESSION;
+    pub use crate::door::{door, MACRO_DOOR};
+}
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK.
 busbar_contract::hyper_io!(::bytes::Bytes);

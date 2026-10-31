@@ -18,6 +18,10 @@ use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 /// This transport's key: the scheme it claims.
 pub const KEY: &str = "grpc";
 
+/// Whether its claim carries sessions: a connection multiplexes calls, each its own stream and
+/// session (the claim row's `session`).
+pub(crate) const SESSION: bool = true;
+
 /// The settings this transport reads.
 pub mod setting {
     /// A dialled call's deadline when the host states none, in seconds.
