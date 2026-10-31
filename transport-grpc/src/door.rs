@@ -316,8 +316,7 @@ slot!(
             o.set(|x| &x.framing, token);
             fill(&mut call, i.sink(), &mut o, class_of, fault_of);
             inst.calls
-                .lock()
-                .expect("calls")
+                .lock().unwrap_or_else(PoisonError::into_inner)
                 .insert(token, Arc::new(Mutex::new(call)));
             return Outcome::Ready;
         }
@@ -357,11 +356,10 @@ slot!(
         let token = inst.next.fetch_add(1, Ordering::Relaxed);
         let held = Arc::new(Mutex::new(conn));
         inst.framings
-            .lock()
-            .expect("framings")
+            .lock().unwrap_or_else(PoisonError::into_inner)
             .insert(token, held.clone());
         o.set(|x| &x.framing, token);
-        let mut h = held.lock().expect("framing");
+        let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
         step("begin", &mut h, i.sink(), &mut o, |_| Ok(()))
     }
 );
@@ -391,7 +389,7 @@ slot!(
         // the SDK states).
         if let Some(call) = one_stream(&p, i.framing()) {
             let outcome = on_stream("emit", &call, i.sink(), &mut o, |c| c.emit(bytes, end));
-            if matches!(outcome, Outcome::Ready) && call.lock().expect("stream").announce_full() {
+            if matches!(outcome, Outcome::Ready) && call.lock().unwrap_or_else(PoisonError::into_inner).announce_full() {
                 mark_stream_full(&mut o);
             }
             return outcome;
@@ -451,7 +449,7 @@ slot!(
     /// closes its call with the final status the close states (its final tail), as trailers.
     Finish, FinishIn, FramerOut, |p, i, o| {
         let call = mine(&p)
-            .and_then(|inst| inst.calls.lock().expect("calls").remove(&i.framing()));
+            .and_then(|inst| inst.calls.lock().unwrap_or_else(PoisonError::into_inner).remove(&i.framing()));
         if let Some(call) = call {
             let all = i.final_bytes();
             // A span of no bytes (absent among them) is none; any other must lie inside the bytes.
@@ -467,7 +465,7 @@ slot!(
                 (m, _) => {
                     // Refused, and the call kept for the host's fallback refusal to close.
                     if let Some(inst) = mine(&p) {
-                        inst.calls.lock().expect("calls").insert(i.framing(), call);
+                        inst.calls.lock().unwrap_or_else(PoisonError::into_inner).insert(i.framing(), call);
                     }
                     o.error(if m.is_none() {
                         "finish: the final message lies outside the close's bytes"
@@ -484,12 +482,12 @@ slot!(
             // A close the sink could not take whole stays until the host's re-call drains it, and a
             // close that failed stays for the host's fallback refusal to close the call.
             let keep = {
-                let c = call.lock().expect("stream");
+                let c = call.lock().unwrap_or_else(PoisonError::into_inner);
                 c.wire_pending() || !c.ended()
             };
             if keep {
                 if let Some(inst) = mine(&p) {
-                    inst.calls.lock().expect("calls").insert(i.framing(), call);
+                    inst.calls.lock().unwrap_or_else(PoisonError::into_inner).insert(i.framing(), call);
                 }
             }
             return answered;
@@ -498,7 +496,7 @@ slot!(
             o.error("finish: no open instance");
             return Outcome::Failed;
         };
-        let removed = inst.framings.lock().expect("framings").remove(&i.framing());
+        let removed = inst.framings.lock().unwrap_or_else(PoisonError::into_inner).remove(&i.framing());
         if removed.is_some() {
             o.set(|x| &x.yielded.flags, YIELD_ENDED);
             Outcome::Ready
@@ -560,7 +558,13 @@ slot!(
 
 /// The one-stream framing `token` names, where it names one.
 fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
-    mine(p).and_then(|inst| inst.calls.lock().expect("calls").get(&token).cloned())
+    mine(p).and_then(|inst| {
+        inst.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&token)
+            .cloned()
+    })
 }
 
 /// Run `f` on a one-stream framing, then fill the sink with what it owes. A failure is `op`'s,
@@ -572,7 +576,7 @@ fn on_stream(
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut StreamCall) -> Result<(), transport::Failure>,
 ) -> Outcome {
-    let mut c = call.lock().expect("stream");
+    let mut c = call.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err(e) = f(&mut c) {
         return o.fail(op_failed(op, &e));
     }
@@ -610,11 +614,16 @@ fn with_then(
     let Some(inst) = mine(p) else {
         return o.fail(Refusal::failed(format!("{op}: no open instance")));
     };
-    let held = inst.framings.lock().expect("framings").get(&token).cloned();
+    let held = inst
+        .framings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&token)
+        .cloned();
     let Some(held) = held else {
         return o.fail(Refusal::failed(format!("{op}: no such framing")));
     };
-    let mut h = held.lock().expect("framing");
+    let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
     let outcome = step(op, &mut h, sink, o, f);
     if matches!(outcome, Outcome::Ready) {
         then(&h, o);

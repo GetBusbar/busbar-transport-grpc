@@ -53,7 +53,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -161,7 +161,7 @@ struct Chan(Arc<Mutex<ChanState>>);
 
 impl Chan {
     fn push(&self, f: Frame<Bytes>) {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if s.ended || s.gone {
             return;
         }
@@ -175,17 +175,17 @@ impl Chan {
     }
     /// The payload bytes queued and not yet taken.
     fn queued(&self) -> usize {
-        self.0.lock().expect("chan").queued
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).queued
     }
     /// Drop every frame queued and not yet taken.
     fn drop_queued(&self) {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         s.frames.clear();
         s.queued = 0;
     }
     /// Fail the stream: drop what is queued, and have the connection reset it.
     fn reset(&self) {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         s.reset = true;
         s.frames.clear();
         s.queued = 0;
@@ -196,14 +196,14 @@ impl Chan {
     /// Whether the queue stands at its high-water mark; if so, the host is being told (the
     /// stream is answered full), and it hears when the queue drains ([`Chan::take_writable`]).
     fn announce_full(&self) -> bool {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let full = s.queued >= STREAM_HIGH_WATER;
         s.announced |= full;
         full
     }
     /// Whether a stream answered full has drained to its low-water mark: once per announcement.
     fn take_writable(&self) -> bool {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let writable = s.announced && s.queued <= STREAM_LOW_WATER;
         if writable {
             s.announced = false;
@@ -211,22 +211,22 @@ impl Chan {
         writable
     }
     fn end(&self) {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         s.ended = true;
         if let Some(w) = s.waker.take() {
             w.wake();
         }
     }
     fn ended(&self) -> bool {
-        self.0.lock().expect("chan").ended
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).ended
     }
     /// The body was let go of before its end (see [`ChanState::gone`]).
     fn gone(&self) -> bool {
-        self.0.lock().expect("chan").gone
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).gone
     }
     /// Nobody will read this body again: drop what is queued and take no more.
     fn let_go(&self) {
-        let mut s = self.0.lock().expect("chan");
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if !(s.ended && s.frames.is_empty()) {
             s.gone = true;
             s.frames.clear();
@@ -248,7 +248,7 @@ impl Body for ChanBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        let mut s = self.0 .0.lock().expect("chan");
+        let mut s = self.0 .0.lock().unwrap_or_else(PoisonError::into_inner);
         if s.reset {
             // The connection resets the stream on a body's error.
             return Poll::Ready(Some(Err(std::io::Error::other("the stream was failed"))));
@@ -266,7 +266,7 @@ impl Body for ChanBody {
         Poll::Pending
     }
     fn is_end_stream(&self) -> bool {
-        let s = self.0 .0.lock().expect("chan");
+        let s = self.0 .0.lock().unwrap_or_else(PoisonError::into_inner);
         s.ended && s.frames.is_empty()
     }
 }
@@ -329,7 +329,7 @@ fn watch<F>(
     let (err, done) = (err.clone(), done.clone());
     exec.execute(Box::pin(async move {
         if let Err(e) = conn.await {
-            *err.lock().expect("err") = Some(e.to_string());
+            *err.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
         }
         done.store(true, Ordering::Release);
     }));
@@ -400,7 +400,7 @@ impl Conn {
         let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
             let reply = Reply::default();
             {
-                let mut a = svc_arrivals.lock().expect("arrivals");
+                let mut a = svc_arrivals.lock().unwrap_or_else(PoisonError::into_inner);
                 a.next += 1;
                 let id = a.next;
                 a.new.push_back((id, req, reply.clone()));
@@ -641,7 +641,11 @@ impl Conn {
             self.failed = Some(f);
             return;
         }
-        let err = self.conn_err.lock().expect("err").clone();
+        let err = self
+            .conn_err
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(e) = err {
             let busy = match &self.side {
                 Side::Dial(d) => !d.calls.is_empty(),
@@ -1155,7 +1159,7 @@ struct Reply {
 
 impl Reply {
     fn head(&self, status: StatusCode, fields: HeaderMap) {
-        let mut s = self.state.lock().expect("reply");
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.head = Some((status, fields));
         if let Some(w) = s.waker.take() {
             w.wake();
@@ -1173,7 +1177,11 @@ struct ReplyFut {
 impl Future for ReplyFut {
     type Output = Result<Response<ChanBody>, Infallible>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut s = self.reply.state.lock().expect("reply");
+        let mut s = self
+            .reply
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let Some((status, fields)) = s.head.take() else {
             s.waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -1328,7 +1336,7 @@ impl Accept {
         let new: Vec<_> = self
             .arrivals
             .lock()
-            .expect("arrivals")
+            .unwrap_or_else(PoisonError::into_inner)
             .new
             .drain(..)
             .collect();
