@@ -783,3 +783,37 @@ fn locate_answers_short_for_any_buffer_too_small() {
         host.close();
     }
 }
+
+/// `refresh` READS ITS SETTINGS AS `validate` DOES, and new ones apply to framings begun after it:
+/// an undeclared key or a bad value is refused in validate's words (the settings in force stay),
+/// and a new ceiling bounds the next stream's messages. Both images. RED: refresh took any blob and
+/// applied nothing.
+#[test]
+fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        assert_eq!(
+            host.refresh(r#"{"limits.nope":1}"#),
+            (
+                Outcome::Failed,
+                "settings: limits.nope is not a setting this transport reads".to_owned()
+            )
+        );
+        assert_eq!(
+            host.refresh(r#"{"limits.request_body_max_bytes":0}"#),
+            (
+                Outcome::Failed,
+                "settings: limits.request_body_max_bytes must be a count of bytes above 0"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            host.refresh(r#"{"limits.request_body_max_bytes":16}"#),
+            (Outcome::Ready, String::new())
+        );
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        assert_eq!(host.feed(&lpm(&[7u8; 17]), false), Outcome::Failed, "the new ceiling");
+        host.close();
+    }
+}

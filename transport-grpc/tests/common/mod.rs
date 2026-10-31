@@ -28,7 +28,9 @@ use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
 use busbar_contract::abi::mechanism::call::Span;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, ValidateIn};
+use busbar_contract::abi::mechanism::lifecycle::{
+    slot as life, OpenIn, OpenOut, RefreshIn, ValidateIn,
+};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{
     check_framer, check_framer_fields, check_head_slots, check_locate,
@@ -386,6 +388,16 @@ impl Host {
             words: Vec::new(),
             facts_text: String::new(),
         }
+    }
+
+    /// `refresh` the instance with `settings`: its outcome and its text.
+    pub fn refresh(&mut self, settings: &'static str) -> (Outcome, String) {
+        let mut i: RefreshIn = z();
+        i.generation = 2;
+        i.settings = Blob::json(settings.as_bytes());
+        let mut o: OutHead = z();
+        let r = call(self.ops.head.refresh, self.inst, &mut i, &mut o, life::REFRESH);
+        (r, text(o.error))
     }
 
     fn sink(&mut self) -> FramerSink {
