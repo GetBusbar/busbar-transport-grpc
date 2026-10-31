@@ -31,6 +31,8 @@ bytes = { workspace = true }
 h2 = { workspace = true }
 # The door's settings blob is JSON.
 serde_json = { workspace = true }
+# A head block may carry an auth's credential lines: the copies this framer owns are wiped.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # THE DOOR'S CONFORMANCE (`tests/conformance.rs`): the dropped-in image (`examples/grpc_door.rs`)
