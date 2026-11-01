@@ -279,12 +279,20 @@ pub const UNAUTHENTICATED: u16 = 16;
 /// (`http-grpc-status-mapping.md`).
 #[must_use]
 pub fn status_of_http(code: u16) -> u16 {
+    use http::StatusCode;
+
     match code {
-        400 => INTERNAL,
-        401 => UNAUTHENTICATED,
-        403 => PERMISSION_DENIED,
-        404 => UNIMPLEMENTED,
-        429 | 502 | 503 | 504 => UNAVAILABLE,
+        c if c == StatusCode::BAD_REQUEST.as_u16() => INTERNAL,
+        c if c == StatusCode::UNAUTHORIZED.as_u16() => UNAUTHENTICATED,
+        c if c == StatusCode::FORBIDDEN.as_u16() => PERMISSION_DENIED,
+        c if c == StatusCode::NOT_FOUND.as_u16() => UNIMPLEMENTED,
+        c if c == StatusCode::TOO_MANY_REQUESTS.as_u16()
+            || c == StatusCode::BAD_GATEWAY.as_u16()
+            || c == StatusCode::SERVICE_UNAVAILABLE.as_u16()
+            || c == StatusCode::GATEWAY_TIMEOUT.as_u16() =>
+        {
+            UNAVAILABLE
+        }
         _ => UNKNOWN,
     }
 }
@@ -303,11 +311,11 @@ pub fn status_of_http(code: u16) -> u16 {
 /// that, and the dial reads it `UNAVAILABLE`.)
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
-    match code {
-        0x7 => UNAVAILABLE,
-        0x8 => CANCELLED,
-        0xb => RESOURCE_EXHAUSTED,
-        0xc => PERMISSION_DENIED,
+    match h2::Reason::from(code) {
+        reason if reason == h2::Reason::REFUSED_STREAM => UNAVAILABLE,
+        reason if reason == h2::Reason::CANCEL => CANCELLED,
+        reason if reason == h2::Reason::ENHANCE_YOUR_CALM => RESOURCE_EXHAUSTED,
+        reason if reason == h2::Reason::INADEQUATE_SECURITY => PERMISSION_DENIED,
         _ => INTERNAL,
     }
 }
@@ -344,7 +352,7 @@ pub fn reset_name(code: u32) -> String {
 #[must_use]
 pub fn status_of_refusal(status: u32) -> u16 {
     match status {
-        413 => RESOURCE_EXHAUSTED,
+        s if s == u32::from(http::StatusCode::PAYLOAD_TOO_LARGE.as_u16()) => RESOURCE_EXHAUSTED,
         s => u16::try_from(s).map_or(UNKNOWN, status_of_http),
     }
 }
@@ -362,7 +370,7 @@ pub fn parse_status(v: &[u8]) -> u16 {
     std::str::from_utf8(v)
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
-        .filter(|c| *c <= 16)
+        .filter(|c| *c <= UNAUTHENTICATED)
         .unwrap_or(UNKNOWN)
 }
 

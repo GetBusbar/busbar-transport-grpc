@@ -35,23 +35,33 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::hyper_io::{fill, mark_stream_full, Owed};
-use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
+use busbar_contract::abi::host::service::{
+    UnitRef, FLOW_CONTINUE, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS, REFUSE_NO_ROUTE,
+};
+use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Statement;
+use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut};
+use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::services::{HeadViewArgs, RefusalCopy, Services};
+use busbar_contract::abi::sdk::transport::policy::Loans;
 use busbar_contract::abi::sdk::transport::settings_reading;
 use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
+use busbar_contract::abi::transport::guest_policy::Policy;
+use busbar_contract::abi::transport::route::RouteView;
+use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
     EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn, ListenOut,
-    LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, SIDE_ACCEPT,
-    SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
+    LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED,
+    CANCEL_PARTIAL, SIDE_ACCEPT, SIDE_ACCEPT_STREAM, SIDE_DIAL, YIELD_ENDED,
 };
 
 use crate::msg;
 use crate::stream::StreamCall;
-use crate::transport::{self, Conn, Posture};
+use crate::transport::{self, Admission, AdmissionProgress, Conn, Posture};
 
 use crate::claims::CLAIM_NAMES;
 use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, TAIL};
@@ -165,7 +175,7 @@ macro_rules! slot {
 }
 
 impl Life for Instance {
-    /// No framer op pends, so nothing is ever in flight to cancel.
+    /// The default when Cancel finds no unadmitted policy opening on its ticket.
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
     fn validate(settings: &[u8]) -> Result<(), Refusal> {
@@ -189,6 +199,30 @@ impl Life for Instance {
         Ok(Refreshed::default())
     }
 }
+
+slot!(
+    /// `cancel`: forget only the unadmitted request whose policy opening belongs to this ticket.
+    Cancel, CancelIn, CancelOut, |p, i, o| {
+        let mut partial = false;
+        let mut busy = false;
+        if let Some(inst) = mine(&p) {
+            let framings: Vec<_> = inst.framings.lock().unwrap_or_else(PoisonError::into_inner)
+                .values().cloned().collect();
+            for framing in framings {
+                match framing.try_lock() {
+                    Ok(mut conn) => partial |= conn.cancel_policy(i.ticket),
+                    Err(std::sync::TryLockError::Poisoned(error)) => partial |= error.into_inner().cancel_policy(i.ticket),
+                    Err(std::sync::TryLockError::WouldBlock) => busy = true,
+                }
+            }
+        }
+        if busy && !partial {
+            return o.fail(Refusal::failed("cancel: framing busy"));
+        }
+        o.set(|x| &x.disposition, if partial { CANCEL_PARTIAL } else { CANCEL_NOTHING_MOVED });
+        Outcome::Ready
+    }
+);
 
 busbar_contract::not_served! {
     state: State, role: "grpc framer";
@@ -312,7 +346,18 @@ slot!(
             return Outcome::Failed;
         };
         let posture = *inst.posture.lock().unwrap_or_else(PoisonError::into_inner);
+        let loans = if matches!(i.side(), SIDE_ACCEPT | SIDE_ACCEPT_STREAM) {
+            match Loans::from_initial(i.field(|x| &x.head.extensions).bytes()) {
+                Ok(loans) => loans,
+                Err(error) => return o.fail(Refusal::failed(format!("begin: {error}"))),
+            }
+        } else { None };
         if i.side() == SIDE_ACCEPT_STREAM {
+            // This body-only adapter is opened after the root already admitted the request.
+            // Begin supplies no original method, so it cannot independently match a live policy.
+            if loans.is_some() {
+                return o.fail(Refusal::refused("begin: a body-only stream cannot open a listener policy"));
+            }
             let fields = i.fields();
             let opened = StreamCall::open(
                 fields
@@ -359,7 +404,7 @@ slot!(
                     }
                 }
             }
-            SIDE_ACCEPT => Conn::accept(posture, now),
+            SIDE_ACCEPT => Conn::accept(posture, now).with_policies(loans, i.scheme),
             _ => {
                 o.error("begin: the side is neither accept nor dial");
                 return Outcome::Failed;
@@ -372,7 +417,8 @@ slot!(
             .insert(token, held.clone());
         o.set(|x| &x.framing, token);
         let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
-        step("begin", &mut h, i.sink(), &mut o, |_| Ok(()))
+        let mut host = host_admission(&p, i.field(|x| &x.head), token);
+        step("begin", &mut h, i.sink(), &mut o, |_| Ok(()), &mut host)
     }
 );
 
@@ -384,7 +430,7 @@ slot!(
             let end = i.end() != 0;
             return on_stream("ingest", &call, i.sink(), &mut o, |c| c.ingest(bytes, end));
         }
-        with("ingest", &p, i.framing(), i.sink(), &mut o, |c| {
+        with(Crossing { op: "ingest", head: i.field(|x| &x.head) }, &p, i.framing(), i.sink(), &mut o, |c| {
             c.ingest(bytes, i.end() != 0);
             Ok(())
         })
@@ -396,6 +442,10 @@ slot!(
     Emit, EmitIn, FramerOut, |p, i, o| {
         let bytes = i.bytes();
         let (now, deadline, end) = (i.sink().now_monotonic_ns(), i.deadline_ns(), i.end_of_frame() != 0);
+        let sensitive = match SensitiveFields::from_extensions(i.field(|x| &x.head.extensions).bytes()) {
+            Ok(sensitive) => sensitive,
+            Err(error) => return o.fail(Refusal::failed(format!("emit: {error}"))),
+        };
         // A STREAM'S OWN BACKPRESSURE, on one stream as on a connection's: an emit that leaves its
         // stream's queue at the high-water mark is answered `YIELD_STREAM_FULL` (after the fill, as
         // the SDK states).
@@ -408,12 +458,16 @@ slot!(
         }
         let stream = i.stream();
         with_then(
-            "emit",
+            Crossing { op: "emit", head: i.field(|x| &x.head) },
             &p,
             i.framing(),
             i.sink(),
             &mut o,
-            |c| c.emit(stream, bytes, end, deadline, now),
+            |c| {
+                if let Some(sensitive) = sensitive {
+                    c.emit_sensitive(stream, bytes, end, deadline, now, sensitive)
+                } else { c.emit(stream, bytes, end, deadline, now) }
+            },
             |c, o| {
                 if c.announce_full(stream) {
                     mark_stream_full(o);
@@ -439,7 +493,7 @@ slot!(
                 c.refuse(bytes, status, head_sent)
             });
         }
-        with("refuse", &p, i.framing(), i.sink(), &mut o, |c| {
+        with(Crossing { op: "refuse", head: i.field(|x| &x.head) }, &p, i.framing(), i.sink(), &mut o, |c| {
             c.end_call(i.stream(), bytes, i.status())
         })
     }
@@ -452,7 +506,7 @@ slot!(
             // One stream asks for no timer (it enforces no deadline): a call only fills.
             return on_stream("timer", &call, i.sink(), &mut o, |_| Ok(()));
         }
-        with("timer", &p, i.framing(), i.sink(), &mut o, |_| Ok(()))
+        with(Crossing { op: "timer", head: i.field(|x| &x.head) }, &p, i.framing(), i.sink(), &mut o, |_| Ok(()))
     }
 );
 
@@ -601,21 +655,144 @@ fn op_failed(op: &str, e: &transport::Failure) -> Refusal {
     Refusal::failed(format!("{op}: {}", e.0))
 }
 
+struct Crossing<'a> {
+    op: &'static str,
+    head: Lent<'a, InHead>,
+}
+
+struct HostAdmission<'a> {
+    services: Option<Services>,
+    ticket: Ticket,
+    conn: u64,
+    extensions: &'a [u8],
+    leases: &'a sdk::life::Leases,
+}
+
+fn host_admission<'a, 'call: 'a>(
+    p: &sdk::Instance<'call, State>,
+    head: Lent<'a, InHead>,
+    conn: u64,
+) -> HostAdmission<'a> {
+    let held = p.get().expect("the caller checked the instance");
+    HostAdmission {
+        services: held.host().and_then(|host| host.services()),
+        ticket: head.ticket,
+        conn,
+        extensions: head.field(|x| &x.extensions).bytes(),
+        leases: held.leases(),
+    }
+}
+
+impl Admission for HostAdmission<'_> {
+    fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
+    fn open(
+        &mut self,
+        loans: &mut Loans,
+        stream: u64,
+        out: &mut Out<'_, FramerOut>,
+    ) -> Result<Option<Arc<Policy>>, transport::Failure> {
+        loans
+            .open(self.ticket, stream, self.extensions, out, self.leases)
+            .map_err(|error| transport::Failure(error.into()))
+    }
+
+    fn hand_in(
+        &mut self,
+        stream: u64,
+        policy: &Policy,
+        head: &HeadViewArgs<'_>,
+        sequence: &mut u32,
+    ) -> Result<Result<UnitRef, RefusalCopy>, transport::Failure> {
+        let services = self
+            .services
+            .as_ref()
+            .ok_or_else(|| transport::Failure("the host unit services are absent".into()))?;
+        let mut next = || {
+            *sequence = sequence.wrapping_add(1).max(1);
+            CompletionHandle {
+                ticket: self.ticket,
+                seq: *sequence,
+                _reserved: 0,
+            }
+        };
+        let mut method_miss = None;
+        let matched = policy.lines.iter().find(|line| {
+            let route = RouteView {
+                methods: line.methods,
+                path_form: line.path_form,
+                path: &line.path,
+                fields: line
+                    .fields
+                    .iter()
+                    .map(|(op, name, value)| (*op, name.as_str(), value.as_slice()))
+                    .collect(),
+                rung: line.rung,
+            };
+            if !route.path_and_fields_match(head.target, head.fields) {
+                return false;
+            }
+            if route.admits(head.method) {
+                return true;
+            }
+            method_miss.get_or_insert(line.line);
+            false
+        });
+        let (unit, cause, line) = if let Some(line) = matched {
+            if line.points != 0 {
+                return Err(transport::Failure(
+                    "gRPC offers no inbound authentication points".into(),
+                ));
+            }
+            let (flow, unit) = services
+                .unit_hand_in(
+                    next(),
+                    line.auth,
+                    UnitRef::NONE,
+                    line.line,
+                    self.conn,
+                    stream,
+                    head,
+                )
+                .map_err(|error| transport::Failure(format!("unit.hand_in: {error:?}")))?;
+            if flow == FLOW_CONTINUE {
+                if unit.is_none() {
+                    return Err(transport::Failure(
+                        "unit.hand_in returned no admitted unit".into(),
+                    ));
+                }
+                return Ok(Ok(unit));
+            }
+            (unit, REFUSE_CHECK_FAILED, line.line)
+        } else if let Some(line) = method_miss {
+            (UnitRef::NONE, REFUSE_METHOD_MISS, line)
+        } else {
+            (UnitRef::NONE, REFUSE_NO_ROUTE, LINE_NONE)
+        };
+        services
+            .unit_refuse(next(), unit, cause, line, self.conn, stream, head)
+            .map(Err)
+            .map_err(|error| transport::Failure(format!("unit.refuse: {error:?}")))
+    }
+}
+
 /// Run `f` on framing `token`, then drive it and fill the sink, as `op`.
 fn with(
-    op: &'static str,
+    crossing: Crossing<'_>,
     p: &sdk::Instance<'_, State>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
 ) -> Outcome {
-    with_then(op, p, token, sink, o, f, |_, _| {})
+    with_then(crossing, p, token, sink, o, f, |_, _| {})
 }
 
 /// [`with`], then `then` on the framing and the answer, where the op answered READY.
 fn with_then(
-    op: &'static str,
+    crossing: Crossing<'_>,
     p: &sdk::Instance<'_, State>,
     token: u64,
     sink: Lent<'_, FramerSink>,
@@ -623,6 +800,7 @@ fn with_then(
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
     then: impl FnOnce(&Conn, &mut Out<'_, FramerOut>),
 ) -> Outcome {
+    let op = crossing.op;
     let Some(inst) = mine(p) else {
         return o.fail(Refusal::failed(format!("{op}: no open instance")));
     };
@@ -636,8 +814,9 @@ fn with_then(
         return o.fail(Refusal::failed(format!("{op}: no such framing")));
     };
     let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
-    let outcome = step(op, &mut h, sink, o, f);
-    if matches!(outcome, Outcome::Ready) {
+    let mut host = host_admission(p, crossing.head, token);
+    let outcome = step(op, &mut h, sink, o, f, &mut host);
+    if matches!(outcome, Outcome::Ready) && !h.policy_pending(host.ticket) {
         then(&h, o);
     }
     outcome
@@ -650,11 +829,20 @@ fn step(
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
+    host: &mut HostAdmission<'_>,
 ) -> Outcome {
-    if let Err(e) = f(c) {
-        return o.fail(op_failed(op, &e));
+    if !c.policy_pending(host.ticket) {
+        if let Err(e) = f(c) {
+            return o.fail(op_failed(op, &e));
+        }
     }
     c.drive(sink.now_monotonic_ns());
+    match c.admit(host, o) {
+        Ok(AdmissionProgress::Requested) => return Outcome::Ready,
+        Ok(AdmissionProgress::Published) => c.drive(sink.now_monotonic_ns()),
+        Ok(AdmissionProgress::Idle) => {}
+        Err(error) => return o.fail(op_failed(op, &error)),
+    }
     let pending = c.wire_pending() || !c.pieces().is_empty();
     if let Some(e) = c.failure().cloned() {
         if !pending {
@@ -668,7 +856,17 @@ fn step(
 busbar_contract::plugin_door! {
     ops: Ops,
     statement: STATEMENT,
-    lifecycle: life(Instance),
+    lifecycle: {
+        validate: Safe<sdk::life::Validate<Instance>>,
+        open: Safe<sdk::life::Open<Instance>>,
+        refresh: Safe<sdk::life::Refresh<Instance>>,
+        retire: Safe<sdk::life::Retire<Instance>>,
+        tick: Safe<sdk::life::Tick<Instance>>,
+        drive: Safe<sdk::life::Drive<Instance>>,
+        cancel: Safe<Cancel>,
+        release: Safe<sdk::life::Release<Instance>>,
+        close: Safe<sdk::life::Close<Instance>>,
+    },
     kind_ops: {
         listen: Safe<Listen>,
         accept: Safe<Accept>,

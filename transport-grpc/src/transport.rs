@@ -58,7 +58,15 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use crate::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
+use busbar_contract::abi::host::service::UnitRef;
+use busbar_contract::abi::mechanism::ticket::Ticket;
+use busbar_contract::abi::sdk::services::{HeadViewArgs, RefusalCopy};
+use busbar_contract::abi::sdk::transport::policy::Loans;
+use busbar_contract::abi::sdk::Out;
 use busbar_contract::abi::transport::fields::hop_by_hop;
+use busbar_contract::abi::transport::guest_policy::Policy;
+use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
+use busbar_contract::abi::transport::FramerOut;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body, Frame};
@@ -94,6 +102,30 @@ pub struct Posture {
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure(pub String);
+
+/// The host selects an immutable loan and admits a matched no-auth request before it is framed.
+pub(crate) trait Admission {
+    fn ticket(&self) -> Ticket;
+    fn open(
+        &mut self,
+        loans: &mut Loans,
+        stream: u64,
+        out: &mut Out<'_, FramerOut>,
+    ) -> Result<Option<Arc<Policy>>, Failure>;
+    fn hand_in(
+        &mut self,
+        stream: u64,
+        policy: &Policy,
+        head: &HeadViewArgs<'_>,
+        sequence: &mut u32,
+    ) -> Result<Result<UnitRef, RefusalCopy>, Failure>;
+}
+
+pub(crate) enum AdmissionProgress {
+    Idle,
+    Requested,
+    Published,
+}
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -432,8 +464,68 @@ impl Conn {
                 arrivals,
                 calls: Vec::new(),
                 ended: Ended::default(),
+                policy: None,
+                waiting: VecDeque::new(),
             }),
         }
+    }
+
+    /// Attach the host's initial policy cache. Each accepted request asks for its own selection.
+    pub(crate) fn with_policies(mut self, loans: Option<Loans>, scheme: u8) -> Self {
+        if let Side::Accept(accept) = &mut self.side {
+            accept.policy = loans.map(|loans| AcceptedPolicy {
+                loans,
+                scheme,
+                sequence: 0,
+            });
+        }
+        self
+    }
+
+    /// Whether this ticket's original input was taken before its policy roundtrip.
+    pub(crate) fn policy_pending(&self, ticket: Ticket) -> bool {
+        matches!(&self.side, Side::Accept(accept) if accept.policy.as_ref().is_some_and(|policy| policy.loans.pending_stream(ticket).is_some()))
+    }
+
+    /// Cancel only this ticket's unadmitted request; other streams keep their bodies and replies.
+    pub(crate) fn cancel_policy(&mut self, ticket: Ticket) -> bool {
+        let Side::Accept(accept) = &mut self.side else {
+            return false;
+        };
+        let Some(policy) = &mut accept.policy else {
+            return false;
+        };
+        let Some(stream) = policy.loans.cancel(ticket) else {
+            return false;
+        };
+        if let Some(at) = accept
+            .waiting
+            .iter()
+            .position(|request| request.id == stream)
+        {
+            let request = accept.waiting.remove(at).expect("position above");
+            request.reply.chan.reset();
+            request
+                .reply
+                .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+        }
+        accept.ended.insert(stream);
+        true
+    }
+
+    /// Admit at most one request between fills. A policy request must be an empty READY answer.
+    pub(crate) fn admit(
+        &mut self,
+        host: &mut dyn Admission,
+        reply: &mut Out<'_, FramerOut>,
+    ) -> Result<AdmissionProgress, Failure> {
+        if self.io.wire_pending() || !self.out.is_empty() {
+            return Ok(AdmissionProgress::Idle);
+        }
+        let Side::Accept(accept) = &mut self.side else {
+            return Ok(AdmissionProgress::Idle);
+        };
+        accept.admit(&mut self.out, self.posture.max_message_bytes, host, reply)
     }
 
     /// The far side sent `bytes` (`end` = and then ended).
@@ -454,6 +546,31 @@ impl Conn {
         end: bool,
         deadline_ns: u64,
         now_ns: u64,
+    ) -> Result<(), Failure> {
+        self.emit_marked(stream, bytes, end, deadline_ns, now_ns, None)
+    }
+
+    /// Emit a request head carrying the host's credential-header classification.
+    pub(crate) fn emit_sensitive(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        deadline_ns: u64,
+        now_ns: u64,
+        sensitive: SensitiveFields,
+    ) -> Result<(), Failure> {
+        self.emit_marked(stream, bytes, end, deadline_ns, now_ns, Some(sensitive))
+    }
+
+    fn emit_marked(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        deadline_ns: u64,
+        now_ns: u64,
+        sensitive: Option<SensitiveFields>,
     ) -> Result<(), Failure> {
         // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
         // the bytes: every step below is idempotent on it.
@@ -483,13 +600,23 @@ impl Conn {
                         } else {
                             deadline_ns
                         };
-                        d.calls
-                            .push((stream, DialStream::new(timer.sleep_until_ns(at))));
+                        let mut call = DialStream::new(timer.sleep_until_ns(at));
+                        call.sensitive = sensitive.clone().unwrap_or_default();
+                        d.calls.push((stream, call));
                         d.calls.len() - 1
                     }
                 };
                 let s = &mut d.calls[idx].1;
-                if let Err(why) = s.take(&d.base, bytes, end, max) {
+                let read = if matches!(s.stage, DStage::Head(_))
+                    && sensitive
+                        .as_ref()
+                        .is_some_and(|fields| fields != &s.sensitive)
+                {
+                    Err("request sensitivity changed during its head".into())
+                } else {
+                    s.take(&d.base, bytes, end, max)
+                };
+                if let Err(why) = read {
                     // Reset, never ended: the far end must not take a cut request for a whole one.
                     s.chan.reset();
                     s.stage = DStage::Done;
@@ -786,6 +913,7 @@ enum DStage {
 }
 
 struct DialStream {
+    sensitive: SensitiveFields,
     stage: DStage,
     chan: Chan,
     /// Bytes of the message stream still to come, when the head stated its length.
@@ -797,6 +925,7 @@ struct DialStream {
 impl DialStream {
     fn new(sleep: Pin<Box<dyn Sleep>>) -> Self {
         Self {
+            sensitive: SensitiveFields::default(),
             stage: DStage::Head(HeadBuf::default()),
             chan: Chan::default(),
             left: None,
@@ -859,13 +988,14 @@ impl DialStream {
             return Err("the head's path is not absolute".into());
         }
         let uri = format!("{base}{}", String::from_utf8_lossy(path));
-        let content_type = match head.get("content-type") {
+        let mut content_type = match head.get("content-type") {
             Some(ct) if msg::is_grpc_content_type(ct) => {
                 HeaderValue::from_bytes(ct).map_err(|_| "content-type is not a field value")?
             }
             Some(_) => return Err("content-type is not a gRPC content type".into()),
             None => HeaderValue::from_static(msg::CONTENT_TYPE),
         };
+        content_type.set_sensitive(self.sensitive.contains(b"content-type"));
         let mut b = Request::builder()
             .method(http::Method::POST)
             .uri(uri)
@@ -880,8 +1010,9 @@ impl DialStream {
             }
             let n = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| format!("`{name}` is not a field name"))?;
-            let v = HeaderValue::from_bytes(value)
+            let mut v = HeaderValue::from_bytes(value)
                 .map_err(|_| format!("`{name}`'s value is not a field value"))?;
+            v.set_sensitive(self.sensitive.contains(name.as_bytes()));
             b = b.header(n, v);
         }
         b.body(self.chan.body())
@@ -1026,6 +1157,13 @@ fn advance(
                         Bytes::from(field_block(r.headers(), STATUS_FIELDS)),
                     ));
                     if stated {
+                        if !r.body().is_end_stream() {
+                            return Err((
+                                "the answer states grpc-status before its body ended".into(),
+                                msg::INTERNAL,
+                                false,
+                            ));
+                        }
                         // Trailers-only: the status is in the head, and the body is empty. Its
                         // fault is the gRPC status's own reading, as any trailers' is.
                         out.extend(trailers(id, &HeaderMap::new(), r.headers()));
@@ -1230,9 +1368,27 @@ struct Accept {
     /// Calls that have ended and been let go of. An `emit` or a refusal on one is late (it raced
     /// the far end's cancel, or the call's own end) and is dropped, as on a dialled stream.
     ended: Ended,
+    policy: Option<AcceptedPolicy>,
+    waiting: VecDeque<Unadmitted>,
+}
+
+struct AcceptedPolicy {
+    loans: Loans,
+    scheme: u8,
+    sequence: u32,
+}
+
+struct Unadmitted {
+    id: u64,
+    request: Request<Incoming>,
+    reply: Reply,
+    ticket: Option<Ticket>,
 }
 
 struct AStream {
+    /// Keep the exact selected generation until the stream's body and reply are both retired.
+    _policy: Option<Arc<Policy>>,
+    _unit: UnitRef,
     /// The call's messages; `None` once the far end has sent its last.
     body: Option<(Incoming, Messages)>,
     reply: Reply,
@@ -1243,6 +1399,30 @@ struct AStream {
 }
 
 impl AStream {
+    fn new(
+        request: Request<Incoming>,
+        reply: Reply,
+        max: usize,
+        policy: Option<Arc<Policy>>,
+        unit: UnitRef,
+    ) -> Self {
+        let content_type = request
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .cloned()
+            .expect("the accepted request was validated as gRPC");
+        Self {
+            _policy: policy,
+            _unit: unit,
+            body: Some((request.into_body(), Messages::new(max))),
+            reply,
+            content_type,
+            head_buf: HeadBuf::default(),
+            head_sent: false,
+            reply_over: false,
+        }
+    }
+
     /// Send the answer's head: `head`'s fields, and on a trailers-only answer `trailers`'.
     ///
     /// # Errors
@@ -1335,6 +1515,160 @@ fn answer_fields<'h>(
 }
 
 impl Accept {
+    fn admit(
+        &mut self,
+        out: &mut VecDeque<Piece>,
+        max: usize,
+        host: &mut dyn Admission,
+        reply: &mut Out<'_, FramerOut>,
+    ) -> Result<AdmissionProgress, Failure> {
+        let Some(policy) = &mut self.policy else {
+            return Ok(AdmissionProgress::Idle);
+        };
+        let ticket = host.ticket();
+        let at = self
+            .waiting
+            .iter()
+            .position(|request| request.ticket == Some(ticket))
+            .or_else(|| {
+                self.waiting
+                    .iter()
+                    .position(|request| request.ticket.is_none())
+            });
+        let Some(at) = at else {
+            return Ok(AdmissionProgress::Idle);
+        };
+        let request = &mut self.waiting[at];
+        if request.reply.chan.gone() {
+            policy.loans.cancel(request.ticket.unwrap_or(ticket));
+            let request = self.waiting.remove(at).expect("position above");
+            self.ended.insert(request.id);
+            out.push_back(Piece {
+                status: Some(msg::CANCELLED),
+                ..Piece::failure(request.id, "the far end cancelled the call")
+            });
+            return Ok(AdmissionProgress::Published);
+        }
+        request.ticket = Some(ticket);
+        let loan = match host.open(&mut policy.loans, request.id, reply) {
+            Ok(Some(loan)) => loan,
+            Ok(None) => return Ok(AdmissionProgress::Requested),
+            Err(error) => {
+                policy.loans.cancel(ticket);
+                let request = self.waiting.remove(at).expect("position above");
+                request.reply.chan.reset();
+                request
+                    .reply
+                    .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+                return Err(error);
+            }
+        };
+        let request = self.waiting.remove(at).expect("position above");
+        let req = &request.request;
+        let fields: Vec<_> = req
+            .headers()
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_bytes()))
+            .collect();
+        let view = HeadViewArgs {
+            method: req.method().as_str(),
+            target: req.uri().path(),
+            authority: req.uri().authority().map_or_else(
+                || {
+                    req.headers()
+                        .get(http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                },
+                http::uri::Authority::as_str,
+            ),
+            query: req.uri().query(),
+            fields: &fields,
+            scheme: policy.scheme,
+        };
+        let decision = host.hand_in(request.id, &loan, &view, &mut policy.sequence);
+        drop(fields);
+        match decision {
+            Ok(Ok(unit)) => self.publish(request, max, Some(loan), unit, out),
+            Ok(Err(refusal)) => {
+                let refused_status = msg::status_of_refusal(u32::from(refusal.status));
+                let mut stream = AStream::new(
+                    request.request,
+                    request.reply,
+                    max,
+                    Some(loan),
+                    UnitRef::NONE,
+                );
+                // The host owns the refusal's status, fields and body. Frame them as supplied,
+                // without turning its body into a gRPC message or inventing a replacement.
+                let mut fields = HeaderMap::new();
+                for (name, value) in refusal.fields {
+                    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                        Failure("the host refusal has an invalid field name".into())
+                    })?;
+                    let value = HeaderValue::from_bytes(&value).map_err(|_| {
+                        Failure("the host refusal has an invalid field value".into())
+                    })?;
+                    fields.append(name, value);
+                }
+                let status = StatusCode::from_u16(refusal.status)
+                    .map_err(|_| Failure("the host refusal has an invalid status".into()))?;
+                stream.reply.head(status, fields);
+                stream
+                    .reply
+                    .chan
+                    .push(Frame::data(Bytes::from(refusal.body)));
+                stream.reply.chan.end();
+                stream.body = None;
+                stream.reply_over = true;
+                self.calls.push((request.id, stream));
+                out.push_back(Piece {
+                    status: Some(refused_status),
+                    ..Piece::failure(request.id, "the host refused the call")
+                });
+            }
+            Err(error) => {
+                request.reply.chan.reset();
+                request
+                    .reply
+                    .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+                return Err(error);
+            }
+        }
+        Ok(AdmissionProgress::Published)
+    }
+
+    fn publish(
+        &mut self,
+        request: Unadmitted,
+        max: usize,
+        policy: Option<Arc<Policy>>,
+        unit: UnitRef,
+        out: &mut VecDeque<Piece>,
+    ) {
+        let Unadmitted {
+            id,
+            request: req,
+            reply,
+            ..
+        } = request;
+        let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
+        let words = HeadWords {
+            method: Bytes::copy_from_slice(req.method().as_str().as_bytes()),
+            target: Bytes::copy_from_slice(target.as_bytes()),
+            authority: req.uri().authority().map_or_else(Bytes::new, |a| {
+                Bytes::copy_from_slice(a.as_str().as_bytes())
+            }),
+            reason: Bytes::new(),
+        };
+        out.push_back(Piece {
+            head: Some(words),
+            ..Piece::fields(id, Bytes::from(field_block(req.headers(), &[])))
+        });
+        self.calls
+            .push((id, AStream::new(req, reply, max, policy, unit)));
+    }
+
     /// An op on `stream`, which this connection does not hold: dropped when the call ended (A
     /// STREAM ENDS ONCE), else no such stream.
     fn late(&self, stream: u64) -> Result<(), Failure> {
@@ -1361,7 +1695,7 @@ impl Accept {
             .collect();
         for (id, req, reply) in new {
             let ct = req.headers().get(http::header::CONTENT_TYPE).cloned();
-            let Some(ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
+            let Some(_ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
                 // Not a gRPC call: answered here, never handed up.
                 reply.head(StatusCode::UNSUPPORTED_MEDIA_TYPE, HeaderMap::new());
                 reply.chan.end();
@@ -1395,34 +1729,29 @@ impl Accept {
                 reply.chan.end();
                 continue;
             }
-            let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
-            let words = HeadWords {
-                method: Bytes::copy_from_slice(req.method().as_str().as_bytes()),
-                target: Bytes::copy_from_slice(target.as_bytes()),
-                authority: req.uri().authority().map_or_else(Bytes::new, |a| {
-                    Bytes::copy_from_slice(a.as_str().as_bytes())
-                }),
-                reason: Bytes::new(),
-            };
-            // A `grpc-timeout` the caller states is handed up with the head's fields, a fact for
-            // the plane: this side enforces no deadline of its own and never fails a call
-            // `DEADLINE_EXCEEDED`.
-            out.push_back(Piece {
-                head: Some(words),
-                ..Piece::fields(id, Bytes::from(field_block(req.headers(), &[])))
-            });
-            self.calls.push((
-                id,
-                AStream {
-                    body: Some((req.into_body(), Messages::new(max))),
+            if self.policy.is_some() {
+                self.waiting.push_back(Unadmitted {
+                    id,
+                    request: req,
                     reply,
-                    content_type: ct,
-                    head_buf: HeadBuf::default(),
-                    head_sent: false,
-                    reply_over: false,
-                },
-            ));
+                    ticket: None,
+                });
+            } else {
+                self.publish(
+                    Unadmitted {
+                        id,
+                        request: req,
+                        reply,
+                        ticket: None,
+                    },
+                    max,
+                    None,
+                    UnitRef::NONE,
+                    out,
+                );
+            }
         }
+        room.held_back |= !self.waiting.is_empty();
         for at in room.order(self.calls.len()) {
             let (id, s) = &mut self.calls[at];
             if !s.reply_over && s.reply.chan.gone() {

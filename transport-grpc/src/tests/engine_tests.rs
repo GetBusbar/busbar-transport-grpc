@@ -13,6 +13,63 @@ use crate::msg;
 
 const SEC: u64 = 1_000_000_000;
 
+#[test]
+fn credential_flags_reach_the_final_grpc_header_values_after_partial_head_reparse() {
+    let mut c = Conn::dial("http://peer.test:50051", posture(), 0).unwrap();
+    let bytes = call(
+        "/svc/Method",
+        &[
+            ("X-Api-Key", b"dummy-one"),
+            ("x-api-key", b"dummy-two"),
+            ("x-public", b"visible"),
+            ("content-type", b"application/grpc+json"),
+        ],
+        &[b"body"],
+    );
+    let fields =
+        super::SensitiveFields::new(vec!["x-api-key".into(), "content-type".into()]).unwrap();
+    c.emit_sensitive(1, &bytes[..7], false, 0, 0, fields)
+        .unwrap();
+    c.emit(
+        3,
+        &call("/public/Method", &[("x-api-key", b"public")], &[]),
+        true,
+        0,
+        0,
+    )
+    .unwrap();
+    c.emit(1, &bytes[7..], true, 0, 0).unwrap();
+    let super::Side::Dial(dial) = &c.side else {
+        panic!("a dialled connection")
+    };
+    let super::DStage::Queued(request) = &dial
+        .calls
+        .iter()
+        .find(|(stream, _)| *stream == 1)
+        .unwrap()
+        .1
+        .stage
+    else {
+        panic!("the real gRPC request was not built")
+    };
+    let values: Vec<_> = request.headers().get_all("x-api-key").iter().collect();
+    assert_eq!(values.len(), 2);
+    assert!(values.iter().all(|value| value.is_sensitive()));
+    assert!(request.headers()["content-type"].is_sensitive());
+    assert!(!request.headers()["x-public"].is_sensitive());
+    let super::DStage::Queued(public) = &dial
+        .calls
+        .iter()
+        .find(|(stream, _)| *stream == 3)
+        .unwrap()
+        .1
+        .stage
+    else {
+        panic!("the public request was not built")
+    };
+    assert!(!public.headers()["x-api-key"].is_sensitive());
+}
+
 fn posture() -> Posture {
     Posture {
         keep_alive_interval: None,

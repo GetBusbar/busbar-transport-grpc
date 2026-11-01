@@ -248,10 +248,14 @@ impl StreamCall {
     ///
     /// # Errors
     ///
-    /// The details are not one field value.
+    /// The details are not one field value, or a successful finish would discard an unfinished
+    /// reply message. On failure the call remains open for completion or a fallback refusal.
     pub fn finish(&mut self, status: u32, message: &[u8], details: &[u8]) -> Result<(), Failure> {
         if self.closed {
             return Ok(());
+        }
+        if status == 0 && self.cut.is_none() && !self.writing.is_empty() {
+            return Err(Failure("finish: the reply ended inside a message".into()));
         }
         // Rendered first, closed after: a final status that cannot be written leaves the call
         // open, so the host's fallback refusal can still close it with a `grpc-status`.
