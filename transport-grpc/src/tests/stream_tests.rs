@@ -344,3 +344,63 @@ fn an_unfinished_large_reply_can_finish_before_drainable_wire_backpressure() {
     assert!(c.pieces().is_empty(), "writable is announced once");
     assert!(!c.announce_full());
 }
+
+#[test]
+fn a_successful_finish_cannot_discard_an_unfinished_reply_message() {
+    for previous in [false, true] {
+        let mut c = grpc();
+        let mut expected = Vec::new();
+        if previous {
+            c.emit(b"already complete", true).unwrap();
+            expected.extend(msg::frame(b"already complete"));
+        }
+        c.emit(b"reply prefix", false).unwrap();
+        assert!(
+            c.finish(0, b"", b"").is_err(),
+            "an unfinished message is not success"
+        );
+        assert!(
+            !c.ended(),
+            "a failed finish leaves the call available for recovery"
+        );
+        assert_eq!(
+            c.take_wire(usize::MAX),
+            expected,
+            "no successful trailer was written"
+        );
+        c.emit(b" and suffix", true)
+            .expect("the same message can still complete");
+        c.finish(0, b"", b"")
+            .expect("the complete reply can finish");
+        let mut completed = msg::frame(b"reply prefix and suffix");
+        completed.extend_from_slice(b"grpc-status: 0\r\n");
+        assert_eq!(c.take_wire(usize::MAX), completed);
+        assert!(c.ended());
+    }
+}
+
+#[test]
+fn unfinished_reply_can_be_refused_and_empty_success_remains_valid() {
+    let mut c = grpc();
+    c.emit(b"unfinished", false).unwrap();
+    assert!(c.finish(0, b"", b"").is_err());
+    c.refuse(b"reply could not complete", 500, false).unwrap();
+    let failed = wire(&mut c);
+    assert!(failed.contains("grpc-status:"));
+    assert!(!failed.contains("grpc-status: 0\r\n"));
+    assert!(!failed.contains("unfinished"));
+    assert!(c.ended());
+
+    let mut c = grpc();
+    c.emit(b"", false).unwrap();
+    c.finish(0, b"", b"").expect("no pending reply bytes");
+    assert_eq!(wire(&mut c), "grpc-status: 0\r\n");
+    assert!(c.ended());
+
+    let mut c = grpc();
+    c.emit(b"unfinished", false).unwrap();
+    c.finish(13, b"failed upstream", b"")
+        .expect("an explicit failure still closes");
+    assert!(wire(&mut c).contains("grpc-status: 13\r\n"));
+    assert!(c.ended());
+}

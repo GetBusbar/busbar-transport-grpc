@@ -1893,3 +1893,97 @@ fn one_busy_stream_does_not_starve_another_while_the_host_is_slow() {
     }
     assert!(late[0] > 20 && late[1] > 20, "both streams read: {late:?}");
 }
+
+/// The actual HTTP/2 dial path against separately delivered server frames.
+fn manual_reply_dial() -> (Conn, Vec<Piece>, u64) {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Get", &[], &[b"request"]), true, 0, now)
+        .unwrap();
+    let mut got = Vec::new();
+    manual_reply_turn(&mut d, &mut got, now);
+    let mut settings = h2(4, 0, 0, &[]);
+    settings.extend(h2(4, 1, 0, &[]));
+    d.ingest(&settings, false);
+    manual_reply_turn(&mut d, &mut got, now);
+    (d, got, now)
+}
+
+fn manual_reply_turn(d: &mut Conn, got: &mut Vec<Piece>, now: u64) {
+    for _ in 0..20 {
+        d.drive(now);
+        drop(d.take_wire(usize::MAX));
+        got.extend(d.pieces().drain(..));
+    }
+}
+
+fn response_head_with_status(status: Option<&str>) -> Vec<u8> {
+    let mut block = vec![0x88]; // HPACK :status 200.
+    lit_field(&mut block, "content-type", "application/grpc");
+    if let Some(status) = status {
+        lit_field(&mut block, "grpc-status", status);
+    }
+    block
+}
+
+#[test]
+fn a_status_in_response_headers_cannot_succeed_before_the_http2_stream_ends() {
+    for coalesced in [false, true] {
+        let (mut d, mut got, now) = manual_reply_dial();
+        let mut first = h2(1, 0x04, 1, &response_head_with_status(Some("0")));
+        let data = h2(0, 0x01, 1, &msg::frame(b"late reply payload"));
+        if coalesced {
+            first.extend_from_slice(&data);
+        }
+        d.ingest(&first, false);
+        manual_reply_turn(&mut d, &mut got, now);
+        assert!(
+            got.iter().all(|p| p.status != Some(0)),
+            "a nonterminal head is not success: {got:?}"
+        );
+        let failed = terminal(&got, 1).expect("malformed trailers-only head fails");
+        assert!(failed.failed, "{failed:?}");
+        assert_eq!(failed.status, Some(msg::INTERNAL));
+        if !coalesced {
+            d.ingest(&data, false);
+            manual_reply_turn(&mut d, &mut got, now);
+        }
+        assert!(
+            got.iter().all(|p| p.status != Some(0)),
+            "later DATA cannot retroactively bless the head"
+        );
+    }
+}
+
+#[test]
+fn terminal_response_headers_and_real_body_trailers_remain_successful() {
+    let (mut d, mut got, now) = manual_reply_dial();
+    d.ingest(
+        &h2(1, 0x05, 1, &response_head_with_status(Some("0"))),
+        false,
+    );
+    manual_reply_turn(&mut d, &mut got, now);
+    assert_eq!(terminal(&got, 1).and_then(|p| p.status), Some(0));
+    assert!(!last(&got, 1).unwrap().failed);
+
+    let (mut d, mut got, now) = manual_reply_dial();
+    d.ingest(&h2(1, 0x04, 1, &response_head_with_status(None)), false);
+    manual_reply_turn(&mut d, &mut got, now);
+    assert!(
+        terminal(&got, 1).is_none(),
+        "an ordinary head leaves the body open"
+    );
+    d.ingest(&h2(0, 0, 1, &msg::frame(b"whole reply")), false);
+    manual_reply_turn(&mut d, &mut got, now);
+    assert!(frames(&got, 1).contains(&msg::frame(b"whole reply").as_slice()));
+    assert!(
+        terminal(&got, 1).is_none(),
+        "DATA without END_STREAM still awaits trailers"
+    );
+    let mut trailers = Vec::new();
+    lit_field(&mut trailers, "grpc-status", "0");
+    d.ingest(&h2(1, 0x05, 1, &trailers), false);
+    manual_reply_turn(&mut d, &mut got, now);
+    assert_eq!(terminal(&got, 1).and_then(|p| p.status), Some(0));
+    assert!(!last(&got, 1).unwrap().failed);
+}
