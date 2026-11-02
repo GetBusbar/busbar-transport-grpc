@@ -629,16 +629,36 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
         };
         let o = host.ops;
         let got = [
-            host.bare::<ListenIn, ListenOut>(o.listen, slot::LISTEN),
-            host.bare::<AcceptIn, AcceptOut>(o.accept, slot::ACCEPT),
-            host.bare::<DialIn, ConnOut>(o.dial, slot::DIAL),
-            host.bare::<ReadIn, IoOut>(o.read, slot::READ),
-            host.bare::<WriteIn, IoOut>(o.write, slot::WRITE),
-            host.bare::<ConnIn, OutHead>(o.flush, slot::FLUSH),
-            host.bare::<ShutIn, OutHead>(o.shut, slot::SHUT),
-            host.bare::<ArrivalIn, ArrivalOut>(o.arrival, slot::ARRIVAL),
-            host.bare::<FramingIn, FramerOut>(o.detach, slot::DETACH),
-            host.bare::<AdoptIn, FramerOut>(o.adopt, slot::ADOPT),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<ListenIn, ListenOut>(o.listen, slot::LISTEN) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<AcceptIn, AcceptOut>(o.accept, slot::ACCEPT) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<DialIn, ConnOut>(o.dial, slot::DIAL) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<ReadIn, IoOut>(o.read, slot::READ) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<WriteIn, IoOut>(o.write, slot::WRITE) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<ConnIn, OutHead>(o.flush, slot::FLUSH) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<ShutIn, OutHead>(o.shut, slot::SHUT) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<ArrivalIn, ArrivalOut>(o.arrival, slot::ARRIVAL) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<FramingIn, FramerOut>(o.detach, slot::DETACH) },
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { host.bare::<AdoptIn, FramerOut>(o.adopt, slot::ADOPT) },
         ];
         let want = [
             "listen", "accept", "dial", "read", "write", "flush", "shut", "arrival", "detach",
@@ -840,34 +860,58 @@ fn every_ops_text_names_its_op() {
         let mut host = Host::open(ops, "{}", ROOMY);
         let o = host.ops;
         assert_eq!(
-            host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, false, |i| {
-                i.side = SIDE_ACCEPT;
-            }),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, false, |i| {
+                    i.side = SIDE_ACCEPT;
+                })
+            },
             (Outcome::Failed, "begin: no open instance".to_owned())
         );
         assert_eq!(
-            host.op_text::<IngestIn, FramerOut>(o.ingest, slot::INGEST, true, |i| i.framing = 999),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<IngestIn, FramerOut>(o.ingest, slot::INGEST, true, |i| {
+                    i.framing = 999
+                })
+            },
             (Outcome::Failed, "ingest: no such framing".to_owned())
         );
         assert_eq!(
-            host.op_text::<FramingIn, FramerOut>(o.timer, slot::TIMER, true, |i| i.framing = 999),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<FramingIn, FramerOut>(o.timer, slot::TIMER, true, |i| {
+                    i.framing = 999
+                })
+            },
             (Outcome::Failed, "timer: no such framing".to_owned())
         );
         host.begin(SIDE_ACCEPT, "", "", None);
         let framing = host.framing;
         assert_eq!(
-            host.op_text::<RefuseIn, FramerOut>(o.refuse, slot::REFUSE, true, |i| {
-                i.framing = framing;
-                i.stream = 9;
-                i.has_stream = 1;
-            }),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<RefuseIn, FramerOut>(o.refuse, slot::REFUSE, true, |i| {
+                    i.framing = framing;
+                    i.stream = 9;
+                    i.has_stream = 1;
+                })
+            },
             (Outcome::Failed, "refuse: no such stream: 9".to_owned())
         );
         assert_eq!(
-            host.op_text::<EmitIn, FramerOut>(o.emit, slot::EMIT, true, |i| {
-                i.framing = framing;
-                i.stream = 9;
-            }),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<EmitIn, FramerOut>(o.emit, slot::EMIT, true, |i| {
+                    i.framing = framing;
+                    i.stream = 9;
+                })
+            },
             (Outcome::Failed, "emit: no such stream: 9".to_owned())
         );
         host.close();
@@ -893,10 +937,14 @@ fn a_target_carrying_userinfo_is_refused_and_never_echoed() {
             )
         );
         let o = host.ops;
-        let (r, why) = host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, true, |i| {
-            i.side = SIDE_DIAL;
-            i.target = s(target);
-        });
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let (r, why) = unsafe {
+            host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, true, |i| {
+                i.side = SIDE_DIAL;
+                i.target = s(target);
+            })
+        };
         assert_eq!(
             (r, why.as_str()),
             (

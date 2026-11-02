@@ -311,17 +311,30 @@ pub fn validate(ops: &'static Ops, json: &'static str) -> (Outcome, String) {
     i.err_buf = reason.as_mut_ptr();
     i.err_cap = reason.len();
     let mut o: OutHead = z();
-    let r = call(
-        ops.head.validate,
-        std::ptr::null_mut(),
-        &mut i,
-        &mut o,
-        life::VALIDATE,
-    );
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe {
+        call(
+            ops.head.validate,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::VALIDATE,
+        )
+    };
     (r, text(o.error))
 }
 
-pub fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u32) -> Outcome {
+/// # Safety
+/// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+/// the instance belonging to this door (or null only for an operation permitting no instance).
+pub unsafe fn call<I, O>(
+    op: Option<Op>,
+    inst: *mut c_void,
+    i: &mut I,
+    o: &mut O,
+    index: u32,
+) -> Outcome {
     // SAFETY: `I` leads with an `InHead`, `O` with an `OutHead` (the table's own structs).
     unsafe {
         let ih = std::ptr::from_mut(i).cast::<InHead>();
@@ -359,13 +372,17 @@ impl Host {
         i.settings = Blob::json(settings.as_bytes());
         let mut o: OpenOut = z();
         assert_eq!(
-            call(
-                ops.head.open,
-                std::ptr::null_mut(),
-                &mut i,
-                &mut o,
-                life::OPEN
-            ),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                call(
+                    ops.head.open,
+                    std::ptr::null_mut(),
+                    &mut i,
+                    &mut o,
+                    life::OPEN,
+                )
+            },
             Outcome::Ready
         );
         Self {
@@ -395,13 +412,17 @@ impl Host {
         i.generation = 2;
         i.settings = Blob::json(settings.as_bytes());
         let mut o: OutHead = z();
-        let r = call(
-            self.ops.head.refresh,
-            self.inst,
-            &mut i,
-            &mut o,
-            life::REFRESH,
-        );
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe {
+            call(
+                self.ops.head.refresh,
+                self.inst,
+                &mut i,
+                &mut o,
+                life::REFRESH,
+            )
+        };
         (r, text(o.error))
     }
 
@@ -443,7 +464,9 @@ impl Host {
         (i.alpn_buf, i.alpn_cap) = (p.as_mut_ptr(), p.len());
         (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
         let mut o: LocateOut = z();
-        let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE) };
         let offer = p[..o.alpn_written as usize].to_vec();
         check_locate(r, &o, 256, 256, 64, &offer, 256).expect("locate passes the kind's check");
         if r != Outcome::Ready {
@@ -476,7 +499,9 @@ impl Host {
         (i.alpn_buf, i.alpn_cap) = (p.as_mut_ptr(), p.len());
         (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
         let mut o: LocateOut = z();
-        let r = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE) };
         let offer = p[..(o.alpn_written as usize).min(p.len())].to_vec();
         check_locate(
             r,
@@ -554,7 +579,9 @@ impl Host {
                     i.framing = self.framing;
                     i.stream = stream;
                     i.sink = self.sink();
-                    call(self.ops.emit, self.inst, &mut i, &mut o, index)
+                    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                    // and the door instance for this synchronous call; the selected slot and index agree.
+                    unsafe { call(self.ops.emit, self.inst, &mut i, &mut o, index) }
                 }
                 slot::REFUSE => {
                     let mut i: RefuseIn = z();
@@ -562,26 +589,34 @@ impl Host {
                     i.stream = stream;
                     i.has_stream = 1;
                     i.sink = self.sink();
-                    call(self.ops.refuse, self.inst, &mut i, &mut o, index)
+                    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                    // and the door instance for this synchronous call; the selected slot and index agree.
+                    unsafe { call(self.ops.refuse, self.inst, &mut i, &mut o, index) }
                 }
                 slot::INGEST => {
                     let mut i: IngestIn = z();
                     i.framing = self.framing;
                     i.sink = self.sink();
-                    call(self.ops.ingest, self.inst, &mut i, &mut o, index)
+                    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                    // and the door instance for this synchronous call; the selected slot and index agree.
+                    unsafe { call(self.ops.ingest, self.inst, &mut i, &mut o, index) }
                 }
                 slot::FINISH => {
                     let mut i: FinishIn = z();
                     i.framing = self.framing;
                     i.sink = self.sink();
-                    call(self.ops.finish, self.inst, &mut i, &mut o, index)
+                    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                    // and the door instance for this synchronous call; the selected slot and index agree.
+                    unsafe { call(self.ops.finish, self.inst, &mut i, &mut o, index) }
                 }
                 _ => {
                     let mut i: FramingIn = z();
                     i.framing = self.framing;
                     i.sink = self.sink();
                     // Begin's remaining initial fields drain through Timer, as the connector does.
-                    call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER)
+                    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                    // and the door instance for this synchronous call; the selected slot and index agree.
+                    unsafe { call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER) }
                 }
             };
             if self.take(r, &o) != Outcome::Ready {
@@ -608,7 +643,9 @@ impl Host {
         i.fields_len = lent.len();
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN) };
         self.framing = o.framing;
         if self.take(r, &o) != Outcome::Ready {
             return r;
@@ -625,7 +662,9 @@ impl Host {
         i.end = u32::from(end);
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST) };
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
@@ -650,7 +689,9 @@ impl Host {
         i.final_bytes_len = bytes.len();
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH) };
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
@@ -675,7 +716,9 @@ impl Host {
         i.final_bytes_len = bytes.len();
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.finish, self.inst, &mut i, &mut o, slot::FINISH) };
         self.take(r, &o);
         (r, text(o.head.error))
     }
@@ -715,7 +758,9 @@ impl Host {
         i.facts = &facts;
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN) };
         self.framing = o.framing;
         if self.take(r, &o) != Outcome::Ready {
             return r;
@@ -744,7 +789,9 @@ impl Host {
         i.sink.wire_cap = self.wire.len();
         let mut o: FramerOut = z();
         assert_eq!(
-            call(self.ops.encode, self.inst, &mut i, &mut o, slot::ENCODE),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe { call(self.ops.encode, self.inst, &mut i, &mut o, slot::ENCODE) },
             Outcome::Ready
         );
         self.wire[..o.yielded.wire_len as usize].to_vec()
@@ -761,7 +808,9 @@ impl Host {
         i.deadline_ns = deadline_ns;
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT) };
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
@@ -779,7 +828,9 @@ impl Host {
         i.end_of_frame = u32::from(end);
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT) };
         self.take(r, &o);
         (r, o.yielded.flags, text(o.head.error))
     }
@@ -812,7 +863,9 @@ impl Host {
         i.status = status;
         i.sink = self.sink();
         let mut o: FramerOut = z();
-        let r = call(self.ops.refuse, self.inst, &mut i, &mut o, slot::REFUSE);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.refuse, self.inst, &mut i, &mut o, slot::REFUSE) };
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
@@ -845,7 +898,9 @@ impl Host {
             i.end = u32::from(end);
             i.sink = self.sink();
             let mut o: FramerOut = z();
-            let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            let r = unsafe { call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST) };
             if self.take(r, &o) != Outcome::Ready {
                 return r;
             }
@@ -869,7 +924,9 @@ impl Host {
             i.framing = self.framing;
             i.sink = self.sink();
             let mut o: FramerOut = z();
-            let r = call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER);
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            let r = unsafe { call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER) };
             if self.take(r, &o) != Outcome::Ready {
                 return r;
             }
@@ -884,7 +941,10 @@ impl Host {
 
     /// Op `index` over an all-zero `in` that `set` then fills, on this instance (or, `instance`
     /// false, on none): its outcome and its text.
-    pub fn op_text<I, O>(
+    /// # Safety
+    /// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+    /// the instance belonging to this door (or null only for an operation permitting no instance).
+    pub unsafe fn op_text<I, O>(
         &self,
         op: Option<Op>,
         index: u32,
@@ -899,17 +959,24 @@ impl Host {
         } else {
             std::ptr::null_mut()
         };
-        let r = call(op, inst, &mut i, &mut o, index);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(op, inst, &mut i, &mut o, index) };
         // SAFETY: every `out` leads with an `OutHead`.
         let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
         (r, text(head.error))
     }
 
     /// Op `index` of this instance over all-zero `in` and `out`: its outcome and its text.
-    pub fn bare<I, O>(&self, op: Option<Op>, index: u32) -> (Outcome, String) {
+    /// # Safety
+    /// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+    /// the instance belonging to this door (or null only for an operation permitting no instance).
+    pub unsafe fn bare<I, O>(&self, op: Option<Op>, index: u32) -> (Outcome, String) {
         let mut i: I = z();
         let mut o: O = z();
-        let r = call(op, self.inst, &mut i, &mut o, index);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(op, self.inst, &mut i, &mut o, index) };
         // SAFETY: every `out` leads with an `OutHead`.
         let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
         (r, text(head.error))
@@ -918,7 +985,9 @@ impl Host {
     pub fn close(self) {
         let mut i: InHead = z();
         let mut o: OutHead = z();
-        call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE) };
     }
 
     /// Stream `stream`'s whole frames (pieces joined up to each end-of-frame) up to its status:

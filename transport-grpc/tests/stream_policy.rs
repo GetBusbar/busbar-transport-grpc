@@ -185,13 +185,17 @@ impl Host {
         input.host = &*tables;
         let mut out: OpenOut = z();
         assert_eq!(
-            call(
-                ops.head.open,
-                std::ptr::null_mut(),
-                &mut input,
-                &mut out,
-                life::OPEN
-            ),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                call(
+                    ops.head.open,
+                    std::ptr::null_mut(),
+                    &mut input,
+                    &mut out,
+                    life::OPEN,
+                )
+            },
             Outcome::Ready
         );
         Self {
@@ -253,13 +257,17 @@ impl Host {
             input.lease = out.head.lease;
             let mut released: OutHead = z();
             assert_eq!(
-                call(
-                    self.ops.head.release,
-                    self.instance,
-                    &mut input,
-                    &mut released,
-                    life::RELEASE
-                ),
+                // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                // and the door instance for this synchronous call; the selected slot and index agree.
+                unsafe {
+                    call(
+                        self.ops.head.release,
+                        self.instance,
+                        &mut input,
+                        &mut released,
+                        life::RELEASE,
+                    )
+                },
                 Outcome::Ready
             );
         }
@@ -285,13 +293,17 @@ impl Host {
         input.fields_len = fields.len();
         input.sink = self.sink();
         let mut out: FramerOut = z();
-        let result = call(
-            self.ops.begin,
-            self.instance,
-            &mut input,
-            &mut out,
-            slot::BEGIN,
-        );
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let result = unsafe {
+            call(
+                self.ops.begin,
+                self.instance,
+                &mut input,
+                &mut out,
+                slot::BEGIN,
+            )
+        };
         self.framing = out.framing;
         self.capture(result, out)
     }
@@ -305,13 +317,17 @@ impl Host {
         input.len = bytes.len();
         input.sink = self.sink();
         let mut out: FramerOut = z();
-        let result = call(
-            self.ops.ingest,
-            self.instance,
-            &mut input,
-            &mut out,
-            slot::INGEST,
-        );
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let result = unsafe {
+            call(
+                self.ops.ingest,
+                self.instance,
+                &mut input,
+                &mut out,
+                slot::INGEST,
+            )
+        };
         self.capture(result, out)
     }
 
@@ -340,13 +356,17 @@ impl Drop for Host {
     fn drop(&mut self) {
         let mut input: InHead = z();
         let mut out: OutHead = z();
-        let _ = call(
-            self.ops.head.close,
-            self.instance,
-            &mut input,
-            &mut out,
-            life::CLOSE,
-        );
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let _ = unsafe {
+            call(
+                self.ops.head.close,
+                self.instance,
+                &mut input,
+                &mut out,
+                life::CLOSE,
+            )
+        };
     }
 }
 
@@ -480,13 +500,17 @@ fn cancelling_a_policy_wait_drops_only_that_unadmitted_stream() {
     input.ticket = ticket(2);
     let mut out: CancelOut = z();
     assert_eq!(
-        call(
-            host.ops.head.cancel,
-            host.instance,
-            &mut input,
-            &mut out,
-            life::CANCEL
-        ),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe {
+            call(
+                host.ops.head.cancel,
+                host.instance,
+                &mut input,
+                &mut out,
+                life::CANCEL,
+            )
+        },
         Outcome::Ready
     );
     assert_eq!(out.disposition, CANCEL_PARTIAL);
@@ -626,13 +650,17 @@ fn the_body_only_begin_declares_final_fields_once_across_tiny_wire_sinks_linked_
                 input.framing = token;
                 input.sink = host.sink();
                 let mut out: FramerOut = z();
-                let result = call(
-                    host.ops.timer,
-                    host.instance,
-                    &mut input,
-                    &mut out,
-                    slot::TIMER,
-                );
+                // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                // and the door instance for this synchronous call; the selected slot and index agree.
+                let result = unsafe {
+                    call(
+                        host.ops.timer,
+                        host.instance,
+                        &mut input,
+                        &mut out,
+                        slot::TIMER,
+                    )
+                };
                 answer = host.capture(result, out);
                 assert_eq!(answer.outcome, Outcome::Ready, "{label}");
                 declaration.extend_from_slice(&answer.wire);
@@ -649,13 +677,17 @@ fn the_body_only_begin_declares_final_fields_once_across_tiny_wire_sinks_linked_
             input.framing = token;
             input.sink = host.sink();
             let mut out: FramerOut = z();
-            let result = call(
-                host.ops.timer,
-                host.instance,
-                &mut input,
-                &mut out,
-                slot::TIMER,
-            );
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            let result = unsafe {
+                call(
+                    host.ops.timer,
+                    host.instance,
+                    &mut input,
+                    &mut out,
+                    slot::TIMER,
+                )
+            };
             assert!(
                 host.capture(result, out).wire.is_empty(),
                 "declaration is not replayed"
@@ -692,13 +724,17 @@ fn unsupported_neutral_emit_kinds_refuse_before_consuming_in_every_grpc_mode() {
                 input.end_of_frame = 1;
                 input.sink = host.sink();
                 let mut out: FramerOut = z();
-                let result = call(
-                    host.ops.emit,
-                    host.instance,
-                    &mut input,
-                    &mut out,
-                    slot::EMIT,
-                );
+                // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                // and the door instance for this synchronous call; the selected slot and index agree.
+                let result = unsafe {
+                    call(
+                        host.ops.emit,
+                        host.instance,
+                        &mut input,
+                        &mut out,
+                        slot::EMIT,
+                    )
+                };
                 let rejected = host.capture(result, out);
                 assert_eq!(rejected.outcome, Outcome::Refused, "{label}: side {side}");
                 assert!(rejected.wire.is_empty() && rejected.pieces.is_empty());
@@ -712,13 +748,17 @@ fn unsupported_neutral_emit_kinds_refuse_before_consuming_in_every_grpc_mode() {
                 input.end_of_frame = 1;
                 input.sink = host.sink();
                 let mut out: FramerOut = z();
-                let result = call(
-                    host.ops.emit,
-                    host.instance,
-                    &mut input,
-                    &mut out,
-                    slot::EMIT,
-                );
+                // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+                // and the door instance for this synchronous call; the selected slot and index agree.
+                let result = unsafe {
+                    call(
+                        host.ops.emit,
+                        host.instance,
+                        &mut input,
+                        &mut out,
+                        slot::EMIT,
+                    )
+                };
                 let reply = host.capture(result, out);
                 assert_eq!(reply.outcome, Outcome::Ready);
                 assert_eq!(
