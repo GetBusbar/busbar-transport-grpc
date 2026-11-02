@@ -53,7 +53,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -311,9 +311,70 @@ impl Drop for ChanBody {
     }
 }
 
+type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Default)]
+struct TaskList {
+    tasks: Vec<Task>,
+    waker: Option<Arc<Waker>>,
+}
+
+/// The framing owns its tasks. Hyper's connection and stream tasks retain their executor, so
+/// that executor must hold this list weakly or finishing a framing would leave a strong cycle.
+#[derive(Default)]
+struct Tasks(Arc<Mutex<TaskList>>);
+
+#[derive(Clone)]
+struct Spawner(Weak<Mutex<TaskList>>);
+
+impl<F: Future<Output = ()> + Send + 'static> Executor<F> for Spawner {
+    fn execute(&self, future: F) {
+        if let Some(list) = self.0.upgrade() {
+            let wake = {
+                let mut list = list.lock().unwrap_or_else(PoisonError::into_inner);
+                list.tasks.push(Box::pin(future));
+                list.waker.clone()
+            };
+            // A handshake may spawn after this round's task pass. Schedule another round so a
+            // new connection cannot wait for unrelated carrier input before its first poll.
+            if let Some(wake) = wake {
+                wake.wake_by_ref();
+            }
+        }
+    }
+}
+
+impl Tasks {
+    fn spawner(&self) -> Spawner {
+        Spawner(Arc::downgrade(&self.0))
+    }
+
+    fn run(&self, cx: &mut Context<'_>) {
+        let previous = {
+            let list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            list.waker.clone()
+        };
+        let wake = match previous {
+            Some(wake) if wake.will_wake(cx.waker()) => wake,
+            _ => Arc::new(cx.waker().clone()),
+        };
+        let (mut tasks, old_wake) = {
+            let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let old_wake = list.waker.replace(wake);
+            (std::mem::take(&mut list.tasks), old_wake)
+        };
+        drop(old_wake);
+        tasks.retain_mut(|task| task.as_mut().poll(cx).is_pending());
+        let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        tasks.append(&mut list.tasks);
+        list.tasks = tasks;
+    }
+}
+
 /// One connection's gRPC machine.
 pub struct Conn {
     io: HostIo,
+    tasks: Tasks,
     out: VecDeque<Piece>,
     conn_err: Arc<Mutex<Option<String>>>,
     conn_done: Arc<AtomicBool>,
@@ -393,14 +454,19 @@ impl Conn {
         let io = HostIo::new(now_ns);
         let conn_err = Arc::new(Mutex::new(None));
         let conn_done = Arc::new(AtomicBool::new(false));
-        let mut b = client::Builder::new(io.exec());
+        let tasks = Tasks::default();
+        let mut b = client::Builder::new(tasks.spawner());
         b.timer(io.timer()).adaptive_window(posture.adaptive_window);
         if let Some(every) = posture.keep_alive_interval {
             b.keep_alive_interval(every)
                 .keep_alive_timeout(posture.keep_alive_timeout);
         }
-        let (exec, err, done, stream) =
-            (io.exec(), conn_err.clone(), conn_done.clone(), io.stream());
+        let (exec, err, done, stream) = (
+            tasks.spawner(),
+            conn_err.clone(),
+            conn_done.clone(),
+            io.stream(),
+        );
         let handshake: BoxFut<hyper::Result<client::SendRequest<ChanBody>>> =
             Box::pin(async move {
                 let (s, c) = b.handshake(stream).await?;
@@ -409,6 +475,7 @@ impl Conn {
             });
         Ok(Self {
             io,
+            tasks,
             out: VecDeque::new(),
             conn_err,
             conn_done,
@@ -447,12 +514,14 @@ impl Conn {
                 answered: false,
             }
         });
-        let mut b = server::Builder::new(io.exec());
+        let tasks = Tasks::default();
+        let mut b = server::Builder::new(tasks.spawner());
         b.timer(io.timer()).adaptive_window(posture.adaptive_window);
         let conn = b.serve_connection(io.stream(), svc);
-        watch(&io.exec(), conn, &conn_err, &conn_done);
+        watch(&tasks.spawner(), conn, &conn_err, &conn_done);
         Self {
             io,
+            tasks,
             out: VecDeque::new(),
             conn_err,
             conn_done,
@@ -761,6 +830,7 @@ impl Conn {
         self.turn = self.turn.wrapping_add(1);
         let held_back = &mut self.held_back;
         let r = io.rounds(|cx| {
+            self.tasks.run(cx);
             let mut room = Room::of(&self.out, turn);
             let r = match &mut self.side {
                 Side::Dial(d) => d.step(&mut self.out, &mut room, max, cx),

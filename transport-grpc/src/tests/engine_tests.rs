@@ -2044,3 +2044,63 @@ fn terminal_response_headers_and_real_body_trailers_remain_successful() {
     assert_eq!(terminal(&got, 1).and_then(|p| p.status), Some(0));
     assert!(!last(&got, 1).unwrap().failed);
 }
+
+/// Both actual HTTP/2 peers have live connection and stream tasks when the host finishes them.
+/// Their task lists belong to the framing; an executor retained by a task must not retain them.
+#[test]
+fn dropping_active_grpc_framings_releases_both_connection_tasks_and_the_service() {
+    let mut pair = Pair::new();
+    pair.d
+        .emit(
+            1,
+            &call("/svc/Method", &[], &[b"request"]),
+            true,
+            0,
+            pair.now,
+        )
+        .unwrap();
+    pair.settle();
+    assert_eq!(
+        head(&pair.got_a, 1).stream,
+        1,
+        "a real stream is awaiting its reply"
+    );
+    let dial_task = std::sync::Arc::downgrade(&pair.d.conn_err);
+    let accept_task = std::sync::Arc::downgrade(&pair.a.conn_err);
+    let super::Side::Accept(accept) = &pair.a.side else {
+        panic!("the accepted peer")
+    };
+    let service = std::sync::Arc::downgrade(&accept.arrivals);
+    assert!(
+        dial_task.strong_count() > 1,
+        "the dialled connection task is live"
+    );
+    assert!(
+        accept_task.strong_count() > 1,
+        "the accepted connection task is live"
+    );
+    drop(pair);
+    assert!(
+        dial_task.upgrade().is_none(),
+        "the dialled task went with its framing"
+    );
+    assert!(
+        accept_task.upgrade().is_none(),
+        "the accepted task went with its framing"
+    );
+    assert!(
+        service.upgrade().is_none(),
+        "the accepted service and stream tasks were freed"
+    );
+}
+
+#[test]
+fn a_new_dialled_grpc_connection_polls_its_spawned_driver_without_peer_input() {
+    let mut conn = Conn::dial("http://peer.test:50051", posture(), 0).unwrap();
+    conn.drive(0);
+    assert!(
+        conn.take_wire(usize::MAX)
+            .starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+        "the spawned connection driver must run in this drive, before any peer input"
+    );
+}
