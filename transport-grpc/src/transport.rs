@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use crate::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
+use crate::hyper_io::{field_block, HeadWords, HostExec, HostIo, Owed, Piece};
 use busbar_contract::abi::transport::fields::hop_by_hop;
 use busbar_contract::abi::transport::FAULT_CALLER;
 use bytes::Bytes;
@@ -283,6 +283,9 @@ impl Drop for ChanBody {
 /// One connection's gRPC machine.
 pub struct Conn {
     io: HostIo,
+    /// The connection's executor, the one strong owner outside `io`: every handle hyper and the
+    /// watch task hold is a [`ConnExec`], weak, so dropping the `Conn` frees the task list.
+    _exec: Arc<HostExec>,
     out: VecDeque<Piece>,
     conn_err: Arc<Mutex<Option<String>>>,
     conn_done: Arc<AtomicBool>,
@@ -320,6 +323,20 @@ impl Owed for Conn {
     }
     fn ended(&self) -> bool {
         self.conn_done.load(Ordering::Acquire)
+    }
+}
+
+/// The executor hyper's tasks hold. The tasks are queued in the framing's own executor, so a strong
+/// handle inside them would be a cycle no drop breaks: this one is weak, and a task spawned once the
+/// connection is gone is dropped.
+#[derive(Clone)]
+struct ConnExec(std::sync::Weak<HostExec>);
+
+impl<F: Future<Output = ()> + Send + 'static> Executor<F> for ConnExec {
+    fn execute(&self, fut: F) {
+        if let Some(e) = self.0.upgrade() {
+            e.execute(fut);
+        }
     }
 }
 
@@ -362,22 +379,28 @@ impl Conn {
         let io = HostIo::new(now_ns);
         let conn_err = Arc::new(Mutex::new(None));
         let conn_done = Arc::new(AtomicBool::new(false));
-        let mut b = client::Builder::new(io.exec());
+        let exec = Arc::new(io.exec());
+        let mut b = client::Builder::new(ConnExec(Arc::downgrade(&exec)));
         b.timer(io.timer()).adaptive_window(posture.adaptive_window);
         if let Some(every) = posture.keep_alive_interval {
             b.keep_alive_interval(every)
                 .keep_alive_timeout(posture.keep_alive_timeout);
         }
-        let (exec, err, done, stream) =
-            (io.exec(), conn_err.clone(), conn_done.clone(), io.stream());
+        let (weak, err, done, stream) = (
+            ConnExec(Arc::downgrade(&exec)),
+            conn_err.clone(),
+            conn_done.clone(),
+            io.stream(),
+        );
         let handshake: BoxFut<hyper::Result<client::SendRequest<ChanBody>>> =
             Box::pin(async move {
                 let (s, c) = b.handshake(stream).await?;
-                watch(&exec, c, &err, &done);
+                watch(&weak, c, &err, &done);
                 Ok(s)
             });
         Ok(Self {
             io,
+            _exec: exec,
             out: VecDeque::new(),
             conn_err,
             conn_done,
@@ -416,12 +439,19 @@ impl Conn {
                 answered: false,
             }
         });
-        let mut b = server::Builder::new(io.exec());
+        let exec = Arc::new(io.exec());
+        let mut b = server::Builder::new(ConnExec(Arc::downgrade(&exec)));
         b.timer(io.timer()).adaptive_window(posture.adaptive_window);
         let conn = b.serve_connection(io.stream(), svc);
-        watch(&io.exec(), conn, &conn_err, &conn_done);
+        watch(
+            &ConnExec(Arc::downgrade(&exec)),
+            conn,
+            &conn_err,
+            &conn_done,
+        );
         Self {
             io,
+            _exec: exec,
             out: VecDeque::new(),
             conn_err,
             conn_done,

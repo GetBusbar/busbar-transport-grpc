@@ -2088,3 +2088,56 @@ fn one_busy_stream_does_not_starve_another_while_the_host_is_slow() {
     }
     assert!(late[0] > 20 && late[1] > 20, "both streams read: {late:?}");
 }
+
+/// A FRAMING DROPPED WITH ITS CONNECTION OPEN IS FREED. The connection's tasks sit in the framing's
+/// own executor, and each held a strong handle to it: a cycle no drop broke, so a finished framing
+/// leaked its h2 state, pipes and header table for the life of the process.
+/// RED: the watch task's `conn_err` clone outlived the dropped `Conn`.
+#[test]
+fn a_dialled_conn_dropped_with_a_call_open_is_freed() {
+    let mut d = Conn::dial("http://peer.test:50051", posture(), 5 * SEC).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Say", &[], &[b"hello"]), true, 0, 5 * SEC)
+        .expect("emit");
+    d.drive(5 * SEC);
+    let weak = std::sync::Arc::downgrade(&d.conn_err);
+    assert!(weak.strong_count() > 1, "the watch task holds the cell");
+    drop(d);
+    assert!(
+        weak.upgrade().is_none(),
+        "the dropped Conn leaked its tasks"
+    );
+}
+
+#[test]
+fn a_dialled_conn_dropped_with_the_pipe_full_is_freed() {
+    let mut d = Conn::dial("http://peer.test:50051", posture(), 5 * SEC).expect("dial");
+    // The host never takes the wire: more than the pipe's write buffer is emitted.
+    let big = vec![b'x'; 600 * 1024];
+    d.emit(1, &call("/pkg.Svc/Say", &[], &[&big]), true, 0, 5 * SEC)
+        .expect("emit");
+    d.drive(5 * SEC);
+    let weak = std::sync::Arc::downgrade(&d.conn_err);
+    assert!(weak.strong_count() > 1, "the watch task holds the cell");
+    drop(d);
+    assert!(
+        weak.upgrade().is_none(),
+        "the dropped Conn leaked its tasks"
+    );
+}
+
+#[test]
+fn an_accepted_conn_dropped_with_a_call_in_flight_is_freed() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening(Some("trailers"));
+    wire.extend(h2(0, 0, 1, &msg::frame(b"q")));
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    assert_eq!(held(&a), 1, "a call is in flight");
+    let weak = std::sync::Arc::downgrade(&a.conn_err);
+    assert!(weak.strong_count() > 1, "the watch task holds the cell");
+    drop(a);
+    assert!(
+        weak.upgrade().is_none(),
+        "the dropped Conn leaked its tasks"
+    );
+}
