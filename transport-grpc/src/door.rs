@@ -65,7 +65,7 @@ use crate::stream::StreamCall;
 use crate::transport::{self, Admission, AdmissionProgress, Conn, Posture};
 
 use crate::claims::CLAIM_NAMES;
-use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, TAIL};
+use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, SETTING_ROWS, TAIL};
 pub use crate::meta::{setting, KEY};
 
 /// THE AUTH POINTS THIS DOOR OFFERS: none (ruling R2). It makes no auth call on either side (no
@@ -124,10 +124,20 @@ const ADAPTIVE_WINDOW: bool = true;
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
 /// says. An absent blob reads as `{}`.
 fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
-    let v = settings_reading(
-        bytes,
-        &[setting::REQUEST_TIMEOUT_SECS, setting::BODY_MAX_BYTES],
-    )?;
+    let v = settings_reading(bytes, &SETTING_ROWS).map_err(|refusal| {
+        // Preserve the established per-unit count diagnostics from this door.
+        for (row, unit) in SETTING_ROWS.iter().zip(["seconds", "bytes"]) {
+            if refusal.text()
+                == Some(format!("settings: {} must be a count above 0", row.path).as_str())
+            {
+                return Refusal::failed(format!(
+                    "settings: {} must be a count of {unit} above 0",
+                    row.path
+                ));
+            }
+        }
+        refusal
+    })?;
     // A count above 0, by its key and its unit (`settings: <key> must be a count of <unit> above
     // 0`, http's words); an absent one reads as the default its declaration states (`SETTINGS`):
     // one source.

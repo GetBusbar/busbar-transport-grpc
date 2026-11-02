@@ -6,8 +6,7 @@
 //! code it describes.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
-use busbar_contract::abi::sdk::door::abi_str;
-use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
+use busbar_contract::abi::sdk::transport::{setting_decls, SettingRow, DEFAULT_BODY_MAX};
 use busbar_contract::abi::transport::{
     FaultRow, SettingDecl, StatusRow, TransportTail, FACT_ACCEPTS, FACT_DIALS, FAULT_CALLER,
     FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
@@ -165,20 +164,20 @@ pub(crate) const fn decimal(text: &str) -> u64 {
 // equal (as the SDK holds `DEFAULT_BODY_MAX` to its bound).
 const _: () = assert!(decimal(DEFAULT_TIMEOUT) == DEFAULT_REQUEST_TIMEOUT_SECS);
 
-pub(crate) const SETTINGS: &[SettingDecl] = &[
-    SettingDecl {
-        path: abi_str(setting::REQUEST_TIMEOUT_SECS),
+pub(crate) const SETTING_ROWS: [SettingRow; 2] = [
+    SettingRow {
+        path: setting::REQUEST_TIMEOUT_SECS,
         kind: SETTING_COUNT,
-        _reserved: 0,
-        default: abi_str(DEFAULT_TIMEOUT),
+        default: DEFAULT_TIMEOUT,
     },
-    SettingDecl {
-        path: abi_str(setting::BODY_MAX_BYTES),
+    SettingRow {
+        path: setting::BODY_MAX_BYTES,
         kind: SETTING_COUNT,
-        _reserved: 0,
-        default: abi_str(DEFAULT_BODY_MAX),
+        default: DEFAULT_BODY_MAX,
     },
 ];
+
+pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls(&SETTING_ROWS);
 
 pub(crate) const TAIL: TransportTail = {
     let mut t = TransportTail::EMPTY
