@@ -1097,8 +1097,7 @@ fn advance(
                     }
                     Err(other) => {
                         if let Ok(t) = other.into_trailers() {
-                            msgs.end()
-                                .map_err(|e| (e.to_string(), msg::INTERNAL, false))?;
+                            msgs.end().map_err(|e| (e.to_string(), e.status(), false))?;
                             out.extend(trailers(id, &t, &t));
                             s.stage = DStage::Done;
                             return Ok(());
@@ -1554,9 +1553,9 @@ impl Accept {
                             Ok(()) => out.push_back(Piece::end(*id)),
                             Err(e) => {
                                 let why = e.to_string();
-                                s.fail_reply(msg::INTERNAL, why.as_bytes());
+                                s.fail_reply(e.status(), why.as_bytes());
                                 out.push_back(Piece {
-                                    status: Some(msg::INTERNAL),
+                                    status: Some(e.status()),
                                     ..Piece::failure(*id, &why)
                                 });
                             }
