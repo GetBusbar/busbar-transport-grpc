@@ -450,16 +450,22 @@ fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_predevs_bytes
     for run in &runs[1..] {
         assert_eq!(same_proof(&runs[0], run), Ok(()));
     }
-
-    let mut host = Host::open(l, "{}", ROOMY);
-    host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
-    let at = host.wire_log.len();
-    assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
-    assert_eq!(
-        String::from_utf8_lossy(&host.wire_log[at..]),
-        tonic_block(tonic::Status::new(tonic::Code::Ok, ""), false)
-    );
-    host.close();
+    // A whole end: `grpc-status: 0` alone, on both images.
+    let (d, _lib) = dropped();
+    for ops in [l, d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        assert_eq!(
+            host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]),
+            Outcome::Ready
+        );
+        let at = host.wire_log.len();
+        assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            tonic_block(tonic::Status::new(tonic::Code::Ok, ""), false)
+        );
+        host.close();
+    }
 }
 
 /// A STREAM REFUSED BEFORE ANY REPLY is the door's trailers-only answer, in predev's bytes (tonic
@@ -490,12 +496,30 @@ fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
         host.begin_stream("/t.T/Unary", &[("content-type", "application/json")]),
         Outcome::Refused
     );
-    let mut host = Host::open(linked(), "{}", ROOMY);
-    host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
-    assert_eq!(
-        host.finish_final(13, b"x", b"line\r\nbreak"),
-        Outcome::Failed
-    );
+    use busbar_contract::abi::mechanism::call::Span;
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        let at = host.wire_log.len();
+        let (msg_bytes, details) = (b"x", b"line\r\nbreak");
+        let blob = [&msg_bytes[..], &details[..]].concat();
+        let span = |offset: u32, len: u32| Span { offset, len };
+        assert_eq!(
+            host.finish_spans(13, &blob, span(0, 1), span(1, 11)),
+            (
+                Outcome::Failed,
+                "finish: the status details are not one field value".to_owned()
+            )
+        );
+        assert_eq!(host.wire_log.len(), at, "nothing written");
+        assert_eq!(host.refuse_as(1, b"", 500), Outcome::Ready);
+        assert!(
+            String::from_utf8_lossy(&host.wire_log[at..]).contains("grpc-status: 2\r\n"),
+            "the fallback refusal closes the call"
+        );
+        host.close();
+    }
 }
 
 /// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` with the
@@ -686,6 +710,47 @@ fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
     }
 }
 
+/// A CLOSE THAT IS PENDING LEAVES THE CALL IN ITS FRAMING: an op crossing the host's `finish`
+/// re-calls (the ABI does not serialize ops per framing) finds the call, never "no such framing".
+/// RED: `finish` took the call out of the map while it worked, so the crossing `timer` failed.
+#[test]
+fn an_op_crossing_a_pending_finish_still_finds_its_call() {
+    use busbar_contract::abi::mechanism::call::Span;
+    let span = |offset: u32, len: u32| Span { offset, len };
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", TIGHT);
+        assert_eq!(
+            host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]),
+            Outcome::Ready
+        );
+        let crossing = host.crossing_timer();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut lost = 0_usize;
+            while !seen.load(std::sync::atomic::Ordering::Relaxed) {
+                let (_, why) = crossing();
+                if why.contains("no such framing") {
+                    lost += 1;
+                }
+            }
+            lost
+        });
+        // A close of many bytes through a sink of seven: hundreds of re-calls.
+        let message = vec![b'm'; 3000];
+        // Far fewer re-calls than the close needs: it is pending throughout.
+        for _ in 0..60 {
+            let (r, why) = host.finish_spans(5, &message, span(0, 3000), span(3000, 0));
+            assert_eq!((r, why.as_str()), (Outcome::Ready, ""));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let lost = thread.join().expect("the crossing thread ran");
+        assert_eq!(lost, 0, "crossing ops lost the call");
+        host.close();
+    }
+}
+
 /// A FINAL TAIL WHOSE SPAN LIES OUTSIDE ITS BYTES IS REFUSED IN WORDS, never read as no message:
 #[test]
 fn a_final_tail_whose_span_lies_outside_its_bytes_is_refused_in_words() {
@@ -780,6 +845,13 @@ fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
                 "settings: limits.request_body_max_bytes must be a count of bytes above 0"
                     .to_owned()
             )
+        );
+        // The refused blobs applied nothing: the default ceiling still takes a 17-byte message.
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        assert_ne!(
+            host.feed(&lpm(&[7u8; 17]), false),
+            Outcome::Failed,
+            "a refused refresh left the settings in force"
         );
         assert_eq!(
             host.refresh(r#"{"limits.request_body_max_bytes":16}"#),

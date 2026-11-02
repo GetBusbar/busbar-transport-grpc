@@ -2,6 +2,35 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! One stream (`SIDE_ACCEPT_STREAM`): a gRPC call whose HTTP/2 connection
+//! and head the host's own framer carries (one listener port carries every claim's streams), framed
+//! here alone. The gRPC layer is still this door's:
+//!
+//! * `begin` takes the call's head fields: a call that is not gRPC (its `content-type`) is refused
+//!   before it is one; a call whose `grpc-encoding` names a compression this door does not take
+//!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding` (gRPC's
+//!   compression rules); the first `grpc-encoding` field is the call's, a repeat is not read;
+//!   a `grpc-timeout` it states is a fact for the plane in the head the host keeps: this framing
+//!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`;
+//! * `ingest` takes the call's body and yields each length-prefixed message's PAYLOAD as one piece
+//!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
+//!   body ended);
+//! * `emit` takes one reply message's payload and yields it length-prefixed, as body bytes; once
+//!   the call is closed an `emit` writes nothing. The reply has a stream's own backpressure: an
+//!   `emit` that leaves its queue at the high-water mark is answered `YIELD_STREAM_FULL`, a
+//!   writable piece follows the drain, and a host that emits past the bound has the reply cut (the
+//!   call then closes `RESOURCE_EXHAUSTED`, whatever close it states);
+//! * `finish` closes the call with the final status the unit stated: `grpc-status`, `grpc-message`
+//!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in tonic
+//!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers;
+//! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
+//!   mapped ([`msg::status_of_refusal`]); a body the framer refused closes in this framer's words,
+//!   whatever the refusal (and whatever close `finish` states): a message over the ceiling
+//!   `RESOURCE_EXHAUSTED`, naming the configured limit; a compression the door does not take
+//!   `UNIMPLEMENTED`; a message flagged compressed with none agreed, or a body that ended inside a
+//!   message, `INTERNAL`; before any message went out the block is the whole answer (trailers-only:
+//!   `:status: 200`, `content-type`, then the status lines).
+//!
+//! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
 
 use std::collections::VecDeque;
 
@@ -26,8 +55,12 @@ pub struct StreamCall {
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
     closed: bool,
-    /// The body was refused for what it is (a message over the ceiling, a compression the door
-    oversize: Option<msg::Bad>,
+    /// The body was refused for what it is: the call closes with this status and these words,
+    /// whatever refusal the host then closes it with. `TooLarge` (a message over the ceiling)
+    /// closes `RESOURCE_EXHAUSTED`, `Encoding` (a compression the door does not take)
+    /// `UNIMPLEMENTED`, `Compressed` (a message flagged compressed, none agreed) and `Truncated`
+    /// (the body ended inside a message) `INTERNAL`.
+    refused: Option<msg::Bad>,
     /// The reply was cut ([`StreamCall::cut_reply`]), for these words.
     cut: Option<String>,
     /// An `emit` was answered `YIELD_STREAM_FULL`, and no writable piece has followed yet.
@@ -36,13 +69,25 @@ pub struct StreamCall {
 
 impl StreamCall {
     /// The call that arrived with `fields`, its messages at most `max` payload bytes.
+    ///
+    /// A `grpc-encoding` naming a compression the door does not take opens the call already
+    /// refused: its first `ingest` fails, and its close is `UNIMPLEMENTED`. The FIRST
+    /// `grpc-encoding` field is the call's encoding; a repeat is not read.
+    ///
+    /// # Errors
+    ///
+    /// The call is not gRPC: its `content-type` is none of gRPC's, or its method (when stated) is
+    /// not POST.
     pub fn open<'f>(
         fields: impl Iterator<Item = (&'f [u8], &'f [u8])>,
         max: usize,
     ) -> Result<Self, Failure> {
-        let (mut grpc, mut encoding) = (false, None);
+        let (mut grpc, mut encoding, mut post) = (false, None, true);
         for (n, v) in fields {
-            if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
+            if n.eq_ignore_ascii_case(b":method") || n.eq_ignore_ascii_case(b"method") {
+                // A gRPC call is a POST; the host passing the method states it.
+                post = v.eq_ignore_ascii_case(b"POST");
+            } else if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
                 grpc = true;
             } else if encoding.is_none() && n.eq_ignore_ascii_case(msg::GRPC_ENCODING.as_bytes()) {
                 encoding = Some(v);
@@ -54,6 +99,11 @@ impl StreamCall {
                 "begin: the stream is not a gRPC call (its content-type)".into(),
             ));
         }
+        if !post {
+            return Err(Failure(
+                "begin: the stream is not a gRPC call (its method)".into(),
+            ));
+        }
         Ok(Self {
             messages: Messages::new(max),
             max,
@@ -62,7 +112,7 @@ impl StreamCall {
             out: VecDeque::new(),
             answered: false,
             closed: false,
-            oversize: refused,
+            refused,
             cut: None,
             announced: false,
         })
@@ -76,24 +126,35 @@ impl StreamCall {
     /// The call's body bytes (`end` = its last): each message they complete is a piece.
     pub fn ingest(&mut self, bytes: &[u8], end: bool) -> Result<(), Failure> {
         let bad = |e: msg::Bad| Failure(e.to_string());
-        if let Some(e @ msg::Bad::Encoding(_)) = &self.oversize {
+        if let Some(e @ msg::Bad::Encoding(_)) = &self.refused {
             return Err(bad(e.clone()));
         }
+        // Every refusal the framer states is the call's own close, as on the connection side.
         let got = self.messages.push(bytes).inspect_err(|e| {
-            if matches!(e, msg::Bad::TooLarge(..)) {
-                self.oversize = Some(e.clone());
-            }
+            self.refused = Some(e.clone());
         });
         for m in got.map_err(bad)? {
             self.out.push_back(Piece::data(STREAM, m.slice(PREFIX..)));
         }
         if end {
-            self.messages.end().map_err(bad)?;
+            self.messages
+                .end()
+                .inspect_err(|e| {
+                    self.refused = Some(e.clone());
+                })
+                .map_err(bad)?;
         }
         Ok(())
     }
 
     /// One reply message's payload bytes (`ends` = they complete it). A call already closed takes
+    /// none: body bytes after the closing lines would follow the trailers. Nor does a reply that
+    /// was cut ([`StreamCall::cut_reply`]).
+    ///
+    /// # Errors
+    ///
+    /// The reply is cut here: its queue went past its bound (a host that kept emitting to a far
+    /// end not reading, [`stream_bound`]), or its message is longer than a length prefix states.
     pub fn emit(&mut self, bytes: &[u8], ends: bool) -> Result<(), Failure> {
         if self.closed || self.cut.is_some() {
             return Ok(());
@@ -142,7 +203,7 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        let lines = if let Some(e) = &self.oversize {
+        let lines = if let Some(e) = &self.refused {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else if let Some(why) = &self.cut {
             cut_lines(why)?
@@ -191,10 +252,17 @@ impl StreamCall {
             return Err(Failure("finish: the reply ended inside a message".into()));
         }
 
-        let lines = match &self.cut {
-            Some(why) => cut_lines(why)?,
-            None => msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?,
+        let lines = if let Some(e) = &self.refused {
+            e.close_lines().map_err(|e| Failure(e.into()))?
+        } else {
+            match &self.cut {
+                Some(why) => cut_lines(why)?,
+                None => {
+                    msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?
+                }
+            }
         };
+        self.writing = Vec::new();
         self.closed = true;
         self.wire.extend(lines);
         Ok(())

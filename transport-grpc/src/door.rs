@@ -491,7 +491,7 @@ slot!(
     /// closes its call with the final status the close states (its final tail), as trailers.
     Finish, FinishIn, FramerOut, |p, i, o| {
         let call = mine(&p)
-            .and_then(|inst| inst.calls.lock().unwrap_or_else(PoisonError::into_inner).remove(&i.framing()));
+            .and_then(|inst| inst.calls.lock().unwrap_or_else(PoisonError::into_inner).get(&i.framing()).cloned());
         if let Some(call) = call {
             let all = i.final_bytes();
             // A span of no bytes (absent among them) is none; any other must lie inside the bytes.
@@ -506,9 +506,6 @@ slot!(
                 (Some(m), Some(d)) => (m, d),
                 (m, _) => {
                     // Refused, and the call kept for the host's fallback refusal to close.
-                    if let Some(inst) = mine(&p) {
-                        inst.calls.lock().unwrap_or_else(PoisonError::into_inner).insert(i.framing(), call);
-                    }
                     o.error(if m.is_none() {
                         "finish: the final message lies outside the close's bytes"
                     } else {
@@ -522,14 +519,15 @@ slot!(
                 c.finish(status, message, details)
             });
             // A close the sink could not take whole stays until the host's re-call drains it, and a
-            // close that failed stays for the host's fallback refusal to close the call.
+            // close that failed stays for the host's fallback refusal to close the call. The call
+            // is in the map throughout, so an op crossing this one finds it.
             let keep = {
                 let c = call.lock().unwrap_or_else(PoisonError::into_inner);
                 c.wire_pending() || !c.ended()
             };
-            if keep {
+            if !keep {
                 if let Some(inst) = mine(&p) {
-                    inst.calls.lock().unwrap_or_else(PoisonError::into_inner).insert(i.framing(), call);
+                    inst.calls.lock().unwrap_or_else(PoisonError::into_inner).remove(&i.framing());
                 }
             }
             return answered;

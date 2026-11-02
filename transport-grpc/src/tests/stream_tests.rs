@@ -87,6 +87,19 @@ fn a_call_that_is_not_grpc_is_refused_before_it_is_one() {
     assert!(StreamCall::open(std::iter::empty(), 1).is_err());
 }
 
+/// A gRPC call is a POST: a stream whose stated method is another is refused at `begin`.
+#[test]
+fn a_stream_whose_method_is_not_post_is_refused() {
+    let grpc_type = (&b"content-type"[..], &b"application/grpc"[..]);
+    for m in [&b"GET"[..], b"PUT"] {
+        let e = StreamCall::open([grpc_type, (&b":method"[..], m)].into_iter(), 1)
+            .err()
+            .expect("refused");
+        assert!(e.0.contains("its method"), "{}", e.0);
+    }
+    assert!(StreamCall::open([grpc_type, (&b":method"[..], &b"POST"[..])].into_iter(), 1).is_ok());
+}
+
 /// The encoding is predev's gRPC line's (v1.5.5 served no gRPC).
 #[test]
 fn the_status_message_is_encoded_as_predev_encoded_it() {
@@ -352,6 +365,90 @@ fn a_successful_finish_cannot_discard_an_unfinished_reply_message() {
     }
 }
 
+/// A CALL WHOSE BODY THE FRAMER REFUSED CLOSES WITH THE FRAMER'S STATUS, NOT THE UNIT'S: after an
+/// oversize message `finish(0, ..)` (core's close, or its Drop) must be `RESOURCE_EXHAUSTED`, never OK.
+#[test]
+fn a_finish_after_an_oversize_message_is_resource_exhausted_not_ok() {
+    let mut c = grpc();
+    let mut body = vec![0u8];
+    body.extend_from_slice(&1025u32.to_be_bytes());
+    c.ingest(&body, false).expect_err("over the ceiling");
+    c.finish(0, b"", b"").unwrap();
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 8\r\n"), "{w}");
+    assert!(!w.contains("grpc-status: 0"), "{w}");
+}
+
+/// A COMPRESSED MESSAGE WITH NO ENCODING ON THE STREAM PATH CLOSES INTERNAL with the framer's words,
+/// as on the connection side, not with the host's neutral refusal status.
+#[test]
+fn a_compressed_message_without_an_encoding_closes_internal_on_a_stream() {
+    let mut c = grpc();
+    let why = c.ingest(&[1, 0, 0, 0, 1, b'z'], true).expect_err("refused");
+    c.refuse(why.0.as_bytes(), 500, false).unwrap();
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 13\r\n"), "{w}");
+    assert!(w.contains("a%20message%20is%20compressed"), "{w}");
+}
+
+/// A truncated body closes INTERNAL too.
+#[test]
+fn a_truncated_body_closes_internal_on_a_stream() {
+    let mut c = grpc();
+    c.ingest(&msg::frame(b"abc")[..6], true).expect_err("cut");
+    c.finish(0, b"", b"").unwrap();
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 13\r\n"), "{w}");
+}
+
+/// A `grpc-encoding` of C1 control bytes is named escaped, printable ASCII only.
+#[test]
+fn an_encoding_name_with_controls_is_escaped_in_the_refusal() {
+    let mut c = open_with(&[(&b"grpc-encoding"[..], "\u{9b}[31m".as_bytes())]);
+    let why = c.ingest(&msg::frame(b"a"), true).expect_err("refused");
+    assert!(
+        why.0
+            .chars()
+            .all(|ch| ch.is_ascii() && !ch.is_ascii_control()),
+        "{}",
+        why.0
+    );
+    assert!(why.0.contains("\\xc2\\x9b"), "{}", why.0);
+}
+
+/// A CLOSE WHILE A REPLY MESSAGE IS STILL BEING WRITTEN never closes whole: the partial message is
+/// dropped and the call closes `INTERNAL` in words, whatever status the host states. RED: the
+/// partial message was dropped silently and the call closed `grpc-status: 0`.
+#[test]
+fn an_unfinished_reply_cannot_close_successfully_and_a_refusal_keeps_its_status() {
+    for status in [0, 5] {
+        let mut c = grpc();
+        c.emit(b"half of a mess", false).unwrap();
+        let result = c.finish(status, b"", b"");
+        if status == 0 {
+            assert!(result.is_err(), "an unfinished reply cannot report success");
+            assert!(
+                c.take_wire(usize::MAX).is_empty(),
+                "no partial body or successful trailer was written"
+            );
+            assert!(!c.ended(), "a refused successful close remains recoverable");
+            c.emit(b"age", true).expect("the same reply may complete");
+            c.finish(0, b"", b"").expect("the whole reply may close");
+            let mut expected = msg::frame(b"half of a message");
+            expected.extend_from_slice(b"grpc-status: 0\r\n");
+            assert_eq!(c.take_wire(usize::MAX), expected);
+        } else {
+            result.expect("an explicit refusal may close the unfinished writer");
+            assert_eq!(
+                wire(&mut c),
+                "grpc-status: 5\r\n",
+                "the host's explicit failure is retained"
+            );
+        }
+        assert!(c.ended());
+    }
+}
+
 #[test]
 fn unfinished_reply_can_be_refused_and_empty_success_remains_valid() {
     let mut c = grpc();
@@ -376,4 +473,35 @@ fn unfinished_reply_can_be_refused_and_empty_success_remains_valid() {
         .expect("an explicit failure still closes");
     assert!(wire(&mut c).contains("grpc-status: 13\r\n"));
     assert!(c.ended());
+}
+
+#[test]
+fn unfinished_fragments_past_the_bound_cut_the_reply() {
+    let mut c = StreamCall::open(
+        [(&b"content-type"[..], &b"application/grpc"[..])].into_iter(),
+        100,
+    )
+    .unwrap();
+    let bound = crate::transport::stream_bound(100);
+    let chunk = [b'a'; 64];
+    let mut sent = 0;
+    let mut err = None;
+    while sent <= bound + chunk.len() {
+        match c.emit(&chunk, false) {
+            Ok(()) => sent += chunk.len(),
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let e = err.expect("end=false fragments past the bound are cut");
+    assert!(sent <= bound, "cut only once past the bound");
+    assert_eq!(e.0, crate::transport::OVER_BOUND);
+    c.emit(b"more", false).unwrap();
+    c.emit(b"tail", true).unwrap();
+    assert!(
+        c.take_wire(usize::MAX).is_empty(),
+        "a cut reply writes nothing more"
+    );
 }

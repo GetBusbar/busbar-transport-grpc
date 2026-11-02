@@ -624,7 +624,7 @@ impl Host {
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
-        self.drain(slot::BEGIN, 0)
+        self.drain(slot::TIMER, 0)
     }
 
     /// `ingest` `bytes` (`end` = the far side's last).
@@ -949,6 +949,21 @@ impl Host {
         // SAFETY: every `out` leads with an `OutHead`.
         let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
         (r, text(head.error))
+    }
+
+    /// A `timer` call on this framing that another thread may make while this host is inside an
+    /// op: it states a sink of no room, and answers its outcome and its text.
+    pub fn crossing_timer(&self) -> impl Fn() -> (Outcome, String) + Send + 'static {
+        let (inst, framing, timer) = (self.inst as usize, self.framing, self.ops.timer);
+        move || {
+            let mut i: FramingIn = z();
+            i.framing = framing;
+            let mut o: FramerOut = z();
+            let r = call(timer, inst as *mut c_void, &mut i, &mut o, slot::TIMER);
+            // SAFETY: every `out` leads with an `OutHead`.
+            let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+            (r, text(head.error))
+        }
     }
 
     pub fn close(self) {

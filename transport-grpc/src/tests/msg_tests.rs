@@ -342,3 +342,59 @@ fn a_refusals_bytes_are_a_block_only_where_they_are_one() {
         );
     }
 }
+
+/// A COMPLETE HEAD OVER THE CEILING IS REFUSED like an incomplete one, even when it arrives whole.
+#[test]
+fn a_complete_head_over_the_ceiling_is_refused() {
+    let mut head = b"a: ".to_vec();
+    head.extend(std::iter::repeat_n(b'x', 200));
+    head.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(
+        read_head(&head, 100),
+        Err("the head block is over the ceiling".to_string())
+    );
+    assert!(read_head(&head, 1000).unwrap().is_some());
+}
+
+/// A HEAD'S DEBUG TEXT NEVER CARRIES A VALUE: a dialled head holds the auth's credential lines.
+/// RED: the derived `Debug` printed `Bearer s3cret` in clear.
+#[test]
+fn a_heads_debug_text_names_fields_and_lengths_only() {
+    let head = Head {
+        fields: vec![("authorization".to_owned(), b"Bearer s3cret".to_vec())],
+        content_length: Some(7),
+    };
+    let text = format!("{head:?}");
+    assert!(
+        !text.contains("s3cret") && !text.contains("Bearer"),
+        "{text}"
+    );
+    assert!(text.contains("authorization"), "{text}");
+    assert!(text.contains("13"), "the value's length: {text}");
+}
+
+/// `message_text` CUTS ON A CHARACTER'S EDGE: a character that would cross the bound is dropped
+/// whole, a multibyte one never split, an expanded control escape never half-written.
+#[test]
+fn message_text_cuts_on_a_characters_edge() {
+    let with = |n: usize, tail: &[u8]| {
+        let mut v = vec![b'a'; n];
+        v.extend_from_slice(tail);
+        message_text(&v)
+    };
+    // A two-byte character that would cross the bound is dropped whole.
+    let out = with(MESSAGE_TEXT_MAX - 1, "é".as_bytes());
+    assert_eq!(out.len(), MESSAGE_TEXT_MAX - 1);
+    let text = String::from_utf8(out).expect("valid UTF-8");
+    assert!(text.bytes().all(|b| b == b'a'), "no U+FFFD tail");
+    // An ESC expands to `\u{1b}` (6 bytes): it crosses the bound, so none of it is written.
+    let out = with(MESSAGE_TEXT_MAX - 3, &[0x1b]);
+    assert_eq!(out, vec![b'a'; MESSAGE_TEXT_MAX - 3]);
+    // A bound already met by ASCII drops the next character whole.
+    let out = with(MESSAGE_TEXT_MAX, "é".as_bytes());
+    assert_eq!(out, vec![b'a'; MESSAGE_TEXT_MAX]);
+    // A character that fits exactly stays.
+    let out = with(MESSAGE_TEXT_MAX - 2, "é".as_bytes());
+    assert_eq!(out.len(), MESSAGE_TEXT_MAX);
+    assert!(out.ends_with("é".as_bytes()));
+}

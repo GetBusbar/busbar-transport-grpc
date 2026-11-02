@@ -100,13 +100,10 @@ impl Bad {
 /// The compression a call's `grpc-encoding` value `v` names, where this door does not take it:
 #[must_use]
 pub fn unsupported_encoding(v: &[u8]) -> Option<Bad> {
-    if v == b"identity" {
+    if v == ACCEPT_ENCODING.as_bytes() {
         return None;
     }
-
-    Some(Bad::Encoding(
-        std::str::from_utf8(v).map_or_else(|_| format!("{v:?}"), str::to_owned),
-    ))
+    Some(Bad::Encoding(v.escape_ascii().to_string()))
 }
 
 impl std::fmt::Display for Bad {
@@ -123,7 +120,8 @@ impl std::fmt::Display for Bad {
             Self::TooLarge(n, limit) => write!(
                 f,
                 "the message is {n} bytes, over the limit of {limit} bytes \
-                 (limits.request_body_max_bytes)"
+                 ({})",
+                crate::meta::setting::BODY_MAX_BYTES
             ),
             Self::Truncated => f.write_str("the stream ended inside a message"),
         }
@@ -447,12 +445,35 @@ pub fn status_lines(code: u32, message: &[u8], details: &[u8]) -> Result<Vec<u8>
 }
 
 /// A head block, read.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Head {
     /// Every field line but `content-length`, in order.
     pub fields: Vec<(String, Vec<u8>)>,
     /// The message stream's length, when the block states it.
     pub content_length: Option<usize>,
+}
+
+/// A head's debug text names its fields and the length of each value, never a value: a dialled head
+/// carries the auth's credential lines.
+impl std::fmt::Debug for Head {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Lengths<'a>(&'a [(String, Vec<u8>)]);
+        impl std::fmt::Debug for Lengths<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_list()
+                    .entries(
+                        self.0
+                            .iter()
+                            .map(|(k, v)| format!("{k}: <{} bytes>", v.len())),
+                    )
+                    .finish()
+            }
+        }
+        f.debug_struct("Head")
+            .field("fields", &Lengths(&self.fields))
+            .field("content_length", &self.content_length)
+            .finish()
+    }
 }
 
 /// A head's values are wiped when it drops: a dialled head carries the auth's credential lines.
@@ -481,6 +502,9 @@ pub fn read_head(buf: &[u8], max: usize) -> Result<Option<(Head, usize)>, String
     let (lines, took) = if buf.starts_with(b"\r\n") {
         (&buf[..0], 2)
     } else if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        if p > max {
+            return Err("the head block is over the ceiling".into());
+        }
         (&buf[..p], p + 4)
     } else {
         if buf.len() > max {

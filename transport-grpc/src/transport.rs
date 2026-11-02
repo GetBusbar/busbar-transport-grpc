@@ -22,6 +22,7 @@ use busbar_contract::abi::transport::fields::hop_by_hop;
 use busbar_contract::abi::transport::guest_policy::Policy;
 use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
 use busbar_contract::abi::transport::FramerOut;
+use busbar_contract::abi::transport::FAULT_CALLER;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body, Frame};
@@ -216,14 +217,16 @@ struct ChanBody(Chan);
 
 impl Body for ChanBody {
     type Data = Bytes;
-    type Error = std::io::Error;
+    // `hyper` reads a reset's reason from an `h2::Error` in the error's source chain, which an
+    // `io::Error` hides.
+    type Error = h2::Error;
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, h2::Error>>> {
         let mut s = self.0 .0.lock().unwrap_or_else(PoisonError::into_inner);
         if s.reset {
-            return Poll::Ready(Some(Err(std::io::Error::other("the stream was failed"))));
+            return Poll::Ready(Some(Err(h2::Error::from(h2::Reason::CANCEL))));
         }
         if let Some(f) = s.frames.pop_front() {
             if let Some(d) = f.data_ref() {
@@ -349,6 +352,7 @@ impl Owed for Conn {
     }
 }
 
+/// Record the actual connection driver's terminal result in its framing.
 fn watch<F>(
     exec: &impl Executor<BoxFut<()>>,
     conn: F,
@@ -606,8 +610,10 @@ impl Conn {
                 if let Err(why) = read {
                     s.chan.reset();
                     s.stage = DStage::Done;
+                    // Nothing was sent: the caller's call was unbuildable, not the far end's fault.
                     self.out.push_back(Piece {
                         status: Some(msg::INTERNAL),
+                        fault: Some(FAULT_CALLER),
                         ..Piece::failure(stream, &why)
                     });
                 } else if s.chan.queued() > bound {
@@ -861,6 +867,11 @@ impl Dial {
         let ended = &mut self.ended;
         self.calls.retain(|(id, s)| {
             if s.over() {
+                // An early answer leaves the request unfinished: reset it, so the connection
+                // sends RST_STREAM rather than hold the send half and the slot open.
+                if !s.chan.ended() {
+                    s.chan.reset();
+                }
                 ended.insert(*id);
             }
             !s.over()
@@ -928,6 +939,9 @@ impl DialStream {
             _ => bytes.to_vec(),
         };
         if !body.is_empty() {
+            if self.chan.ended() {
+                return Err("bytes after the request's end".into());
+            }
             if let Some(left) = self.left.as_mut() {
                 if body.len() > *left {
                     return Err("more message bytes than the head's content-length".into());
@@ -1113,7 +1127,6 @@ fn advance(
                                 false,
                             ));
                         }
-
                         out.extend(trailers(id, &HeaderMap::new(), r.headers()));
                         s.stage = DStage::Done;
                         return Ok(());
@@ -1138,8 +1151,7 @@ fn advance(
                     }
                     Err(other) => {
                         if let Ok(t) = other.into_trailers() {
-                            msgs.end()
-                                .map_err(|e| (e.to_string(), msg::INTERNAL, false))?;
+                            msgs.end().map_err(|e| (e.to_string(), e.status(), false))?;
                             out.extend(trailers(id, &t, &t));
                             s.stage = DStage::Done;
                             return Ok(());
@@ -1186,7 +1198,7 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
     }
     (
         msg::UNAVAILABLE,
-        "the connection to the far end was lost".into(),
+        format!("the connection to the far end was lost: {e}"),
     )
 }
 
@@ -1194,7 +1206,10 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
 fn dial_bad_text(e: &msg::Bad) -> String {
     match e {
         msg::Bad::TooLarge(n, limit) => {
-            format!("the answer's message is {n} bytes, over the limit of {limit} bytes")
+            format!(
+                "the answer's message is {n} bytes, over the limit of {limit} bytes ({})",
+                crate::meta::setting::BODY_MAX_BYTES
+            )
         }
         other => other.to_string(),
     }
@@ -1219,7 +1234,27 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
         .get(msg::GRPC_MESSAGE)
         .map(|v| msg::message_text(v.as_bytes()))
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| format!("grpc-status {code}").into_bytes());
+        .unwrap_or_else(|| {
+            if let Some(sent) = status.get(msg::GRPC_STATUS) {
+                // A value that is not a canonical code reads as UNKNOWN: the text says what the
+                // far end sent, not a code it did not.
+                let canonical = std::str::from_utf8(sent.as_bytes())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+                    .is_some_and(|c| c <= 16);
+                if canonical {
+                    format!("grpc-status {code}").into_bytes()
+                } else {
+                    format!(
+                        "grpc-status {} (not a gRPC status; read as UNKNOWN)",
+                        sent.as_bytes().escape_ascii()
+                    )
+                    .into_bytes()
+                }
+            } else {
+                b"the answer's trailers carry no grpc-status".to_vec()
+            }
+        });
     [
         block,
         Piece {
@@ -1602,10 +1637,22 @@ impl Accept {
             .drain(..)
             .collect();
         for (id, req, reply) in new {
+            if req.method() != http::Method::POST {
+                // gRPC calls are POSTs (PROTOCOL-HTTP2.md): answered here, never handed up.
+                let mut fields = HeaderMap::new();
+                fields.insert(http::header::ALLOW, HeaderValue::from_static("POST"));
+                reply.head(StatusCode::METHOD_NOT_ALLOWED, fields);
+                reply.chan.end();
+                // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
+                self.ended.insert(id);
+                continue;
+            }
             let ct = req.headers().get(http::header::CONTENT_TYPE).cloned();
             let Some(_ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
                 reply.head(StatusCode::UNSUPPORTED_MEDIA_TYPE, HeaderMap::new());
                 reply.chan.end();
+                // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
+                self.ended.insert(id);
                 continue;
             };
             if let Some(bad) = req
@@ -1630,6 +1677,8 @@ impl Accept {
                 }
                 reply.head(StatusCode::OK, fields);
                 reply.chan.end();
+                // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
+                self.ended.insert(id);
                 continue;
             }
             if self.policy.is_some() {
@@ -1699,9 +1748,9 @@ impl Accept {
                             Ok(()) => out.push_back(Piece::end(*id)),
                             Err(e) => {
                                 let why = e.to_string();
-                                s.fail_reply(msg::INTERNAL, why.as_bytes());
+                                s.fail_reply(e.status(), why.as_bytes());
                                 out.push_back(Piece {
-                                    status: Some(msg::INTERNAL),
+                                    status: Some(e.status()),
                                     ..Piece::failure(*id, &why)
                                 });
                             }

@@ -586,6 +586,10 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
         (400, msg::INTERNAL, FAULT_CALLER),
         (409, msg::UNKNOWN, FAULT_CALLER),
         (500, msg::UNKNOWN, FAULT_TRANSIENT),
+        (408, msg::UNKNOWN, FAULT_TRANSIENT),
+        (429, msg::UNAVAILABLE, FAULT_TRANSIENT),
+        (599, msg::UNKNOWN, FAULT_TRANSIENT),
+        (404, msg::UNIMPLEMENTED, FAULT_CALLER),
     ] {
         let now = 5 * SEC;
         let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
@@ -625,6 +629,69 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
             "HTTP {http}"
         );
     }
+}
+
+/// AN EARLY ANSWER RESETS THE REQUEST STILL BEING SENT: a far end that answers a bare HTTP status
+/// (or trailers-only) before the host has finished its request sends no RST_STREAM, so the dialler
+/// must reset the stream itself rather than hold the request body, the send half and the
+/// concurrency slot until the connection closes.
+#[test]
+fn an_early_answer_resets_the_request_still_being_sent() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    // A head stating 1000 bytes of messages, and one message of them: the request is not whole.
+    let mut bytes = msg::render_head(&[("path", b"/pkg.Svc/Get")], Some(1000)).expect("a head");
+    bytes.extend_from_slice(&msg::frame(b"k"));
+    d.emit(1, &bytes, false, 0, now).expect("emit");
+    // The client connection preface (24 bytes) leads the wire, ahead of its frames.
+    const PREFACE: usize = 24;
+    let mut sent: Vec<u8> = Vec::new();
+    let turn = |d: &mut Conn, sent: &mut Vec<u8>| {
+        for _ in 0..20 {
+            d.drive(now);
+            sent.extend(d.take_wire(usize::MAX));
+            d.pieces().clear();
+        }
+    };
+    turn(&mut d, &mut sent);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut sent);
+    assert!(
+        !frame_types(&sent[PREFACE..]).contains(&3),
+        "no RST_STREAM while the call is open"
+    );
+    // The far end answers a bare 503 ending the stream, without resetting ours.
+    d.ingest(&h2(1, 0x05, 1, &[0x08, 3, b'5', b'0', b'3']), false);
+    turn(&mut d, &mut sent);
+    assert!(
+        frame_types(&sent[PREFACE..]).contains(&3),
+        "the unfinished request is reset: {:?}",
+        frame_types(&sent[PREFACE..])
+    );
+}
+
+/// A DIALLED CALL THE FRAMER CANNOT BUILD IS THE CALLER'S FAULT, NOT THE FAR END'S: a head stating
+/// a non-gRPC content type builds no request, nothing was sent, and the far end's breaker must not
+/// be charged a transient fault for it.
+#[test]
+fn a_dialled_call_that_cannot_be_built_is_the_callers_fault() {
+    use busbar_contract::abi::transport::FAULT_CALLER;
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    d.emit(
+        1,
+        &call("/pkg.Svc/Get", &[("content-type", b"text/plain")], &[b"k"]),
+        true,
+        0,
+        now,
+    )
+    .expect("emit");
+    let got: Vec<Piece> = d.pieces().drain(..).collect();
+    let t = terminal(&got, 1).expect("the stream fails");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.fault, Some(FAULT_CALLER), "{t:?}");
 }
 
 /// The calls an accepted connection still holds.
@@ -1006,7 +1073,10 @@ fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
     assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
     assert_eq!(
         String::from_utf8_lossy(&t.bytes),
-        format!("the answer's message is {over} bytes, over the limit of {limit} bytes")
+        format!(
+            "the answer's message is {over} bytes, over the limit of {limit} bytes ({})",
+            crate::meta::setting::BODY_MAX_BYTES
+        )
     );
 }
 
@@ -1128,9 +1198,9 @@ fn a_connection_lost_before_any_status_fails_the_call_unavailable() {
         let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
         assert!(t.failed);
         assert_eq!(t.status, Some(msg::UNAVAILABLE), "after_head {after_head}");
-        assert_eq!(
-            t.bytes.as_ref(),
-            b"the connection to the far end was lost",
+        assert!(
+            t.bytes
+                .starts_with(b"the connection to the far end was lost"),
             "after_head {after_head}"
         );
     }
@@ -1315,6 +1385,88 @@ fn a_dialled_frame_running_past_its_content_length_fails_in_words() {
         t.bytes.as_ref(),
         b"more message bytes than the head's content-length"
     );
+}
+
+/// A DIALLED STREAM WITH NO CONTENT-LENGTH THAT IS EMITTED ON AFTER THE FRAME THAT ENDED IT fails
+/// in words, as the content-length over-run does. RED: the extra bytes were dropped and the emit
+/// answered Ok.
+#[test]
+fn a_dialled_frame_after_the_request_ended_fails_in_words() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Say")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"q"));
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    let again = p.d.emit(1, &msg::frame(b"late"), false, 0, p.now);
+    p.settle();
+    let failed = terminal(&p.got_d, 1)
+        .filter(|t| t.failed)
+        .map(|t| String::from_utf8_lossy(&t.bytes).into_owned());
+    assert!(
+        again.is_err() || failed.as_deref() == Some("bytes after the request's end"),
+        "late bytes are refused in words: {again:?} {failed:?}"
+    );
+}
+
+/// TRAILERS THAT CARRY NO `grpc-status` close UNKNOWN in words that say the status is missing,
+/// never the bare `grpc-status 2` a real UNKNOWN reads as. RED: `grpc-status 2`.
+#[test]
+fn trailers_with_no_grpc_status_say_so() {
+    let mut block = Vec::new();
+    lit_field(&mut block, "x-a", "b");
+    let mut p = open_call(true, b"");
+    p.d.ingest(&h2(1, 0x5, 1, &block), false);
+    p.settle();
+    assert_eq!(
+        terminal(&p.got_d, 1).and_then(|t| t.status),
+        Some(msg::UNKNOWN)
+    );
+    assert_eq!(
+        last(&p.got_d, 1).expect("terminal").bytes.as_ref(),
+        b"the answer's trailers carry no grpc-status"
+    );
+}
+
+/// A `grpc-status` THAT IS NOT A CANONICAL CODE, with no `grpc-message`, closes UNKNOWN in words
+/// that give the value the far end sent, never `grpc-status 2`, a value it did not send. RED:
+/// `grpc-status 2`.
+#[test]
+fn a_non_canonical_grpc_status_is_reported_as_sent() {
+    for (sent, shown) in [("99", "99"), ("abc", "abc"), ("2", "")] {
+        let mut block = Vec::new();
+        lit_field(&mut block, "grpc-status", sent);
+        let mut p = open_call(true, b"");
+        p.d.ingest(&h2(1, 0x5, 1, &block), false);
+        p.settle();
+        assert_eq!(
+            terminal(&p.got_d, 1).and_then(|t| t.status),
+            Some(msg::UNKNOWN),
+            "{sent}"
+        );
+        let want = if shown.is_empty() {
+            "grpc-status 2".to_owned()
+        } else {
+            format!("grpc-status {shown} (not a gRPC status; read as UNKNOWN)")
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&last(&p.got_d, 1).expect("terminal").bytes),
+            want,
+            "{sent}"
+        );
+    }
+}
+
+/// A CONNECTION LOST BELOW gRPC keeps its cause in the text. RED: the fixed text alone.
+#[test]
+fn a_lost_connection_keeps_its_cause() {
+    let mut p = open_call(true, b"");
+    p.d.ingest(&[], true);
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
+    let text = String::from_utf8_lossy(&t.bytes).into_owned();
+    let cause = text
+        .strip_prefix("the connection to the far end was lost: ")
+        .unwrap_or_else(|| panic!("no cause in {text:?}"));
+    assert!(!cause.is_empty());
 }
 
 /// HPACK, literal without indexing, a new name: `name: value`.
@@ -1668,9 +1820,19 @@ fn a_dialled_keep_alive_pings_and_fails_a_silent_far_end() {
     d.ingest(&wire, false);
     let (sent, _) = turn(&mut d, now);
     assert!(!frame_types(&sent).contains(&6), "no PING yet");
+    let (sent, _) = turn(&mut d, now + 29 * SEC);
+    assert!(
+        !frame_types(&sent).contains(&6),
+        "no PING before the interval"
+    );
     let (sent, got) = turn(&mut d, now + 30 * SEC);
     assert!(frame_types(&sent).contains(&6), "a PING at the interval");
     assert!(terminal(&got, 1).is_none(), "the call waits on the PING");
+    let (_, got) = turn(&mut d, now + 39 * SEC);
+    assert!(
+        terminal(&got, 1).is_none(),
+        "the call waits out the PING timeout"
+    );
     let (_, got) = turn(&mut d, now + 40 * SEC);
     let t = terminal(&got, 1).expect("an unanswered PING fails the call");
     assert!(t.failed, "{t:?}");
@@ -1724,6 +1886,42 @@ fn an_accepted_call_that_is_not_grpc_is_answered_415_and_never_handed_up() {
     assert_eq!(t.status, Some(msg::UNKNOWN), "415 maps to UNKNOWN");
     let end = last(&p.got_d, 1).expect("terminal");
     assert_eq!(end.bytes.as_ref(), b"HTTP status 415");
+}
+
+/// A REFUSED ARRIVAL IS REMEMBERED AS ENDED: a call answered 415 here (or `UNIMPLEMENTED` for an
+/// encoding) used an id and is never handed up, so it must enter the ended set, or every accepted
+/// id after it stands as a run of its own and the set grows without bound on a long connection.
+#[test]
+fn a_refused_arrival_is_remembered_as_ended() {
+    let mut p = Pair::new();
+    for id in [1u64, 2] {
+        let super::Side::Dial(d) = &mut p.d.side else {
+            panic!("a dialled connection");
+        };
+        let timer = p.d.io.timer();
+        let mut s = super::DialStream::new(timer.sleep_until_ns(p.now + 60 * SEC));
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://peer.test:50051/pkg.Svc/Say")
+            .version(http::Version::HTTP_2)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(s.chan.body())
+            .expect("a request");
+        s.chan.end();
+        s.stage = super::DStage::Queued(req);
+        d.calls.push((id, s));
+        p.settle();
+    }
+    assert!(of(&p.got_a, 1).is_empty(), "never handed up: {:?}", p.got_a);
+    let super::Side::Accept(a) = &p.a.side else {
+        panic!("an accepted connection");
+    };
+    assert_eq!(a.calls.len(), 0);
+    assert!(
+        a.ended.contains(1) && a.ended.contains(2),
+        "both refused arrivals are ended: {:?}",
+        a.ended.0
+    );
 }
 
 /// A DIALLED HEAD'S CONTENT TYPE MUST BE gRPC'S, and the fields this layer owns never go upstream
@@ -1965,4 +2163,201 @@ fn a_new_dialled_grpc_connection_polls_its_spawned_driver_without_peer_input() {
             .starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
         "the spawned connection driver must run in this drive, before any peer input"
     );
+}
+
+/// A FRAMING DROPPED WITH ITS CONNECTION OPEN IS FREED. The connection's tasks sit in the framing's
+/// own executor, and each held a strong handle to it: a cycle no drop broke, so a finished framing
+/// leaked its h2 state, pipes and header table for the life of the process.
+/// RED: the watch task's `conn_err` clone outlived the dropped `Conn`.
+#[test]
+fn a_dialled_conn_dropped_with_a_call_open_is_freed() {
+    let mut d = Conn::dial("http://peer.test:50051", posture(), 5 * SEC).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Say", &[], &[b"hello"]), true, 0, 5 * SEC)
+        .expect("emit");
+    d.drive(5 * SEC);
+    let weak = std::sync::Arc::downgrade(&d.conn_err);
+    assert!(weak.strong_count() > 1, "the watch task holds the cell");
+    drop(d);
+    assert!(
+        weak.upgrade().is_none(),
+        "the dropped Conn leaked its tasks"
+    );
+}
+
+/// A framing dropped with its pipe FULL (the wire at `WRITE_HIGH_WATER`, the host never taking it)
+/// is freed: the far end's window is opened first, so h2 really does write that much.
+#[test]
+fn a_dialled_conn_dropped_with_the_pipe_full_is_freed() {
+    const HIGH: usize = 256 * 1024;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), 5 * SEC).expect("dial");
+    // The far end's preface: SETTINGS with a large INITIAL_WINDOW_SIZE, its ACK of ours, and a
+    // connection-level WINDOW_UPDATE.
+    let mut preface = h2(4, 0, 0, &[0, 4, 0x40, 0, 0, 0]);
+    preface.extend(h2(4, 1, 0, &[]));
+    preface.extend(h2(8, 0, 0, &(1u32 << 30).to_be_bytes()));
+    d.drive(5 * SEC);
+    let _ = d.take_wire(usize::MAX);
+    d.ingest(&preface, false);
+    d.drive(5 * SEC);
+    let _ = d.take_wire(usize::MAX);
+    let big = vec![b'x'; 900 * 1024];
+    d.emit(1, &call("/pkg.Svc/Say", &[], &[&big]), true, 0, 5 * SEC)
+        .expect("emit");
+    // Driven without the host taking the wire: the pipe fills to its mark.
+    d.drive(5 * SEC);
+    // Observe the fill (taking it frees room), then let the drive refill it.
+    let n = d.take_wire(HIGH).len();
+    assert!(n >= HIGH, "the pipe reached its mark: {n}");
+    d.drive(5 * SEC);
+    assert!(
+        d.take_wire(HIGH).len() >= HIGH,
+        "the pipe refilled to its mark"
+    );
+    d.drive(5 * SEC);
+    let weak = std::sync::Arc::downgrade(&d.conn_err);
+    assert!(weak.strong_count() > 1, "the watch task holds the cell");
+    drop(d);
+    assert!(
+        weak.upgrade().is_none(),
+        "the dropped Conn leaked its tasks"
+    );
+}
+
+#[test]
+fn an_accepted_conn_dropped_with_a_call_in_flight_is_freed() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening(Some("trailers"));
+    wire.extend(h2(0, 0, 1, &msg::frame(b"q")));
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    assert_eq!(held(&a), 1, "a call is in flight");
+    let weak = std::sync::Arc::downgrade(&a.conn_err);
+    assert!(weak.strong_count() > 1, "the watch task holds the cell");
+    drop(a);
+    assert!(
+        weak.upgrade().is_none(),
+        "the dropped Conn leaked its tasks"
+    );
+}
+
+/// A literal HPACK field, no indexing, no Huffman.
+fn lit(name: &str, value: &str) -> Vec<u8> {
+    let mut v = vec![0x00, name.len() as u8];
+    v.extend_from_slice(name.as_bytes());
+    v.push(value.len() as u8);
+    v.extend_from_slice(value.as_bytes());
+    v
+}
+
+/// Premature status never becomes successful completion; an ordinary response keeps its body
+/// and its actual terminal trailers.
+#[test]
+fn a_premature_status_is_refused_and_real_final_trailers_are_preserved() {
+    for premature in [false, true] {
+        let now = 5 * SEC;
+        let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+        d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, now)
+            .expect("emit");
+        let mut got: Vec<Piece> = Vec::new();
+        let turn = |d: &mut Conn, got: &mut Vec<Piece>| {
+            for _ in 0..20 {
+                d.drive(now);
+                let _ = d.take_wire(usize::MAX);
+                got.extend(d.pieces().drain(..));
+            }
+        };
+        turn(&mut d, &mut got);
+        let mut wire = h2(4, 0, 0, &[]);
+        wire.extend(h2(4, 1, 0, &[]));
+        d.ingest(&wire, false);
+        turn(&mut d, &mut got);
+        let mut head_block = vec![0x88];
+        head_block.extend(lit("content-type", "application/grpc"));
+        if premature {
+            head_block.extend(lit("grpc-status", "0"));
+        }
+        let mut wire = h2(1, 0x04, 1, &head_block);
+        wire.extend(h2(0, 0, 1, &msg::frame(b"answer")));
+        wire.extend(h2(1, 0x05, 1, &lit("grpc-status", "13")));
+        d.ingest(&wire, false);
+        turn(&mut d, &mut got);
+        let t = terminal(&got, 1).expect("the trailers' status");
+        if premature {
+            assert!(
+                t.failed,
+                "a nonterminal status is refused, never successful: {got:?}"
+            );
+            assert_eq!(t.status, Some(msg::INTERNAL));
+            assert!(
+                got.iter().all(|piece| piece.status != Some(0)),
+                "the premature OK never crosses back"
+            );
+        } else {
+            let data = frames(&got, 1);
+            assert_eq!(
+                data.first().copied(),
+                Some(msg::frame(b"answer").as_slice()),
+                "the legitimate message reaches the host: {got:?}"
+            );
+            assert_eq!(
+                t.status,
+                Some(13),
+                "the actual final trailers supply the status: {got:?}"
+            );
+        }
+    }
+}
+
+/// A gRPC CALL IS A POST. A `GET` with a gRPC content-type is answered here and never handed up.
+/// RED: it was handed up as a call whose method is GET.
+#[test]
+fn a_get_with_a_grpc_content_type_is_refused_and_never_handed_up() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening(Some("trailers"));
+    let at = wire.iter().rposition(|b| *b == 0x83).expect(":method POST");
+    wire[at] = 0x82; // :method GET
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert!(got.is_empty(), "a GET was handed up as a call: {got:?}");
+    assert!(!a.take_wire(usize::MAX).is_empty(), "it was answered");
+    // Its id is used; the next call (arrival 2, h2 stream 3) is still served.
+    let mut next = opening(Some("trailers"));
+    next.drain(..24 + 9);
+    let mut block_frame = next.split_off(0);
+    block_frame[8] = 3; // stream 3
+    a.ingest(&block_frame, false);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert_eq!(
+        head(&got, 2).head.as_ref().map(|w| w.method.as_ref()),
+        Some(&b"POST"[..])
+    );
+}
+
+/// A DIALLED CALL THIS FRAMER RESETS IS RESET `CANCEL`, as a client's cancel or deadline is
+/// (PROTOCOL-HTTP2.md). RED: the reset went out `INTERNAL_ERROR` (2): hyper reads the reason from
+/// an `h2::Error` in the body error's source chain, and an `io::Error` hides its inner error.
+#[test]
+fn a_dialled_call_past_its_deadline_is_reset_cancel() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    let mut bytes = msg::render_head(&[("path", b"/pkg.Svc/Get")], Some(1000)).expect("a head");
+    bytes.extend_from_slice(&msg::frame(b"k"));
+    d.emit(1, &bytes, false, now + 2 * SEC, now).expect("emit");
+    let mut sent: Vec<u8> = Vec::new();
+    let mut turn = |d: &mut Conn, at: u64| {
+        for _ in 0..20 {
+            d.drive(at);
+            sent.extend(d.take_wire(usize::MAX));
+            d.pieces().clear();
+        }
+    };
+    turn(&mut d, now);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, now);
+    turn(&mut d, now + 2 * SEC);
+    assert_eq!(resets(&sent[24..]), vec![(1, 8)], "RST_STREAM CANCEL");
 }
