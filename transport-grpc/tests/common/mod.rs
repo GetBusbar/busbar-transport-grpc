@@ -612,7 +612,7 @@ impl Host {
         if self.take(r, &o) != Outcome::Ready {
             return r;
         }
-        self.drain(slot::BEGIN, 0)
+        self.drain(slot::TIMER, 0)
     }
 
     /// `ingest` `bytes` (`end` = the far side's last).
