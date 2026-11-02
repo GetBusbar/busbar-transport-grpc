@@ -77,14 +77,18 @@ impl StreamCall {
     ///
     /// # Errors
     ///
-    /// The call is not gRPC: its `content-type` is none of gRPC's.
+    /// The call is not gRPC: its `content-type` is none of gRPC's, or its method (when stated) is
+    /// not POST.
     pub fn open<'f>(
         fields: impl Iterator<Item = (&'f [u8], &'f [u8])>,
         max: usize,
     ) -> Result<Self, Failure> {
-        let (mut grpc, mut encoding) = (false, None);
+        let (mut grpc, mut encoding, mut post) = (false, None, true);
         for (n, v) in fields {
-            if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
+            if n.eq_ignore_ascii_case(b":method") || n.eq_ignore_ascii_case(b"method") {
+                // A gRPC call is a POST; the host passing the method states it.
+                post = v.eq_ignore_ascii_case(b"POST");
+            } else if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
                 grpc = true;
             } else if encoding.is_none() && n.eq_ignore_ascii_case(msg::GRPC_ENCODING.as_bytes()) {
                 encoding = Some(v);
@@ -94,6 +98,11 @@ impl StreamCall {
         if !grpc {
             return Err(Failure(
                 "begin: the stream is not a gRPC call (its content-type)".into(),
+            ));
+        }
+        if !post {
+            return Err(Failure(
+                "begin: the stream is not a gRPC call (its method)".into(),
             ));
         }
         Ok(Self {

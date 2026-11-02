@@ -88,6 +88,19 @@ fn a_call_that_is_not_grpc_is_refused_before_it_is_one() {
     assert!(StreamCall::open(std::iter::empty(), 1).is_err());
 }
 
+/// A gRPC call is a POST: a stream whose stated method is another is refused at `begin`.
+#[test]
+fn a_stream_whose_method_is_not_post_is_refused() {
+    let grpc_type = (&b"content-type"[..], &b"application/grpc"[..]);
+    for m in [&b"GET"[..], b"PUT"] {
+        let e = StreamCall::open([grpc_type, (&b":method"[..], m)].into_iter(), 1)
+            .err()
+            .expect("refused");
+        assert!(e.0.contains("its method"), "{}", e.0);
+    }
+    assert!(StreamCall::open([grpc_type, (&b":method"[..], &b"POST"[..])].into_iter(), 1).is_ok());
+}
+
 /// The encoding is predev's gRPC line's (v1.5.5 served no gRPC).
 #[test]
 fn the_status_message_is_encoded_as_predev_encoded_it() {
