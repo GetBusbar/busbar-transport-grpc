@@ -395,3 +395,21 @@ fn an_encoding_name_with_controls_is_escaped_in_the_refusal() {
     );
     assert!(why.0.contains("\\xc2\\x9b"), "{}", why.0);
 }
+
+/// A CLOSE WHILE A REPLY MESSAGE IS STILL BEING WRITTEN never closes whole: the partial message is
+/// dropped and the call closes `INTERNAL` in words, whatever status the host states. RED: the
+/// partial message was dropped silently and the call closed `grpc-status: 0`.
+#[test]
+fn a_close_inside_a_reply_message_is_internal_never_the_hosts_status() {
+    for status in [0, 5] {
+        let mut c = grpc();
+        c.emit(b"half of a mess", false).unwrap();
+        c.finish(status, b"", b"").unwrap();
+        assert_eq!(
+            wire(&mut c),
+            "grpc-status: 13\r\ngrpc-message: the%20reply%20ended%20inside%20a%20message\r\n",
+            "status {status}"
+        );
+        assert!(c.ended());
+    }
+}

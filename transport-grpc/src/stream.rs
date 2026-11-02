@@ -265,11 +265,20 @@ impl StreamCall {
         } else {
             match &self.cut {
                 Some(why) => cut_lines(why)?,
+                // A reply message still being written is missing its end: the call never closes
+                // whole, whatever status the host states.
+                None if !self.writing.is_empty() => msg::status_lines(
+                    u32::from(msg::INTERNAL),
+                    b"the reply ended inside a message",
+                    &[],
+                )
+                .map_err(|e| Failure(e.into()))?,
                 None => {
                     msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?
                 }
             }
         };
+        self.writing = Vec::new();
         self.closed = true;
         self.wire.extend(lines);
         Ok(())
