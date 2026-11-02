@@ -533,13 +533,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         Value::String(v) if v == "refused" => {
             {
                 let label = "locate";
-                let before = count(&p);
-                let value = (|| locate(&p, b"conformance", AMPLE).0)();
-                assert_eq!(count(&p) - before, 1, "{label} crossings");
+                let before = count(p);
+                let value = locate(p, b"conformance", AMPLE).0;
+                assert_eq!(count(p) - before, 1, "{label} crossings");
                 let answer = value;
                 assert!(answer.starts_with("Refused "), "{label}: {answer}");
                 transcript.push(format!("{label}: {answer}"));
-                ()
             };
         }
         l => {
@@ -556,16 +555,15 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                 {
                     let label = &format!("locate #{n}");
                     let want = want;
-                    let before = count(&p);
-                    let value = (|| locate(&p, &target, AMPLE).0)();
-                    assert_eq!(count(&p) - before, 1, "{label} crossings");
+                    let before = count(p);
+                    let value = locate(p, &target, AMPLE).0;
+                    assert_eq!(count(p) - before, 1, "{label} crossings");
                     let answer = value;
                     match want {
                         Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
                         Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
                     };
                     transcript.push(format!("{label}: {answer}"));
-                    ()
                 };
             }
             let target = text(&reads[0]["target"], "locate.reads.target");
@@ -585,34 +583,32 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             {
                 let label = "locate short";
                 let want = want;
-                let before = count(&p);
+                let before = count(p);
                 let value = (|| {
-                    let (first, token) = locate(&p, &target, 1);
+                    let (first, token) = locate(p, &target, 1);
                     let Some((token, needed)) = token else {
                         return format!("{first} (no re-call)");
                     };
-                    let again = locate_on(&p, &target, needed as usize, Some(token)).0;
+                    let again = locate_on(p, &target, needed as usize, Some(token)).0;
                     format!("needed={needed} then {again}")
                 })();
-                assert_eq!(count(&p) - before, 2, "{label} crossings");
+                assert_eq!(count(p) - before, 2, "{label} crossings");
                 let answer = value;
                 match want {
                     Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
                     Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
                 };
                 transcript.push(format!("{label}: {answer}"));
-                ()
             };
             for (n, t) in texts(&l["refuses"], "locate.refuses").iter().enumerate() {
                 {
                     let label = &format!("locate refused #{n}");
-                    let before = count(&p);
-                    let value = (|| locate(&p, t, AMPLE).0)();
-                    assert_eq!(count(&p) - before, 1, "{label} crossings");
+                    let before = count(p);
+                    let value = locate(p, t, AMPLE).0;
+                    assert_eq!(count(p) - before, 1, "{label} crossings");
                     let answer = value;
                     assert!(answer.starts_with("Failed "), "{label}: {answer}");
                     transcript.push(format!("{label}: {answer}"));
-                    ()
                 };
             }
         }
@@ -646,12 +642,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let token = {
         let label = "begin dial";
         let want = want;
-        let before = count(&p);
-        let value = (|| {
-            let y = pump(&p, 0, Op::Begin(SIDE_DIAL, &target), &mut tight);
+        let before = count(p);
+        let value = {
+            let y = pump(p, 0, Op::Begin(SIDE_DIAL, &target), &mut tight);
             (y.line(), y.framing)
-        })();
-        assert_eq!(count(&p) - before, pinned, "{label} crossings");
+        };
+        assert_eq!(count(p) - before, pinned, "{label} crossings");
         let (answer, result) = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -672,10 +668,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = "dial answer";
             let want = want;
-            let before = count(&p);
-            let value = (|| pump(&p, token, Op::Ingest(&answer, false), &mut tight).line())();
+            let before = count(p);
+            let value = pump(p, token, Op::Ingest(&answer, false), &mut tight).line();
             assert_eq!(
-                count(&p) - before,
+                count(p) - before,
                 frame_sinkfuls(&heard),
                 "{label} crossings"
             );
@@ -685,7 +681,6 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                 Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
             };
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
     }
 
@@ -709,9 +704,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             .unwrap_or_default();
         let (defaults, states_length) = {
             let label = "dial defaults";
-            let before = count(&p);
-            let value = (|| located_defaults(&p, &target))();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = located_defaults(p, &target);
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let (answer, result) = value;
             transcript.push(format!("{label}: {answer}"));
             result
@@ -742,12 +737,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             .collect();
         {
             let label = "dial encode";
-            let before = count(&p);
-            let value = (|| {
-                let y = once(&p, 0, Op::Encode(&body, &fields), &mut Sink::ample());
+            let before = count(p);
+            let value = {
+                let y = once(p, 0, Op::Encode(&body, &fields), &mut Sink::ample());
                 (y.line(), y.wire)
-            })();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            };
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let (answer, result) = value;
             transcript.push(format!("{label}: {answer}"));
             result
@@ -757,10 +752,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     {
         let label = "emit";
         let want = want;
-        let before = count(&p);
-        let value = (|| pump(&p, token, Op::Emit(&emit, true), &mut tight).line())();
+        let before = count(p);
+        let value = pump(p, token, Op::Emit(&emit, true), &mut tight).line();
         assert_eq!(
-            count(&p) - before,
+            count(p) - before,
             sinkfuls(wire.len(), TIGHT_WIRE),
             "{label} crossings"
         );
@@ -770,7 +765,6 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
         };
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
 
     let answered = opt_text(&dial["ingest_wire"], "dial.ingest_wire");
@@ -782,41 +776,39 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     {
         let label = "ingest";
         let want = want;
-        let before = count(&p);
-        let value = (|| pump(&p, token, Op::Ingest(&ingest, false), &mut tight).line())();
-        assert_eq!(count(&p) - before, ingest_calls, "{label} crossings");
+        let before = count(p);
+        let value = pump(p, token, Op::Ingest(&ingest, false), &mut tight).line();
+        assert_eq!(count(p) - before, ingest_calls, "{label} crossings");
         let answer = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
             Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
         };
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
     let want = Expected::Exact(yielded_line(&[], &[], &[], YIELD_ENDED, false));
     {
         let label = "ingest end";
         let want = want;
-        let before = count(&p);
-        let value = (|| pump(&p, token, Op::Ingest(&[], true), &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        let before = count(p);
+        let value = pump(p, token, Op::Ingest(&[], true), &mut tight).line();
+        assert_eq!(count(p) - before, 1, "{label} crossings");
         let answer = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
             Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
         };
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
     let finish = opt_text(&dial["finish"], "dial.finish");
     let want = Expected::Exact(yielded_line(&finish, &[], &[], YIELD_ENDED, false));
     {
         let label = "finish";
         let want = want;
-        let before = count(&p);
-        let value = (|| pump(&p, token, Op::Finish, &mut tight).line())();
+        let before = count(p);
+        let value = pump(p, token, Op::Finish, &mut tight).line();
         assert_eq!(
-            count(&p) - before,
+            count(p) - before,
             sinkfuls(finish.len(), TIGHT_WIRE),
             "{label} crossings"
         );
@@ -826,17 +818,15 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
         };
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
     {
         let label = "finish again";
-        let before = count(&p);
-        let value = (|| once(&p, token, Op::Finish, &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        let before = count(p);
+        let value = once(p, token, Op::Finish, &mut tight).line();
+        assert_eq!(count(p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Failed "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
 
     let cases = k["encode"]
@@ -871,16 +861,15 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = &format!("encode #{n}");
             let want = want;
-            let before = count(&p);
-            let value = (|| once(&p, 0, Op::Encode(&body, &fields), &mut Sink::ample()).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, 0, Op::Encode(&body, &fields), &mut Sink::ample()).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             match want {
                 Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
                 Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
             };
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
     }
 
@@ -899,12 +888,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let token = {
             let label = "begin accept";
             let want = want;
-            let before = count(&p);
-            let value = (|| {
-                let y = pump(&p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
+            let before = count(p);
+            let value = {
+                let y = pump(p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
                 (y.line(), y.framing)
-            })();
-            assert_eq!(count(&p) - before, pinned, "{label} crossings");
+            };
+            assert_eq!(count(p) - before, pinned, "{label} crossings");
             let (answer, result) = value;
             match want {
                 Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -921,10 +910,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             {
                 let label = "accept opening";
                 let want = want;
-                let before = count(&p);
-                let value = (|| pump(&p, token, Op::Ingest(&opening, false), &mut tight).line())();
+                let before = count(p);
+                let value = pump(p, token, Op::Ingest(&opening, false), &mut tight).line();
                 assert_eq!(
-                    count(&p) - before,
+                    count(p) - before,
                     sinkfuls(answer.len(), TIGHT_WIRE),
                     "{label} crossings"
                 );
@@ -934,7 +923,6 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                     Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
                 };
                 transcript.push(format!("{label}: {answer}"));
-                ()
             };
         }
 
@@ -949,10 +937,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = "refuse";
             let want = want;
-            let before = count(&p);
-            let value = (|| pump(&p, token, Op::Refuse(&bytes), &mut tight).line())();
+            let before = count(p);
+            let value = pump(p, token, Op::Refuse(&bytes), &mut tight).line();
             assert_eq!(
-                count(&p) - before,
+                count(p) - before,
                 sinkfuls(wire.len(), TIGHT_WIRE),
                 "{label} crossings"
             );
@@ -962,7 +950,6 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                 Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
             };
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         let want = if ends {
             Expected::Prefix("Failed ")
@@ -972,52 +959,49 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = "timer";
             let want = want;
-            let before = count(&p);
-            let value = (|| pump(&p, token, Op::Timer, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = pump(p, token, Op::Timer, &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             match want {
                 Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
                 Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
             };
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         {
             let label = "finish refused";
-            let before = count(&p);
-            let value = (|| once(&p, token, Op::Finish, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, token, Op::Finish, &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
 
         let token = {
             let label = "begin upgrade";
-            let before = count(&p);
-            let value = (|| {
-                let y = once(&p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
+            let before = count(p);
+            let value = {
+                let y = once(p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
                 (y.line(), y.framing)
-            })();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            };
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let (answer, result) = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
             result
         };
-        upgrade(&mut transcript, &p, k, token);
+        upgrade(&mut transcript, p, k, token);
     }
     {
         let label = "ingest on no framing";
-        let before = count(&p);
-        let value = (|| once(&p, u64::MAX, Op::Ingest(b"x", false), &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        let before = count(p);
+        let value = once(p, u64::MAX, Op::Ingest(b"x", false), &mut tight).line();
+        assert_eq!(count(p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Failed "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
 
     let before = count(p);
@@ -1117,33 +1101,30 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     if refused(whole) {
         {
             let label = "detach";
-            let before = count(&p);
-            let value = (|| once(p, token, Op::Detach, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, token, Op::Detach, &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         {
             let label = "adopt";
-            let before = count(&p);
+            let before = count(p);
             let value = (refused_)();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         {
             let label = "finish upgrade";
-            let before = count(&p);
-            let value = (|| once(p, token, Op::Finish, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, token, Op::Finish, &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         return;
     }
@@ -1156,13 +1137,12 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     if refused(detach) {
         {
             let label = "detach";
-            let before = count(&p);
-            let value = (|| once(p, token, Op::Detach, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, token, Op::Detach, &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
     } else {
         let ingest = text(&detach["ingest"], &format!("{of}.ingest"));
@@ -1170,22 +1150,21 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
 
         {
             let label = "ingest before upgrade";
-            let before = count(&p);
-            let value = (|| once(p, token, Op::Ingest(&ingest, false), &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, token, Op::Ingest(&ingest, false), &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         let want = Expected::Exact(yielded_line(&[], &[], &detached, YIELD_ENDED, false));
         {
             let label = "detach";
             let want = want;
-            let before = count(&p);
-            let value = (|| pump(p, token, Op::Detach, &mut tight).line())();
+            let before = count(p);
+            let value = pump(p, token, Op::Detach, &mut tight).line();
             assert_eq!(
-                count(&p) - before,
+                count(p) - before,
                 sinkfuls(detached.len(), TIGHT_FRAME),
                 "{label} crossings"
             );
@@ -1195,32 +1174,29 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
                 Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
             };
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
     }
 
     if whole.is_null() {
         {
             let label = "finish upgrade";
-            let before = count(&p);
-            let value = (|| once(p, token, Op::Finish, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            let before = count(p);
+            let value = once(p, token, Op::Finish, &mut tight).line();
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
     }
     if refused(adopt) {
         {
             let label = "adopt";
-            let before = count(&p);
+            let before = count(p);
             let value = (refused_)();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
-            ()
         };
         return;
     }
@@ -1237,12 +1213,12 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     let adopted = {
         let label = "adopt";
         let want = want;
-        let before = count(&p);
-        let value = (|| {
+        let before = count(p);
+        let value = {
             let y = pump(p, 0, Op::Adopt(&left), &mut tight);
             (y.line(), y.framing)
-        })();
-        assert_eq!(count(&p) - before, crossings, "{label} crossings");
+        };
+        assert_eq!(count(p) - before, crossings, "{label} crossings");
         let (answer, result) = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -1253,13 +1229,12 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     };
     {
         let label = "finish adopted";
-        let before = count(&p);
-        let value = (|| once(p, adopted, Op::Finish, &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        let before = count(p);
+        let value = once(p, adopted, Op::Finish, &mut tight).line();
+        assert_eq!(count(p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Ready "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
-        ()
     };
 }
 
