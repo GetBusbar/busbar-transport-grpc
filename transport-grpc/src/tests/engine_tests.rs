@@ -2191,3 +2191,30 @@ fn a_head_stating_grpc_status_without_ending_the_stream_is_not_trailers_only() {
     let t = terminal(&got, 1).expect("the trailers' status");
     assert_eq!(t.status, Some(13), "the status is the trailers': {got:?}");
 }
+
+/// A gRPC CALL IS A POST. A `GET` with a gRPC content-type is answered here and never handed up.
+/// RED: it was handed up as a call whose method is GET.
+#[test]
+fn a_get_with_a_grpc_content_type_is_refused_and_never_handed_up() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening(Some("trailers"));
+    let at = wire.iter().rposition(|b| *b == 0x83).expect(":method POST");
+    wire[at] = 0x82; // :method GET
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert!(got.is_empty(), "a GET was handed up as a call: {got:?}");
+    assert!(!a.take_wire(usize::MAX).is_empty(), "it was answered");
+    // Its id is used; the next call (arrival 2, h2 stream 3) is still served.
+    let mut next = opening(Some("trailers"));
+    next.drain(..24 + 9);
+    let mut block_frame = next.split_off(0);
+    block_frame[8] = 3; // stream 3
+    a.ingest(&block_frame, false);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert_eq!(
+        head(&got, 2).head.as_ref().map(|w| w.method.as_ref()),
+        Some(&b"POST"[..])
+    );
+}

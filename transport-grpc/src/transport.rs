@@ -1422,6 +1422,16 @@ impl Accept {
             .drain(..)
             .collect();
         for (id, req, reply) in new {
+            if req.method() != http::Method::POST {
+                // gRPC calls are POSTs (PROTOCOL-HTTP2.md): answered here, never handed up.
+                let mut fields = HeaderMap::new();
+                fields.insert(http::header::ALLOW, HeaderValue::from_static("POST"));
+                reply.head(StatusCode::METHOD_NOT_ALLOWED, fields);
+                reply.chan.end();
+                // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
+                self.ended.insert(id);
+                continue;
+            }
             let ct = req.headers().get(http::header::CONTENT_TYPE).cloned();
             let Some(ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
                 // Not a gRPC call: answered here, never handed up.
