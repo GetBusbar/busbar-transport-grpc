@@ -200,7 +200,7 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-#[path = "framer.rs.inc"]
+#[path = "support/framer.rs"]
 mod framer;
 
 #[test]
@@ -224,5 +224,5 @@ fn the_statement_offers_no_auth_point() {
     assert_eq!(points, Ok(0));
 }
 
-#[path = "negative.rs.inc"]
+#[path = "support/negative.rs"]
 mod negative;
