@@ -540,7 +540,7 @@ fn resets(wire: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
-/// RED: a `te` other than `trailers` is reset with HTTP/2 `PROTOCOL_ERROR` before it is a call,
+/// A `te` value other than `trailers` is reset with HTTP/2 `PROTOCOL_ERROR` before admission.
 
 #[test]
 fn a_wrong_te_is_reset_protocol_error_and_never_handed_up() {

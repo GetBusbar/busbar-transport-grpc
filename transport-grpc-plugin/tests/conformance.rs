@@ -206,7 +206,7 @@ fn the_statement_carries_the_declares_document() {
     );
 }
 
-/// THE DOOR OFFERS NO AUTH POINT (ruling R2): it makes no auth call, on either side, so its
+/// The gRPC door offers no authentication point and makes no authentication call.
 
 #[test]
 fn the_statement_offers_no_auth_point() {

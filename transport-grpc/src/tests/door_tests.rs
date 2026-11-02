@@ -140,7 +140,7 @@ fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
     }
 }
 
-/// THE TAIL STATES EXACTLY THE OPS THIS DOOR SERVES (ruling R1: every framer states its own): it
+/// The tail states exactly the operations this door serves.
 
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
@@ -149,7 +149,7 @@ fn the_tail_states_the_ops_the_door_serves() {
     assert_eq!(TAIL.facts & ops, FACT_ACCEPTS | FACT_DIALS);
 }
 
-/// THE CLAIM DECLARES ONLY THE SELECTOR FORMS SOMETHING HONOURS (ruling R3): the route vocabulary
+/// The claim declares only selector forms honored by routing.
 
 #[test]
 fn the_claim_declares_only_the_selector_forms_something_honours() {

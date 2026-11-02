@@ -492,7 +492,7 @@ fn a_stream_refused_before_any_reply_is_predevs_trailers_only_answer() {
     }
 }
 
-/// RED: a call that is not gRPC is refused at `begin`; details that are not one field value fail
+/// Non-gRPC calls and details that cannot form a field value are refused.
 
 #[test]
 fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {

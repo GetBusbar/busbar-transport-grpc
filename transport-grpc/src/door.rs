@@ -41,7 +41,7 @@ use crate::claims::CLAIM_NAMES;
 use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, SETTING_ROWS, TAIL};
 pub use crate::meta::{setting, KEY};
 
-/// THE AUTH POINTS THIS DOOR OFFERS: none (ruling R2). It makes no auth call on either side (no
+/// This door offers no authentication points and makes no authentication call on either side.
 
 const OFFERED_POINTS: [u8; 4] = 0u32.to_le_bytes();
 
