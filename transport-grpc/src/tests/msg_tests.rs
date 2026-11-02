@@ -362,3 +362,20 @@ fn a_complete_head_over_the_ceiling_is_refused() {
     );
     assert!(read_head(&head, 1000).unwrap().is_some());
 }
+
+/// A HEAD'S DEBUG TEXT NEVER CARRIES A VALUE: a dialled head holds the auth's credential lines.
+/// RED: the derived `Debug` printed `Bearer s3cret` in clear.
+#[test]
+fn a_heads_debug_text_names_fields_and_lengths_only() {
+    let head = Head {
+        fields: vec![("authorization".to_owned(), b"Bearer s3cret".to_vec())],
+        content_length: Some(7),
+    };
+    let text = format!("{head:?}");
+    assert!(
+        !text.contains("s3cret") && !text.contains("Bearer"),
+        "{text}"
+    );
+    assert!(text.contains("authorization"), "{text}");
+    assert!(text.contains("13"), "the value's length: {text}");
+}

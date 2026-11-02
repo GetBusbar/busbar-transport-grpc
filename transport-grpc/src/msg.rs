@@ -508,12 +508,35 @@ pub fn status_lines(code: u32, message: &[u8], details: &[u8]) -> Result<Vec<u8>
 }
 
 /// A head block, read.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Head {
     /// Every field line but `content-length`, in order.
     pub fields: Vec<(String, Vec<u8>)>,
     /// The message stream's length, when the block states it.
     pub content_length: Option<usize>,
+}
+
+/// A head's debug text names its fields and the length of each value, never a value: a dialled head
+/// carries the auth's credential lines.
+impl std::fmt::Debug for Head {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Lengths<'a>(&'a [(String, Vec<u8>)]);
+        impl std::fmt::Debug for Lengths<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_list()
+                    .entries(
+                        self.0
+                            .iter()
+                            .map(|(k, v)| format!("{k}: <{} bytes>", v.len())),
+                    )
+                    .finish()
+            }
+        }
+        f.debug_struct("Head")
+            .field("fields", &Lengths(&self.fields))
+            .field("content_length", &self.content_length)
+            .finish()
+    }
 }
 
 /// A head's values are wiped when it drops: a dialled head carries the auth's credential lines.
