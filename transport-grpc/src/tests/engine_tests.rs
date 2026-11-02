@@ -2111,13 +2111,35 @@ fn a_dialled_conn_dropped_with_a_call_open_is_freed() {
     );
 }
 
+/// A framing dropped with its pipe FULL (the wire at `WRITE_HIGH_WATER`, the host never taking it)
+/// is freed: the far end's window is opened first, so h2 really does write that much.
 #[test]
 fn a_dialled_conn_dropped_with_the_pipe_full_is_freed() {
+    const HIGH: usize = 256 * 1024;
     let mut d = Conn::dial("http://peer.test:50051", posture(), 5 * SEC).expect("dial");
-    // The host never takes the wire: more than the pipe's write buffer is emitted.
-    let big = vec![b'x'; 600 * 1024];
+    // The far end's preface: SETTINGS with a large INITIAL_WINDOW_SIZE, its ACK of ours, and a
+    // connection-level WINDOW_UPDATE.
+    let mut preface = h2(4, 0, 0, &[0, 4, 0x40, 0, 0, 0]);
+    preface.extend(h2(4, 1, 0, &[]));
+    preface.extend(h2(8, 0, 0, &(1u32 << 30).to_be_bytes()));
+    d.drive(5 * SEC);
+    let _ = d.take_wire(usize::MAX);
+    d.ingest(&preface, false);
+    d.drive(5 * SEC);
+    let _ = d.take_wire(usize::MAX);
+    let big = vec![b'x'; 900 * 1024];
     d.emit(1, &call("/pkg.Svc/Say", &[], &[&big]), true, 0, 5 * SEC)
         .expect("emit");
+    // Driven without the host taking the wire: the pipe fills to its mark.
+    d.drive(5 * SEC);
+    // Observe the fill (taking it frees room), then let the drive refill it.
+    let n = d.take_wire(HIGH).len();
+    assert!(n >= HIGH, "the pipe reached its mark: {n}");
+    d.drive(5 * SEC);
+    assert!(
+        d.take_wire(HIGH).len() >= HIGH,
+        "the pipe refilled to its mark"
+    );
     d.drive(5 * SEC);
     let weak = std::sync::Arc::downgrade(&d.conn_err);
     assert!(weak.strong_count() > 1, "the watch task holds the cell");
