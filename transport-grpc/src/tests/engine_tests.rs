@@ -1453,6 +1453,35 @@ fn trailers_with_no_grpc_status_say_so() {
     );
 }
 
+/// A `grpc-status` THAT IS NOT A CANONICAL CODE, with no `grpc-message`, closes UNKNOWN in words
+/// that give the value the far end sent, never `grpc-status 2`, a value it did not send. RED:
+/// `grpc-status 2`.
+#[test]
+fn a_non_canonical_grpc_status_is_reported_as_sent() {
+    for (sent, shown) in [("99", "99"), ("abc", "abc"), ("2", "")] {
+        let mut block = Vec::new();
+        lit_field(&mut block, "grpc-status", sent);
+        let mut p = open_call(true, b"");
+        p.d.ingest(&h2(1, 0x5, 1, &block), false);
+        p.settle();
+        assert_eq!(
+            terminal(&p.got_d, 1).and_then(|t| t.status),
+            Some(msg::UNKNOWN),
+            "{sent}"
+        );
+        let want = if shown.is_empty() {
+            "grpc-status 2".to_owned()
+        } else {
+            format!("grpc-status {shown} (not a gRPC status; read as UNKNOWN)")
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&last(&p.got_d, 1).expect("terminal").bytes),
+            want,
+            "{sent}"
+        );
+    }
+}
+
 /// A CONNECTION LOST BELOW gRPC keeps its cause in the text. RED: the fixed text alone.
 #[test]
 fn a_lost_connection_keeps_its_cause() {

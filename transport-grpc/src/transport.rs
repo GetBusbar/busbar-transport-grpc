@@ -1159,8 +1159,22 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
         .map(|v| msg::message_text(v.as_bytes()))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| {
-            if status.contains_key(msg::GRPC_STATUS) {
-                format!("grpc-status {code}").into_bytes()
+            if let Some(sent) = status.get(msg::GRPC_STATUS) {
+                // A value that is not a canonical code reads as UNKNOWN: the text says what the
+                // far end sent, not a code it did not.
+                let canonical = std::str::from_utf8(sent.as_bytes())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+                    .is_some_and(|c| c <= 16);
+                if canonical {
+                    format!("grpc-status {code}").into_bytes()
+                } else {
+                    format!(
+                        "grpc-status {} (not a gRPC status; read as UNKNOWN)",
+                        sent.as_bytes().escape_ascii()
+                    )
+                    .into_bytes()
+                }
             } else {
                 b"the answer's trailers carry no grpc-status".to_vec()
             }
