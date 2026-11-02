@@ -116,16 +116,20 @@ impl StreamCall {
         if let Some(e @ msg::Bad::Encoding(_)) = &self.oversize {
             return Err(bad(e.clone()));
         }
+        // Every refusal the framer states is the call's own close, as on the connection side.
         let got = self.messages.push(bytes).inspect_err(|e| {
-            if matches!(e, msg::Bad::TooLarge(..)) {
-                self.oversize = Some(e.clone());
-            }
+            self.oversize = Some(e.clone());
         });
         for m in got.map_err(bad)? {
             self.out.push_back(Piece::data(STREAM, m.slice(PREFIX..)));
         }
         if end {
-            self.messages.end().map_err(bad)?;
+            self.messages
+                .end()
+                .inspect_err(|e| {
+                    self.oversize = Some(e.clone());
+                })
+                .map_err(bad)?;
         }
         Ok(())
     }
@@ -255,9 +259,16 @@ impl StreamCall {
         }
         // Rendered first, closed after: a final status that cannot be written leaves the call
         // open, so the host's fallback refusal can still close it with a `grpc-status`.
-        let lines = match &self.cut {
-            Some(why) => cut_lines(why)?,
-            None => msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?,
+        // A call whose body the framer refused closes with the framer's status, as `refuse` does.
+        let lines = if let Some(e) = &self.oversize {
+            e.close_lines().map_err(|e| Failure(e.into()))?
+        } else {
+            match &self.cut {
+                Some(why) => cut_lines(why)?,
+                None => {
+                    msg::status_lines(status, message, details).map_err(|e| Failure(e.into()))?
+                }
+            }
         };
         self.closed = true;
         self.wire.extend(lines);

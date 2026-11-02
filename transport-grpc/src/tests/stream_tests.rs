@@ -344,3 +344,54 @@ fn an_unfinished_large_reply_can_finish_before_drainable_wire_backpressure() {
     assert!(c.pieces().is_empty(), "writable is announced once");
     assert!(!c.announce_full());
 }
+
+/// A CALL WHOSE BODY THE FRAMER REFUSED CLOSES WITH THE FRAMER'S STATUS, NOT THE UNIT'S: after an
+/// oversize message `finish(0, ..)` (core's close, or its Drop) must be `RESOURCE_EXHAUSTED`, never OK.
+#[test]
+fn a_finish_after_an_oversize_message_is_resource_exhausted_not_ok() {
+    let mut c = grpc();
+    let mut body = vec![0u8];
+    body.extend_from_slice(&1025u32.to_be_bytes());
+    c.ingest(&body, false).expect_err("over the ceiling");
+    c.finish(0, b"", b"").unwrap();
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 8\r\n"), "{w}");
+    assert!(!w.contains("grpc-status: 0"), "{w}");
+}
+
+/// A COMPRESSED MESSAGE WITH NO ENCODING ON THE STREAM PATH CLOSES INTERNAL with the framer's words,
+/// as on the connection side, not with the host's neutral refusal status.
+#[test]
+fn a_compressed_message_without_an_encoding_closes_internal_on_a_stream() {
+    let mut c = grpc();
+    let why = c.ingest(&[1, 0, 0, 0, 1, b'z'], true).expect_err("refused");
+    c.refuse(why.0.as_bytes(), 500, false).unwrap();
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 13\r\n"), "{w}");
+    assert!(w.contains("a%20message%20is%20compressed"), "{w}");
+}
+
+/// A truncated body closes INTERNAL too.
+#[test]
+fn a_truncated_body_closes_internal_on_a_stream() {
+    let mut c = grpc();
+    c.ingest(&msg::frame(b"abc")[..6], true).expect_err("cut");
+    c.finish(0, b"", b"").unwrap();
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 13\r\n"), "{w}");
+}
+
+/// A `grpc-encoding` of C1 control bytes is named escaped, printable ASCII only.
+#[test]
+fn an_encoding_name_with_controls_is_escaped_in_the_refusal() {
+    let mut c = open_with(&[(&b"grpc-encoding"[..], "\u{9b}[31m".as_bytes())]);
+    let why = c.ingest(&msg::frame(b"a"), true).expect_err("refused");
+    assert!(
+        why.0
+            .chars()
+            .all(|ch| ch.is_ascii() && !ch.is_ascii_control()),
+        "{}",
+        why.0
+    );
+    assert!(why.0.contains("\\xc2\\x9b"), "{}", why.0);
+}
