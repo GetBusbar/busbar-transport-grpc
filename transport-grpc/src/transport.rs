@@ -1066,8 +1066,9 @@ fn advance(
                         id,
                         Bytes::from(field_block(r.headers(), STATUS_FIELDS)),
                     ));
-                    if stated {
-                        // Trailers-only: the status is in the head, and the body is empty. Its
+                    if stated && r.body().is_end_stream() {
+                        // Trailers-only: the status is in the head, which ended the stream. A head
+                        // that states one and goes on to a body is read by its real trailers. Its
                         // fault is the gRPC status's own reading, as any trailers' is.
                         out.extend(trailers(id, &HeaderMap::new(), r.headers()));
                         s.stage = DStage::Done;

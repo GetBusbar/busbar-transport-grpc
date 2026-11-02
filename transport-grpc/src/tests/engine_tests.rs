@@ -2141,3 +2141,53 @@ fn an_accepted_conn_dropped_with_a_call_in_flight_is_freed() {
         "the dropped Conn leaked its tasks"
     );
 }
+
+/// A literal HPACK field, no indexing, no Huffman.
+fn lit(name: &str, value: &str) -> Vec<u8> {
+    let mut v = vec![0x00, name.len() as u8];
+    v.extend_from_slice(name.as_bytes());
+    v.push(value.len() as u8);
+    v.extend_from_slice(value.as_bytes());
+    v
+}
+
+/// A HEAD THAT STATES `grpc-status` BUT DOES NOT END THE STREAM IS NOT TRAILERS-ONLY. The far end
+/// answers 200 with `grpc-status: 0` in the head, then a message, then trailers: the call's
+/// message must reach the host and the status is the trailers'.
+/// RED: the head was taken as trailers-only; the message was discarded and the call ended OK.
+#[test]
+fn a_head_stating_grpc_status_without_ending_the_stream_is_not_trailers_only() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, now)
+        .expect("emit");
+    let mut got: Vec<Piece> = Vec::new();
+    let turn = |d: &mut Conn, got: &mut Vec<Piece>| {
+        for _ in 0..20 {
+            d.drive(now);
+            let _ = d.take_wire(usize::MAX);
+            got.extend(d.pieces().drain(..));
+        }
+    };
+    turn(&mut d, &mut got);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut got);
+    let mut head_block = vec![0x88];
+    head_block.extend(lit("content-type", "application/grpc"));
+    head_block.extend(lit("grpc-status", "0"));
+    let mut wire = h2(1, 0x04, 1, &head_block);
+    wire.extend(h2(0, 0, 1, &msg::frame(b"answer")));
+    wire.extend(h2(1, 0x05, 1, &lit("grpc-status", "13")));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut got);
+    let data = frames(&got, 1);
+    assert_eq!(
+        data.first().copied(),
+        Some(msg::frame(b"answer").as_slice()),
+        "the message reaches the host: {got:?}"
+    );
+    let t = terminal(&got, 1).expect("the trailers' status");
+    assert_eq!(t.status, Some(13), "the status is the trailers': {got:?}");
+}
