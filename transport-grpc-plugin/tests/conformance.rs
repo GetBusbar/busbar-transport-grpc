@@ -25,7 +25,7 @@ fn z<T>() -> T {
     unsafe { zeroed() }
 }
 
-/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
+/// This product's freshly built cdylib. A missing artifact is a hard failure.
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -33,12 +33,20 @@ fn cdylib() -> std::path::PathBuf {
         .and_then(|d| d.parent())
         .expect("target/<profile>");
     let file = busbar_plugin_loader::plugin_library_filename("busbar_transport_grpc_plugin");
-    [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the busbar-transport-grpc-plugin cdylib ({file}) is not built"))
+    let path = match std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+            path
+        }
+        None => profile.join(file),
+    };
+    assert!(
+        path.is_file(),
+        "build this product's actual cdylib before testing: {}",
+        path.display()
+    );
+    path
 }
 
 /// This crate's own door, as the loader names a compiled-in one.
@@ -189,11 +197,8 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-busbar_test_kit::conformance_suite! {
-    loaded: loaded(),
-    cdylib: "busbar_transport_grpc_plugin",
-    inputs: include_str!("conformance.json"),
-}
+#[path = "framer.rs.inc"]
+mod framer;
 
 #[test]
 fn the_statement_carries_the_declares_document() {
@@ -215,3 +220,6 @@ fn the_statement_offers_no_auth_point() {
             .map(|p| p.0);
     assert_eq!(points, Ok(0));
 }
+
+#[path = "negative.rs.inc"]
+mod negative;

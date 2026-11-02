@@ -23,7 +23,7 @@ busbar-transport-grpc = { path = "../transport-grpc" }
 busbar-contract = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 # The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
 # dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
 busbar-plugin-loader = { workspace = true }
-busbar-test-kit = { workspace = true }
