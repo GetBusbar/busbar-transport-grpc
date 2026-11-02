@@ -42,7 +42,6 @@ use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, SETTING_ROWS, TA
 pub use crate::meta::{setting, KEY};
 
 /// This door offers no authentication points and makes no authentication call on either side.
-
 const OFFERED_POINTS: [u8; 4] = 0u32.to_le_bytes();
 
 busbar_contract::statement_extensions!(
@@ -83,7 +82,6 @@ pub struct Instance {
 }
 
 /// HTTP/2 keep-alive on a dialled connection: a PING this often (fixed here, not an operator
-
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a keep-alive PING may go unanswered before the dialled connection is failed.
@@ -93,7 +91,6 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const ADAPTIVE_WINDOW: bool = true;
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
-
 fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
     let v = settings_reading(bytes, &SETTING_ROWS).map_err(|refusal| {
         for (row, unit) in SETTING_ROWS.iter().zip(["seconds", "bytes"]) {
@@ -171,7 +168,6 @@ impl Life for Instance {
     }
 
     /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
-
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         let posture = read_settings(settings)?;
         *self.posture.lock().unwrap_or_else(PoisonError::into_inner) = posture;
@@ -305,13 +301,11 @@ slot!(
 );
 
 /// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a URL
-
 fn carries_userinfo(uri: &http::Uri) -> bool {
     uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
 /// The framer's own head lines on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
-
 const DEFAULT_LINES: &str = "content-type: application/grpc\r\nte: trailers\r\n";
 
 slot!(
@@ -616,7 +610,6 @@ fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<Stre
 }
 
 /// Run `f` on a one-stream framing, then fill the sink with what it owes. A failure is `op`'s,
-
 fn on_stream(
     op: &'static str,
     call: &Mutex<StreamCall>,

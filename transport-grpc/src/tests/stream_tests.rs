@@ -97,7 +97,6 @@ fn the_status_message_is_encoded_as_predev_encoded_it() {
 }
 
 /// AN OVERSIZE MESSAGE ON ONE STREAM CLOSES IT `RESOURCE_EXHAUSTED` NAMING THE LIMIT. The body's message
-
 #[test]
 fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
     let mut c = grpc();
@@ -114,7 +113,6 @@ fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
 }
 
 /// A FINAL STATUS THAT CANNOT BE RENDERED LEAVES THE CALL OPEN for the host's fallback refusal: a
-
 #[test]
 fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
     let mut c = grpc();
@@ -126,7 +124,6 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
 }
 
 /// A `grpc-timeout` THE CALLER STATES IS NEVER ENFORCED HERE, as predev's server enforced none:
-
 #[test]
 fn a_stated_grpc_timeout_is_never_enforced_here() {
     let mut c = StreamCall::open(
@@ -152,7 +149,6 @@ fn a_stated_grpc_timeout_is_never_enforced_here() {
 }
 
 /// AN EMIT AFTER THE CLOSE WRITES NOTHING: a reply message the host emits once the call is closed
-
 #[test]
 fn an_emit_after_the_close_writes_nothing() {
     let mut c = grpc();
@@ -178,13 +174,11 @@ fn open_with(fields: &[(&'static [u8], &'static [u8])]) -> StreamCall {
 }
 
 /// The close a compression the door does not take ends a call with, before any reply: the whole
-
 const UNIMPLEMENTED_GZIP: &str = ":status: 200\r\ncontent-type: application/grpc\r\n\
      grpc-accept-encoding: identity\r\ngrpc-status: 12\r\ngrpc-message: the%20message%20encoding\
      %20%60gzip%60%20is%20not%20supported:%20this%20server%20takes%20identity\r\n";
 
 /// A COMPRESSION THE DOOR DOES NOT TAKE IS `UNIMPLEMENTED` WITH THE ENCODINGS IT TAKES (gRPC's
-
 #[test]
 fn a_compression_the_door_does_not_take_closes_unimplemented() {
     let mut c = open_with(&[(&b"grpc-encoding"[..], &b"gzip"[..])]);
@@ -203,7 +197,6 @@ fn a_compression_the_door_does_not_take_closes_unimplemented() {
 }
 
 /// THE FIRST `grpc-encoding` FIELD IS THE CALL'S: a repeat is not read. A call that states
-
 #[test]
 fn the_first_grpc_encoding_field_is_the_calls() {
     let mut c = open_with(&[
@@ -223,7 +216,6 @@ fn the_first_grpc_encoding_field_is_the_calls() {
 }
 
 /// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN: when the host states
-
 #[test]
 fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
     let mut c = grpc();
@@ -239,7 +231,6 @@ fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
 }
 
 /// A REFUSAL STATING NO STATUS EITHER WAY IS `UNKNOWN` WITH ITS OWN WORDS, as the connection side
-
 #[test]
 fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
     let mut c = grpc();
@@ -252,7 +243,6 @@ fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
 }
 
 /// The same on one stream: a refusal whose block names `grpc-status` but is no field block fails in
-
 #[test]
 fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
     let mut c = grpc();
@@ -269,7 +259,6 @@ fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
 }
 
 /// A REFUSAL BLOCK'S OWN `content-type` (and any connection-specific field) IS DROPPED, as the
-
 #[test]
 fn a_refusal_blocks_own_content_type_and_connection_fields_are_dropped() {
     let mut c = grpc();

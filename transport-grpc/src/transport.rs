@@ -33,7 +33,6 @@ use hyper::server::conn::http2 as server;
 use crate::msg::{self, Head, Messages};
 
 /// A head block the host emitted, held until it is whole: wiped when it drops, since a dialled
-
 type HeadBuf = zeroize::Zeroizing<Vec<u8>>;
 
 /// The connection posture every framing carries.
@@ -100,15 +99,12 @@ struct ChanState {
 }
 
 /// A STREAM'S OWN BACKPRESSURE (the transport ABI): the payload bytes one stream may queue for
-
 pub(crate) const STREAM_HIGH_WATER: usize = 1 << 20;
 
 /// A stream answered full that has drained to this many queued bytes is writable again
-
 pub(crate) const STREAM_LOW_WATER: usize = 256 * 1024;
 
 /// THE HOST'S OWN BACKPRESSURE, the other way: what a connection holds for the host (pieces handed
-
 const INBOUND_HIGH_WATER: usize = STREAM_HIGH_WATER;
 
 /// What one piece held for the host counts beside its bytes ([`INBOUND_HIGH_WATER`]).
@@ -120,16 +116,13 @@ fn held_for_host(out: &VecDeque<Piece>) -> usize {
 }
 
 /// Why a stream whose host emitted past its bound (the high-water mark and one whole message
-
 pub(crate) const OVER_BOUND: &str =
     "the stream's queue is past its bound: the far end is not reading";
 
 /// The room a head block may take beside one whole message: an answer's head block is read up to
-
 pub(crate) const HEAD_ALLOWANCE: usize = 64 * 1024;
 
 /// A STREAM'S BOUND: the payload bytes it may queue for the far end before a host that keeps
-
 pub(crate) fn stream_bound(max_message_bytes: usize) -> usize {
     STREAM_HIGH_WATER
         .saturating_add(max_message_bytes)
@@ -175,7 +168,6 @@ impl Chan {
         }
     }
     /// Whether the queue stands at its high-water mark; if so, the host is being told (the
-
     fn announce_full(&self) -> bool {
         let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let full = s.queued >= STREAM_HIGH_WATER;
@@ -253,7 +245,6 @@ impl Body for ChanBody {
 
 impl Drop for ChanBody {
     /// The connection drops a body it read to its end, or one whose stream the far end reset; the
-
     fn drop(&mut self) {
         self.0.let_go();
     }
@@ -344,7 +335,6 @@ impl Owed for Conn {
         self.io.take_wire(cap)
     }
     /// Wire bytes still owed, or a body the last drive left unread for the host's sake: either way
-
     fn wire_pending(&self) -> bool {
         self.failed.is_none() && (self.io.wire_pending() || self.held_back)
     }
@@ -378,7 +368,6 @@ fn watch<F>(
 
 impl Conn {
     /// Open a dialled connection to `target` (an `http`/`https` URL: its scheme and authority are
-
     pub fn dial(target: &str, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let uri: http::Uri = target.parse().map_err(|_| Failure("not a target".into()))?;
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
@@ -542,7 +531,6 @@ impl Conn {
     }
 
     /// Bytes for `stream` (`end` = they end the frame). `deadline_ns` is the attempt's deadline on
-
     pub fn emit(
         &mut self,
         stream: u64,
@@ -692,7 +680,6 @@ impl Conn {
     }
 
     /// Whether `stream`'s queue stands at its high-water mark after an `emit`: the answer is then
-
     #[must_use]
     pub fn announce_full(&self, stream: u64) -> bool {
         match &self.side {
@@ -710,7 +697,6 @@ impl Conn {
     }
 
     /// End accepted `stream` with `trailers` (a block of `name: value` lines). A block that does
-
     pub fn end_call(&mut self, stream: u64, trailers: &[u8], status: u32) -> Result<(), Failure> {
         let Side::Accept(a) = &mut self.side else {
             return Err(Failure("a dialled call is not answered".into()));
@@ -803,7 +789,6 @@ impl Room {
     }
 
     /// The order a round reads `n` streams in: from [`Room::first`] round, so that while the host is
-
     fn order(&self, n: usize) -> impl Iterator<Item = usize> {
         let first = if n == 0 { 0 } else { self.first % n };
         (0..n).map(move |k| (first + k) % n)
@@ -1002,7 +987,6 @@ impl DialStream {
 }
 
 /// Fields this layer owns on a request, beside the hop-by-hop ones HTTP/2 forbids: a head block's
-
 const RESERVED_ON_REQUEST: &[&str] = &[
     "path",
     "method",
@@ -1050,7 +1034,6 @@ impl Dial {
 }
 
 /// Move one dialled stream as far as it goes this round. `Err((why, code, true))` is the
-
 fn advance(
     id: u64,
     s: &mut DialStream,
@@ -1178,7 +1161,6 @@ fn advance(
 }
 
 /// A DIALLED STREAM'S FAILURE BELOW gRPC, as the status it stands for and this framer's own text
-
 fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
     let mut at = Some(e);
     while let Some(err) = at {
@@ -1222,7 +1204,6 @@ fn dial_bad_text(e: &msg::Bad) -> String {
 const STATUS_FIELDS: &[&str] = &[msg::GRPC_STATUS, msg::GRPC_MESSAGE];
 
 /// The stream's end, from the fields that carry `grpc-status` (`status`): the trailers (`fields`
-
 fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
     let code = status
         .get(msg::GRPC_STATUS)
@@ -1307,7 +1288,6 @@ impl Future for ReplyFut {
 
 impl Drop for ReplyFut {
     /// Dropped before the head went out: the far end reset the call while the host was still
-
     fn drop(&mut self) {
         if !self.answered {
             self.reply.chan.let_go();
@@ -1376,7 +1356,6 @@ impl AStream {
     }
 
     /// Send the answer's head: `head`'s fields, and on a trailers-only answer `trailers`'.
-
     fn send_head(&mut self, head: &Head, trailers: Option<&Head>) -> Result<(), String> {
         let mut fields = HeaderMap::new();
         fields.insert(http::header::CONTENT_TYPE, self.content_type.clone());
@@ -1387,7 +1366,6 @@ impl AStream {
     }
 
     /// End the call with `trailers` (trailers-only before any head).
-
     fn finish(&mut self, trailers: &Head) -> Result<(), String> {
         if self.head_sent {
             let mut map = HeaderMap::new();
@@ -1422,13 +1400,11 @@ impl AStream {
 const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
 
 /// Whether an answer field named `name` (lower case) is never the host's to send: one this layer
-
 pub(crate) fn not_the_hosts(name: &str) -> bool {
     RESERVED_ON_ANSWER.contains(&name) || hop_by_hop(name, [])
 }
 
 /// The answer fields `blocks` state, appended to `map` in order: a head's or the trailers' alike,
-
 fn answer_fields<'h>(
     blocks: impl IntoIterator<Item = &'h Head>,
     map: &mut HeaderMap,
@@ -1603,7 +1579,6 @@ impl Accept {
     }
 
     /// An op on `stream`, which this connection does not hold: dropped when the call ended (A
-
     fn late(&self, stream: u64) -> Result<(), Failure> {
         if self.ended.contains(stream) {
             Ok(())

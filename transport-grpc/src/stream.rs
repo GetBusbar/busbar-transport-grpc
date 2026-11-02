@@ -36,7 +36,6 @@ pub struct StreamCall {
 
 impl StreamCall {
     /// The call that arrived with `fields`, its messages at most `max` payload bytes.
-
     pub fn open<'f>(
         fields: impl Iterator<Item = (&'f [u8], &'f [u8])>,
         max: usize,
@@ -70,13 +69,11 @@ impl StreamCall {
     }
 
     /// The response's possible final fields, declared before the host sends its HTTP/1 head.
-
     pub(crate) fn declare_response_fields(&mut self) {
         self.wire.extend(b"trailer: grpc-status, grpc-message, grpc-status-details-bin, grpc-accept-encoding\r\n");
     }
 
     /// The call's body bytes (`end` = its last): each message they complete is a piece.
-
     pub fn ingest(&mut self, bytes: &[u8], end: bool) -> Result<(), Failure> {
         let bad = |e: msg::Bad| Failure(e.to_string());
         if let Some(e @ msg::Bad::Encoding(_)) = &self.oversize {
@@ -97,7 +94,6 @@ impl StreamCall {
     }
 
     /// One reply message's payload bytes (`ends` = they complete it). A call already closed takes
-
     pub fn emit(&mut self, bytes: &[u8], ends: bool) -> Result<(), Failure> {
         if self.closed || self.cut.is_some() {
             return Ok(());
@@ -123,13 +119,11 @@ impl StreamCall {
     }
 
     /// The reply bytes queued and not yet taken by the host: the wire, and the message being
-
     fn queued(&self) -> usize {
         self.wire.len().saturating_add(self.writing.len())
     }
 
     /// Whether drainable reply bytes stand at the high-water mark after an `emit`.
-
     pub fn announce_full(&mut self) -> bool {
         let full = !self.closed && self.cut.is_none() && self.wire.len() >= STREAM_HIGH_WATER;
         self.announced |= full;
@@ -137,7 +131,6 @@ impl StreamCall {
     }
 
     /// Cut the reply for `why`: the message being written is dropped, no reply byte more is taken,
-
     fn cut_reply(&mut self, why: String) -> Failure {
         self.writing = Vec::new();
         self.cut = Some(why.clone());
@@ -145,7 +138,6 @@ impl StreamCall {
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
-
     pub fn refuse(&mut self, bytes: &[u8], status: u32, head_sent: bool) -> Result<(), Failure> {
         if self.closed {
             return Ok(());
@@ -191,7 +183,6 @@ impl StreamCall {
     }
 
     /// Close the call with the unit's final status (`status` in gRPC's numbering, its message and
-
     pub fn finish(&mut self, status: u32, message: &[u8], details: &[u8]) -> Result<(), Failure> {
         if self.closed {
             return Ok(());

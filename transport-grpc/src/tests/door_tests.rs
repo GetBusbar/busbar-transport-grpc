@@ -47,7 +47,6 @@ fn every_canonical_status_has_the_class_its_http_mapping_gives_it() {
 }
 
 /// Every code gRPC defines, stated as the breaker's reading. Written out rather than derived from
-
 #[test]
 fn every_canonical_status_has_the_breakers_fault_reading() {
     let expect: [(u16, u8); 17] = [
@@ -100,7 +99,6 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
 }
 
 /// EACH DECLARED DEFAULT IS THE VALUE THE DOOR APPLIES when the setting is absent: the declaration
-
 #[test]
 fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
     use crate::meta::DEFAULT_TIMEOUT;
@@ -111,7 +109,6 @@ fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
 }
 
 /// AN ILL-TYPED OR ZERO SETTING IS REFUSED BY ITS NAME, in http's words (`settings: <key> must be a
-
 #[test]
 fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
     let why = |json: &[u8]| {
@@ -141,7 +138,6 @@ fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
 }
 
 /// The tail states exactly the operations this door serves.
-
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
@@ -150,7 +146,6 @@ fn the_tail_states_the_ops_the_door_serves() {
 }
 
 /// The claim declares only selector forms honored by routing.
-
 #[test]
 fn the_claim_declares_only_the_selector_forms_something_honours() {
     use busbar_contract::SelectorForm;

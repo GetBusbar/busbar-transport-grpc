@@ -287,7 +287,6 @@ fn a_refusals_neutral_status_maps_as_predevs_grpc_line_answered_it() {
 }
 
 /// A MESSAGE STREAM THAT FAILED HOLDS NOTHING MORE: once a message is over the ceiling (or
-
 #[test]
 fn a_failed_message_stream_holds_nothing_more() {
     let mut over = vec![0u8];
@@ -304,7 +303,6 @@ fn a_failed_message_stream_holds_nothing_more() {
 }
 
 /// A PAYLOAD NO LENGTH PREFIX CAN STATE HAS NONE: past `u32::MAX` bytes there is no prefix, never a
-
 #[test]
 fn a_payload_past_u32_max_has_no_prefix() {
     let past = usize::try_from(u64::from(u32::MAX) + 1).expect("a 64-bit host");
@@ -313,7 +311,6 @@ fn a_payload_past_u32_max_has_no_prefix() {
 }
 
 /// A refusal's bytes are a block only where they are one: a block stating `grpc-status` is the
-
 #[test]
 fn a_refusals_bytes_are_a_block_only_where_they_are_one() {
     let block = refusal_block(b"grpc-status: 5\r\ngrpc-message: gone\r\n").expect("a block");

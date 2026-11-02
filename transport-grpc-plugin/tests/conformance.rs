@@ -26,7 +26,6 @@ fn z<T>() -> T {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -207,7 +206,6 @@ fn the_statement_carries_the_declares_document() {
 }
 
 /// The gRPC door offers no authentication point and makes no authentication call.
-
 #[test]
 fn the_statement_offers_no_auth_point() {
     let row = row();

@@ -17,7 +17,6 @@ mod transport;
 pub use door::door;
 
 /// The transport axis entry the composition root folds for this transport: its key, the layers it
-
 pub mod linked {
     /// The row's registry key.
     pub const KEY: &str = crate::meta::KEY;

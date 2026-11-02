@@ -16,7 +16,6 @@ use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 pub const KEY: &str = "grpc";
 
 /// Whether its claim carries sessions: a connection multiplexes calls, each its own stream and
-
 pub(crate) const SESSION: bool = true;
 
 /// The settings this transport reads.
@@ -28,11 +27,9 @@ pub mod setting {
 }
 
 /// What `grpc` composes over: NOTHING. No transport names another. The connector builds every
-
 pub(crate) const COMPOSES_OVER: &[AbiStr] = &[];
 
 /// `grpc-status` by class, as the canonical HTTP mapping of each code reads it: a `4xx` code is
-
 pub(crate) const STATUS_ROWS: &[StatusRow] = &[
     row(0, 0, STATUS_SUCCESS),
     row(1, 1, STATUS_CALLER_FAULT),
@@ -61,7 +58,6 @@ pub(crate) fn class_of(code: u16) -> u8 {
 }
 
 /// What each `grpc-status` means to the BREAKER: the fault table, beside the status table and
-
 pub(crate) const FAULT_ROWS: &[FaultRow] = &[
     fault_row(0, FAULT_CALLER),
     fault_row(1, FAULT_CALLER),
@@ -100,7 +96,6 @@ pub(crate) fn fault_of(code: u16) -> u8 {
 }
 
 /// How the breaker reads a BARE HTTP ANSWER (a far end, or a proxy or auth wall in front of it,
-
 const HTTP_FAULTS: &[(u16, u16, u8)] = &[
     (401, 401, FAULT_HARD),
     (403, 403, FAULT_HARD),
@@ -110,7 +105,6 @@ const HTTP_FAULTS: &[(u16, u16, u8)] = &[
 ];
 
 /// The breaker's reading of a bare HTTP answer's `status` ([`HTTP_FAULTS`]; off the table, the
-
 pub(crate) fn fault_of_http(status: u16) -> u8 {
     HTTP_FAULTS
         .iter()

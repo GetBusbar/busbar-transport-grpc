@@ -74,7 +74,6 @@ pub fn linked() -> &'static Ops {
 }
 
 /// THE IMAGE WHERE `cargo test` DID NOT BUILD IT, or built it before the code under test: the
-
 fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
     static BUILT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     BUILT
@@ -163,7 +162,6 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
 }
 
 /// The socket the host holds: what the far end wrote and the host has not ingested (and whether
-
 pub struct Socket {
     rx: Mutex<(VecDeque<u8>, bool)>,
     to_far: mpsc::UnboundedSender<Vec<u8>>,
@@ -232,7 +230,6 @@ impl Got {
 }
 
 /// Stream `stream`'s end, once it arrived: the status (code and class, from the trailers or a
-
 pub fn over(got: &[Got], stream: u64) -> Option<(u32, u8, bool, Vec<u8>)> {
     let mut status = None;
     let mut bytes = Vec::new();
@@ -427,7 +424,6 @@ impl Host {
     }
 
     /// `locate` as the connector asks it for an ACCEPTING listener (`LocateIn::accept`, an empty
-
     pub fn locate_listener(&mut self) -> Result<Located, Outcome> {
         self.locate_as("", true)
     }
@@ -462,7 +458,6 @@ impl Host {
     }
 
     /// `locate` with the buffers lent at the given sizes (`authority`, `name`, `alpn`, `defaults`),
-
     pub fn locate_lent(
         &mut self,
         target: &str,
@@ -678,7 +673,6 @@ impl Host {
     }
 
     /// `finish` with a final tail stated by hand: `bytes`, and the `message` and `details` spans
-
     pub fn finish_spans(
         &mut self,
         status: u32,
@@ -748,7 +742,6 @@ impl Host {
     }
 
     /// `encode` an envelope: `path` as the target head word, then `fields`, then the one message
-
     pub fn encode(&mut self, path: &str, fields: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
         let all: Vec<Field> = fields
             .iter()
@@ -797,7 +790,6 @@ impl Host {
     }
 
     /// `emit` `bytes` on `stream` ONCE, as a host whose far end is not reading does: no `YIELD_MORE`
-
     pub fn emit_held(&mut self, stream: u64, bytes: &[u8], end: bool) -> (Outcome, u32, String) {
         let mut i: EmitIn = z();
         i.framing = self.framing;
@@ -815,7 +807,6 @@ impl Host {
     }
 
     /// Re-call `emit` on `stream` with no new bytes until it has nothing more: the far end reads
-
     pub fn emit_drain(&mut self, stream: u64) -> Outcome {
         self.drain(slot::EMIT, stream)
     }
@@ -852,7 +843,6 @@ impl Host {
     }
 
     /// Ingest whatever the far end sends until it stays quiet for `quiet` or `until` holds; the
-
     pub fn pump_until(&mut self, quiet: Duration, until: impl Fn(&[Got]) -> bool) -> Outcome {
         let mut idle = Duration::ZERO;
         let step = Duration::from_millis(5);
@@ -970,7 +960,6 @@ impl Host {
     }
 
     /// Stream `stream`'s whole frames (pieces joined up to each end-of-frame) up to its status:
-
     pub fn frames(&self, stream: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut cur = Vec::new();

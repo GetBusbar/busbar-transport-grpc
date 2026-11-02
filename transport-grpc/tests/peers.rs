@@ -221,7 +221,6 @@ fn a_connection_that_agreed_another_protocol_is_refused_at_begin() {
 }
 
 /// A listener the test holds, and tonic's (lazy) `Channel` to it: the channel connects on its
-
 fn listening(
     rt: &tokio::runtime::Runtime,
 ) -> (

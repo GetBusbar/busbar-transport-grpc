@@ -18,11 +18,9 @@ use common::*;
 const QUIET: Duration = Duration::from_millis(300);
 
 /// The most a scenario waits on the far end (idle) before it is judged: a loaded runner's stall is
-
 const BOUND: Duration = Duration::from_secs(10);
 
 /// Pump until `stream` has its terminal piece, and say so: never index an exchange that is not
-
 fn until_over(host: &mut Host, stream: u64) {
     assert_eq!(
         host.pump_until(BOUND, move |got| over(got, stream).is_some()),
@@ -175,7 +173,6 @@ fn accept(ops: &'static Ops, rt: &tokio::runtime::Runtime) -> Vec<String> {
 }
 
 /// `frames` with every `date:` line taken out. The server stamps each answer's head with the second
-
 fn undated(frames: &[u8]) -> Vec<u8> {
     let mut out = frames.to_vec();
     while let Some(at) = out.windows(6).position(|w| w == b"date: ") {
@@ -191,7 +188,6 @@ fn undated(frames: &[u8]) -> Vec<u8> {
 }
 
 /// The re-call rule's check: an exchange collected through a sink so small that every op is
-
 fn recall_continues(tight: &[u8], roomy: &[u8]) -> Result<(), String> {
     let (tight, roomy) = (undated(tight), undated(roomy));
     if tight == roomy {
@@ -300,7 +296,6 @@ fn locate_offers_h2_alone_on_a_secured_target_and_nothing_in_the_clear() {
 }
 
 /// A TLS gRPC LISTENER OFFERS `h2`: asked for an ACCEPTING listener's offer (`LocateIn::accept`,
-
 #[test]
 fn a_listener_is_offered_h2_alone() {
     let (d, _lib) = dropped();
@@ -317,7 +312,6 @@ fn a_listener_is_offered_h2_alone() {
 }
 
 /// THE FRAMER'S OWN HEAD LINES ARE STATED AT `locate`, so the host puts them in the head BEFORE the
-
 #[test]
 fn locate_states_the_framers_own_head_lines_before_the_auth_signs() {
     let (d, _lib) = dropped();
@@ -363,7 +357,6 @@ fn b64_nopad(raw: &[u8]) -> String {
 }
 
 /// What predev's gRPC line wrote for a status: tonic 0.14's own header rendering, as field lines
-
 fn tonic_block(status: tonic::Status, head: bool) -> String {
     let mut out = String::new();
     let map = if head {
@@ -384,7 +377,6 @@ fn tonic_block(status: tonic::Status, head: bool) -> String {
 }
 
 /// One stream through `ops`: its body's messages, a reply framed, and the close rendered from the
-
 fn one_stream(ops: &'static Ops, caps: Caps) -> (Vec<String>, String) {
     let mut proof = Vec::new();
     let mut host = Host::open(ops, "{}", caps);
@@ -429,7 +421,6 @@ fn one_stream(ops: &'static Ops, caps: Caps) -> (Vec<String>, String) {
 }
 
 /// THE CLOSE IS THE DOOR'S, BOTH WAYS IN, IN PREDEV'S BYTES: the linked and the dropped-in door
-
 #[test]
 fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_predevs_bytes() {
     let l = linked();
@@ -472,7 +463,6 @@ fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_predevs_bytes
 }
 
 /// A STREAM REFUSED BEFORE ANY REPLY is the door's trailers-only answer, in predev's bytes (tonic
-
 #[test]
 fn a_stream_refused_before_any_reply_is_predevs_trailers_only_answer() {
     let (d, _lib) = dropped();
@@ -493,7 +483,6 @@ fn a_stream_refused_before_any_reply_is_predevs_trailers_only_answer() {
 }
 
 /// Non-gRPC calls and details that cannot form a field value are refused.
-
 #[test]
 fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
     let mut host = Host::open(linked(), "{}", ROOMY);
@@ -510,7 +499,6 @@ fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
 }
 
 /// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` with the
-
 #[test]
 fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
     let (d, _lib) = dropped();
@@ -535,7 +523,6 @@ fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
 }
 
 /// AN OVERSIZE MESSAGE IS REFUSED AT THE CONFIGURED LIMIT, IN THIS FRAMER'S WORDS:
-
 #[test]
 fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words() {
     let (d, _lib) = dropped();
@@ -559,7 +546,6 @@ fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words(
 }
 
 /// THE SDK'S WORDS, both images: `validate` refuses a blob that is no JSON object and a key this
-
 #[test]
 fn settings_and_the_unserved_ops_answer_the_sdks_words() {
     use busbar_contract::abi::mechanism::call::OutHead;
@@ -646,7 +632,6 @@ fn settings_and_the_unserved_ops_answer_the_sdks_words() {
 }
 
 /// ONE STREAM'S REPLY HAS THE BACKPRESSURE AND THE BOUND A CONNECTION'S STREAM HAS (the transport
-
 #[test]
 fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
     use busbar_contract::abi::transport::{PIECE_WRITABLE, YIELD_STREAM_FULL};
@@ -702,7 +687,6 @@ fn one_streams_reply_is_answered_full_drains_writable_and_is_bounded() {
 }
 
 /// A FINAL TAIL WHOSE SPAN LIES OUTSIDE ITS BYTES IS REFUSED IN WORDS, never read as no message:
-
 #[test]
 fn a_final_tail_whose_span_lies_outside_its_bytes_is_refused_in_words() {
     use busbar_contract::abi::mechanism::call::Span;
@@ -738,7 +722,6 @@ fn a_final_tail_whose_span_lies_outside_its_bytes_is_refused_in_words() {
 }
 
 /// A HOST BUFFER TOO SMALL FOR `locate`'S ANSWER IS A SHORT ANSWER, never a truncated success: each
-
 #[test]
 fn locate_answers_short_for_any_buffer_too_small() {
     let (d, _lib) = dropped();
@@ -778,7 +761,6 @@ fn locate_answers_short_for_any_buffer_too_small() {
 }
 
 /// `refresh` READS ITS SETTINGS AS `validate` DOES, and new ones apply to framings begun after it:
-
 #[test]
 fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
     let (d, _lib) = dropped();
@@ -814,7 +796,6 @@ fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
 }
 
 /// EVERY OP'S TEXT NAMES ITS OP (`<op>: <reason>`, the kind's grammar), the framing's own failures
-
 #[test]
 fn every_ops_text_names_its_op() {
     use busbar_contract::abi::transport::{
@@ -884,7 +865,6 @@ fn every_ops_text_names_its_op() {
 }
 
 /// A TARGET CARRYING USERINFO IS REFUSED AT `locate` AND AT `begin`, as http and ws refuse it, and
-
 #[test]
 fn a_target_carrying_userinfo_is_refused_and_never_echoed() {
     use busbar_contract::abi::transport::{slot, BeginIn, FramerOut, SIDE_DIAL};
