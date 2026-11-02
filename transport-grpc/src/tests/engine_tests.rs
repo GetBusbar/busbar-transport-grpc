@@ -2218,3 +2218,30 @@ fn a_get_with_a_grpc_content_type_is_refused_and_never_handed_up() {
         Some(&b"POST"[..])
     );
 }
+
+/// A DIALLED CALL THIS FRAMER RESETS IS RESET `CANCEL`, as a client's cancel or deadline is
+/// (PROTOCOL-HTTP2.md). RED: the reset went out `INTERNAL_ERROR` (2): hyper reads the reason from
+/// an `h2::Error` in the body error's source chain, and an `io::Error` hides its inner error.
+#[test]
+fn a_dialled_call_past_its_deadline_is_reset_cancel() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    let mut bytes = msg::render_head(&[("path", b"/pkg.Svc/Get")], Some(1000)).expect("a head");
+    bytes.extend_from_slice(&msg::frame(b"k"));
+    d.emit(1, &bytes, false, now + 2 * SEC, now).expect("emit");
+    let mut sent: Vec<u8> = Vec::new();
+    let mut turn = |d: &mut Conn, at: u64| {
+        for _ in 0..20 {
+            d.drive(at);
+            sent.extend(d.take_wire(usize::MAX));
+            d.pieces().clear();
+        }
+    };
+    turn(&mut d, now);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, now);
+    turn(&mut d, now + 2 * SEC);
+    assert_eq!(resets(&sent[24..]), vec![(1, 8)], "RST_STREAM CANCEL");
+}

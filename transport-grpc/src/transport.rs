@@ -244,15 +244,18 @@ struct ChanBody(Chan);
 
 impl Body for ChanBody {
     type Data = Bytes;
-    type Error = std::io::Error;
+    // `hyper` reads a reset's reason from an `h2::Error` in the error's source chain, which an
+    // `io::Error` hides.
+    type Error = h2::Error;
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, h2::Error>>> {
         let mut s = self.0 .0.lock().unwrap_or_else(PoisonError::into_inner);
         if s.reset {
-            // The connection resets the stream on a body's error.
-            return Poll::Ready(Some(Err(std::io::Error::other("the stream was failed"))));
+            // The connection resets the stream on a body's error: `CANCEL`, as a client's cancel
+            // or deadline is.
+            return Poll::Ready(Some(Err(h2::Error::from(h2::Reason::CANCEL))));
         }
         if let Some(f) = s.frames.pop_front() {
             if let Some(d) = f.data_ref() {
