@@ -552,6 +552,10 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
         (400, msg::INTERNAL, FAULT_CALLER),
         (409, msg::UNKNOWN, FAULT_CALLER),
         (500, msg::UNKNOWN, FAULT_TRANSIENT),
+        (408, msg::UNKNOWN, FAULT_TRANSIENT),
+        (429, msg::UNAVAILABLE, FAULT_TRANSIENT),
+        (599, msg::UNKNOWN, FAULT_TRANSIENT),
+        (404, msg::UNIMPLEMENTED, FAULT_CALLER),
     ] {
         let now = 5 * SEC;
         let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
@@ -1736,9 +1740,19 @@ fn a_dialled_keep_alive_pings_and_fails_a_silent_far_end() {
     d.ingest(&wire, false);
     let (sent, _) = turn(&mut d, now);
     assert!(!frame_types(&sent).contains(&6), "no PING yet");
+    let (sent, _) = turn(&mut d, now + 29 * SEC);
+    assert!(
+        !frame_types(&sent).contains(&6),
+        "no PING before the interval"
+    );
     let (sent, got) = turn(&mut d, now + 30 * SEC);
     assert!(frame_types(&sent).contains(&6), "a PING at the interval");
     assert!(terminal(&got, 1).is_none(), "the call waits on the PING");
+    let (_, got) = turn(&mut d, now + 39 * SEC);
+    assert!(
+        terminal(&got, 1).is_none(),
+        "the call waits out the PING timeout"
+    );
     let (_, got) = turn(&mut d, now + 40 * SEC);
     let t = terminal(&got, 1).expect("an unanswered PING fails the call");
     assert!(t.failed, "{t:?}");
