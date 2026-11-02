@@ -349,3 +349,16 @@ fn a_refusals_bytes_are_a_block_only_where_they_are_one() {
         );
     }
 }
+
+/// A COMPLETE HEAD OVER THE CEILING IS REFUSED like an incomplete one, even when it arrives whole.
+#[test]
+fn a_complete_head_over_the_ceiling_is_refused() {
+    let mut head = b"a: ".to_vec();
+    head.extend(std::iter::repeat_n(b'x', 200));
+    head.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(
+        read_head(&head, 100),
+        Err("the head block is over the ceiling".to_string())
+    );
+    assert!(read_head(&head, 1000).unwrap().is_some());
+}

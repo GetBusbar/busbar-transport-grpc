@@ -113,13 +113,11 @@ impl Bad {
 /// every value but `identity`, the one encoding it takes. `None` = the call is not compressed.
 #[must_use]
 pub fn unsupported_encoding(v: &[u8]) -> Option<Bad> {
-    if v == b"identity" {
+    if v == ACCEPT_ENCODING.as_bytes() {
         return None;
     }
-    // Text where it is text; else the bytes, each as its number.
-    Some(Bad::Encoding(
-        std::str::from_utf8(v).map_or_else(|_| format!("{v:?}"), str::to_owned),
-    ))
+    // Always printable ASCII: any other byte is shown as its `\xNN` escape.
+    Some(Bad::Encoding(v.escape_ascii().to_string()))
 }
 
 impl std::fmt::Display for Bad {
@@ -137,7 +135,8 @@ impl std::fmt::Display for Bad {
             Self::TooLarge(n, limit) => write!(
                 f,
                 "the message is {n} bytes, over the limit of {limit} bytes \
-                 (limits.request_body_max_bytes)"
+                 ({})",
+                crate::meta::setting::BODY_MAX_BYTES
             ),
             Self::Truncated => f.write_str("the stream ended inside a message"),
         }
@@ -549,6 +548,9 @@ pub fn read_head(buf: &[u8], max: usize) -> Result<Option<(Head, usize)>, String
     let (lines, took) = if buf.starts_with(b"\r\n") {
         (&buf[..0], 2)
     } else if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        if p > max {
+            return Err("the head block is over the ceiling".into());
+        }
         (&buf[..p], p + 4)
     } else {
         if buf.len() > max {
