@@ -1165,7 +1165,10 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
 fn dial_bad_text(e: &msg::Bad) -> String {
     match e {
         msg::Bad::TooLarge(n, limit) => {
-            format!("the answer's message is {n} bytes, over the limit of {limit} bytes")
+            format!(
+                "the answer's message is {n} bytes, over the limit of {limit} bytes ({})",
+                crate::meta::setting::BODY_MAX_BYTES
+            )
         }
         other => other.to_string(),
     }

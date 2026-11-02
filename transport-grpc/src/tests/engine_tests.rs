@@ -1070,7 +1070,10 @@ fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
     assert_eq!(t.status, Some(msg::RESOURCE_EXHAUSTED));
     assert_eq!(
         String::from_utf8_lossy(&t.bytes),
-        format!("the answer's message is {over} bytes, over the limit of {limit} bytes")
+        format!(
+            "the answer's message is {over} bytes, over the limit of {limit} bytes ({})",
+            crate::meta::setting::BODY_MAX_BYTES
+        )
     );
 }
 
