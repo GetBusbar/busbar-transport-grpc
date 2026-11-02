@@ -409,6 +409,11 @@ fn one_stream(ops: &'static Ops, caps: Caps) -> (Vec<String>, String) {
     let mut host = Host::open(ops, "{}", caps);
     let fields = [("content-type", "application/grpc"), ("te", "trailers")];
     assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
+    assert_eq!(
+        host.wire_log,
+        b"trailer: grpc-status, grpc-message, grpc-status-details-bin, grpc-accept-encoding\r\n",
+        "the initial declaration drains through Timer before any body on either sink size"
+    );
     let mut body = lpm(b"hello");
     body.extend(lpm(b""));
     body.extend(lpm(b"again"));

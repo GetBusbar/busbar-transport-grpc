@@ -580,7 +580,8 @@ impl Host {
                     let mut i: FramingIn = z();
                     i.framing = self.framing;
                     i.sink = self.sink();
-                    call(self.ops.timer, self.inst, &mut i, &mut o, index)
+                    // Begin's remaining initial fields drain through Timer, as the connector does.
+                    call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER)
                 }
             };
             if self.take(r, &o) != Outcome::Ready {

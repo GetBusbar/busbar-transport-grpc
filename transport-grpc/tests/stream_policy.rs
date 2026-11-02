@@ -166,6 +166,10 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
+        Self::on(linked())
+    }
+
+    fn on(ops: &'static Ops) -> Self {
         HANDED.with(|seen| seen.borrow_mut().clear());
         REFUSED.with(|seen| seen.borrow_mut().clear());
         FLOW.with(|flow| flow.set(FLOW_CONTINUE));
@@ -180,7 +184,6 @@ impl Host {
         let mut input: OpenIn = z();
         input.host = &*tables;
         let mut out: OpenOut = z();
-        let ops = linked();
         assert_eq!(
             call(
                 ops.head.open,
@@ -274,6 +277,7 @@ impl Host {
         }];
         let mut input: BeginIn = z();
         input.side = side;
+        input.target = s("http://policy.test:50051");
         input.scheme = SCHEME_PLAIN;
         input.head.ticket = ticket(1);
         input.head.extensions = blob(ext);
@@ -439,7 +443,8 @@ fn every_multiplexed_request_uses_its_selected_loan_before_head_or_body_and_hand
             .flat_map(|(_, bytes)| bytes.iter().copied())
             .collect();
         assert_eq!(
-            payload, expected,
+            payload,
+            message(expected),
             "the original DATA is consumed exactly once"
         );
     }
@@ -600,4 +605,128 @@ fn the_actual_http_method_must_match_before_a_none_line_is_handed_in() {
             &[(REFUSE_METHOD_MISS, 22, UnitRef::NONE)]
         )
     });
+}
+
+#[test]
+fn the_body_only_begin_declares_final_fields_once_across_tiny_wire_sinks_linked_and_dropped() {
+    let (dropped, _image) = common::dropped();
+    for (label, ops) in [("linked", linked()), ("dropped", dropped)] {
+        for capacity in [1, 7, 65536] {
+            let mut host = Host::on(ops);
+            host.wire.resize(capacity, 0);
+            let mut answer = host.begin(SIDE_ACCEPT_STREAM, &[]);
+            assert_eq!(answer.outcome, Outcome::Ready, "{label}");
+            let token = answer.framing;
+            let mut declaration = answer.wire;
+            for _ in 0..256 {
+                if answer.flags & YIELD_MORE == 0 {
+                    break;
+                }
+                let mut input: busbar_contract::abi::transport::FramingIn = z();
+                input.framing = token;
+                input.sink = host.sink();
+                let mut out: FramerOut = z();
+                let result = call(
+                    host.ops.timer,
+                    host.instance,
+                    &mut input,
+                    &mut out,
+                    slot::TIMER,
+                );
+                answer = host.capture(result, out);
+                assert_eq!(answer.outcome, Outcome::Ready, "{label}");
+                declaration.extend_from_slice(&answer.wire);
+            }
+            assert_eq!(
+                answer.flags & YIELD_MORE,
+                0,
+                "{label}: finite declaration drains"
+            );
+            assert_eq!(declaration,
+                b"trailer: grpc-status, grpc-message, grpc-status-details-bin, grpc-accept-encoding\r\n",
+                "{label}: Begin's wire is one complete initial field block");
+            let mut input: busbar_contract::abi::transport::FramingIn = z();
+            input.framing = token;
+            input.sink = host.sink();
+            let mut out: FramerOut = z();
+            let result = call(
+                host.ops.timer,
+                host.instance,
+                &mut input,
+                &mut out,
+                slot::TIMER,
+            );
+            assert!(
+                host.capture(result, out).wire.is_empty(),
+                "declaration is not replayed"
+            );
+            let got = host.ingest(&message(b"body"), &[], ticket(2));
+            assert_eq!(got.outcome, Outcome::Ready);
+            assert!(
+                got.wire.is_empty(),
+                "initial fields never prefix payload output"
+            );
+            assert_eq!(got.pieces[0].1, b"body");
+        }
+    }
+}
+
+#[test]
+fn unsupported_neutral_emit_kinds_refuse_before_consuming_in_every_grpc_mode() {
+    use busbar_contract::abi::transport::{EmitIn, EMIT_TRAILERS, SIDE_DIAL};
+    let (dropped, _image) = common::dropped();
+    for (label, ops) in [("linked", linked()), ("dropped", dropped)] {
+        for side in [SIDE_DIAL, SIDE_ACCEPT, SIDE_ACCEPT_STREAM] {
+            let mut host = Host::on(ops);
+            let begin = host.begin(side, &[]);
+            assert_eq!(begin.outcome, Outcome::Ready);
+            for flags in [EMIT_TRAILERS, 0x8000_0000] {
+                let bytes = b"grpc-status: 0\r\n";
+                let mut input: EmitIn = z();
+                input.framing = host.framing;
+                input.stream = 1;
+                input.head.ticket = ticket(2);
+                input.bytes = bytes.as_ptr();
+                input.len = bytes.len();
+                input.flags = flags;
+                input.end_of_frame = 1;
+                input.sink = host.sink();
+                let mut out: FramerOut = z();
+                let result = call(
+                    host.ops.emit,
+                    host.instance,
+                    &mut input,
+                    &mut out,
+                    slot::EMIT,
+                );
+                let rejected = host.capture(result, out);
+                assert_eq!(rejected.outcome, Outcome::Refused, "{label}: side {side}");
+                assert!(rejected.wire.is_empty() && rejected.pieces.is_empty());
+            }
+            if side == SIDE_ACCEPT_STREAM {
+                let mut input: EmitIn = z();
+                input.framing = host.framing;
+                input.stream = 1;
+                input.bytes = b"reply".as_ptr();
+                input.len = 5;
+                input.end_of_frame = 1;
+                input.sink = host.sink();
+                let mut out: FramerOut = z();
+                let result = call(
+                    host.ops.emit,
+                    host.instance,
+                    &mut input,
+                    &mut out,
+                    slot::EMIT,
+                );
+                let reply = host.capture(result, out);
+                assert_eq!(reply.outcome, Outcome::Ready);
+                assert_eq!(
+                    reply.wire,
+                    message(b"reply"),
+                    "rejected trailer bytes did not enter the body"
+                );
+            }
+        }
+    }
 }

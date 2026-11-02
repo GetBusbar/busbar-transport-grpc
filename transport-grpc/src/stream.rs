@@ -10,7 +10,9 @@
 //!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding` (gRPC's
 //!   compression rules); the first `grpc-encoding` field is the call's, a repeat is not read;
 //!   a `grpc-timeout` it states is a fact for the plane in the head the host keeps: this framing
-//!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`;
+//!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`. Begin yields the initial
+//!   response Trailer declaration, before the host writes its HTTP head; a short sink drains that
+//!   declaration through timer recalls before the call's body can be emitted;
 //! * `ingest` takes the call's body and yields each length-prefixed message's PAYLOAD as one piece
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
@@ -104,6 +106,12 @@ impl StreamCall {
             cut: None,
             announced: false,
         })
+    }
+
+    /// The response's possible final fields, declared before the host sends its HTTP/1 head.
+    /// Begin is called once; a short sink drains the remaining declaration through timer recalls.
+    pub(crate) fn declare_response_fields(&mut self) {
+        self.wire.extend(b"trailer: grpc-status, grpc-message, grpc-status-details-bin, grpc-accept-encoding\r\n");
     }
 
     /// The call's body bytes (`end` = its last): each message they complete is a piece.

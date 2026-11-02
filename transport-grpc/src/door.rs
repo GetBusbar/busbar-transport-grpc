@@ -20,7 +20,8 @@
 //!   framer asked for, and `finish` drops the connection.
 //!
 //! One stream (`SIDE_ACCEPT_STREAM`): a framing begun on that side frames one call
-//! whose connection and head the host's own framer carries, and its `finish` closes the call with
+//! whose connection and head the host's own framer carries. Begin yields an initial response field
+//! block declaring the possible final fields. Its `finish` closes the call with
 //! the final status the unit stated (the close's final tail), rendered here alone
 //! (`crate::stream`).
 //!
@@ -369,6 +370,7 @@ slot!(
                 Ok(call) => call,
                 Err(e) => return o.fail(Refusal::refused(e.0)),
             };
+            call.declare_response_fields();
             let token = inst.next.fetch_add(1, Ordering::Relaxed);
             o.set(|x| &x.framing, token);
             fill(&mut call, i.sink(), &mut o, class_of, fault_of);
@@ -440,6 +442,11 @@ slot!(
 slot!(
     /// `emit`.
     Emit, EmitIn, FramerOut, |p, i, o| {
+        // This framer renders terminal status through finish/refuse, never a neutral trailer
+        // emit. TEXT is only a hint on wires with distinct text frames; gRPC has no such opcode.
+        if i.flags() & !busbar_contract::abi::transport::EMIT_TEXT != 0 {
+            return o.fail(Refusal::refused("emit: unsupported flags; gRPC closes through finish or refuse"));
+        }
         let bytes = i.bytes();
         let (now, deadline, end) = (i.sink().now_monotonic_ns(), i.deadline_ns(), i.end_of_frame() != 0);
         let sensitive = match SensitiveFields::from_extensions(i.field(|x| &x.head.extensions).bytes()) {
