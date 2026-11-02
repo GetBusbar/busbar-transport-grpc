@@ -1207,9 +1207,9 @@ fn a_connection_lost_before_any_status_fails_the_call_unavailable() {
         let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
         assert!(t.failed);
         assert_eq!(t.status, Some(msg::UNAVAILABLE), "after_head {after_head}");
-        assert_eq!(
-            t.bytes.as_ref(),
-            b"the connection to the far end was lost",
+        assert!(
+            t.bytes
+                .starts_with(b"the connection to the far end was lost"),
             "after_head {after_head}"
         );
     }
@@ -1412,6 +1412,59 @@ fn a_dialled_frame_running_past_its_content_length_fails_in_words() {
         t.bytes.as_ref(),
         b"more message bytes than the head's content-length"
     );
+}
+
+/// A DIALLED STREAM WITH NO CONTENT-LENGTH THAT IS EMITTED ON AFTER THE FRAME THAT ENDED IT fails
+/// in words, as the content-length over-run does. RED: the extra bytes were dropped and the emit
+/// answered Ok.
+#[test]
+fn a_dialled_frame_after_the_request_ended_fails_in_words() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Say")], None).expect("head");
+    c.extend_from_slice(&msg::frame(b"q"));
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    let again = p.d.emit(1, &msg::frame(b"late"), false, 0, p.now);
+    p.settle();
+    let failed = terminal(&p.got_d, 1)
+        .filter(|t| t.failed)
+        .map(|t| String::from_utf8_lossy(&t.bytes).into_owned());
+    assert!(
+        again.is_err() || failed.as_deref() == Some("bytes after the request's end"),
+        "late bytes are refused in words: {again:?} {failed:?}"
+    );
+}
+
+/// TRAILERS THAT CARRY NO `grpc-status` close UNKNOWN in words that say the status is missing,
+/// never the bare `grpc-status 2` a real UNKNOWN reads as. RED: `grpc-status 2`.
+#[test]
+fn trailers_with_no_grpc_status_say_so() {
+    let mut block = Vec::new();
+    lit_field(&mut block, "x-a", "b");
+    let mut p = open_call(true, b"");
+    p.d.ingest(&h2(1, 0x5, 1, &block), false);
+    p.settle();
+    assert_eq!(
+        terminal(&p.got_d, 1).and_then(|t| t.status),
+        Some(msg::UNKNOWN)
+    );
+    assert_eq!(
+        last(&p.got_d, 1).expect("terminal").bytes.as_ref(),
+        b"the answer's trailers carry no grpc-status"
+    );
+}
+
+/// A CONNECTION LOST BELOW gRPC keeps its cause in the text. RED: the fixed text alone.
+#[test]
+fn a_lost_connection_keeps_its_cause() {
+    let mut p = open_call(true, b"");
+    p.d.ingest(&[], true);
+    p.settle();
+    let t = terminal(&p.got_d, 1).cloned().expect("the stream ends");
+    let text = String::from_utf8_lossy(&t.bytes).into_owned();
+    let cause = text
+        .strip_prefix("the connection to the far end was lost: ")
+        .unwrap_or_else(|| panic!("no cause in {text:?}"));
+    assert!(!cause.is_empty());
 }
 
 /// HPACK, literal without indexing, a new name: `name: value`.

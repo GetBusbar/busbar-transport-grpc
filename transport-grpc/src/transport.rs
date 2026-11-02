@@ -839,6 +839,9 @@ impl DialStream {
             _ => bytes.to_vec(),
         };
         if !body.is_empty() {
+            if self.chan.ended() {
+                return Err("bytes after the request's end".into());
+            }
             if let Some(left) = self.left.as_mut() {
                 if body.len() > *left {
                     return Err("more message bytes than the head's content-length".into());
@@ -1120,7 +1123,7 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
     }
     (
         msg::UNAVAILABLE,
-        "the connection to the far end was lost".into(),
+        format!("the connection to the far end was lost: {e}"),
     )
 }
 
@@ -1155,7 +1158,13 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
         .get(msg::GRPC_MESSAGE)
         .map(|v| msg::message_text(v.as_bytes()))
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| format!("grpc-status {code}").into_bytes());
+        .unwrap_or_else(|| {
+            if status.contains_key(msg::GRPC_STATUS) {
+                format!("grpc-status {code}").into_bytes()
+            } else {
+                b"the answer's trailers carry no grpc-status".to_vec()
+            }
+        });
     [
         block,
         Piece {
