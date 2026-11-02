@@ -413,3 +413,34 @@ fn a_close_inside_a_reply_message_is_internal_never_the_hosts_status() {
         assert!(c.ended());
     }
 }
+
+#[test]
+fn unfinished_fragments_past_the_bound_cut_the_reply() {
+    let mut c = StreamCall::open(
+        [(&b"content-type"[..], &b"application/grpc"[..])].into_iter(),
+        100,
+    )
+    .unwrap();
+    let bound = crate::transport::stream_bound(100);
+    let chunk = [b'a'; 64];
+    let mut sent = 0;
+    let mut err = None;
+    while sent <= bound + chunk.len() {
+        match c.emit(&chunk, false) {
+            Ok(()) => sent += chunk.len(),
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let e = err.expect("end=false fragments past the bound are cut");
+    assert!(sent <= bound, "cut only once past the bound");
+    assert_eq!(e.0, crate::transport::OVER_BOUND);
+    c.emit(b"more", false).unwrap();
+    c.emit(b"tail", true).unwrap();
+    assert!(
+        c.take_wire(usize::MAX).is_empty(),
+        "a cut reply writes nothing more"
+    );
+}
