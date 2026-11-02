@@ -475,16 +475,22 @@ fn the_linked_and_the_dropped_in_door_close_one_stream_the_same_in_predevs_bytes
     for run in &runs[1..] {
         assert_eq!(same_proof(&runs[0], run), Ok(()));
     }
-    // A whole end: `grpc-status: 0` alone.
-    let mut host = Host::open(l, "{}", ROOMY);
-    host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
-    let at = host.wire_log.len();
-    assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
-    assert_eq!(
-        String::from_utf8_lossy(&host.wire_log[at..]),
-        tonic_block(tonic::Status::new(tonic::Code::Ok, ""), false)
-    );
-    host.close();
+    // A whole end: `grpc-status: 0` alone, on both images.
+    let (d, _lib) = dropped();
+    for ops in [l, d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        assert_eq!(
+            host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]),
+            Outcome::Ready
+        );
+        let at = host.wire_log.len();
+        assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+        assert_eq!(
+            String::from_utf8_lossy(&host.wire_log[at..]),
+            tonic_block(tonic::Status::new(tonic::Code::Ok, ""), false)
+        );
+        host.close();
+    }
 }
 
 /// A STREAM REFUSED BEFORE ANY REPLY is the door's trailers-only answer, in predev's bytes (tonic
@@ -517,12 +523,30 @@ fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
         host.begin_stream("/t.T/Unary", &[("content-type", "application/json")]),
         Outcome::Refused
     );
-    let mut host = Host::open(linked(), "{}", ROOMY);
-    host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
-    assert_eq!(
-        host.finish_final(13, b"x", b"line\r\nbreak"),
-        Outcome::Failed
-    );
+    use busbar_contract::abi::mechanism::call::Span;
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        let at = host.wire_log.len();
+        let (msg_bytes, details) = (b"x", b"line\r\nbreak");
+        let blob = [&msg_bytes[..], &details[..]].concat();
+        let span = |offset: u32, len: u32| Span { offset, len };
+        assert_eq!(
+            host.finish_spans(13, &blob, span(0, 1), span(1, 11)),
+            (
+                Outcome::Failed,
+                "finish: the status details are not one field value".to_owned()
+            )
+        );
+        assert_eq!(host.wire_log.len(), at, "nothing written");
+        assert_eq!(host.refuse_as(1, b"", 500), Outcome::Ready);
+        assert!(
+            String::from_utf8_lossy(&host.wire_log[at..]).contains("grpc-status: 2\r\n"),
+            "the fallback refusal closes the call"
+        );
+        host.close();
+    }
 }
 
 /// A STREAM COMPRESSED WITH AN ENCODING THE DOOR DOES NOT TAKE closes `UNIMPLEMENTED` with the
