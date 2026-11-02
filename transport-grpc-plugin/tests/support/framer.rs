@@ -554,7 +554,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                 let want = Expected::Exact(ready_locate(&authority, secure, has_name));
                 {
                     let label = &format!("locate #{n}");
-                    let want = want;
+
                     let before = count(p);
                     let value = locate(p, &target, AMPLE).0;
                     assert_eq!(count(p) - before, 1, "{label} crossings");
@@ -582,7 +582,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
 
             {
                 let label = "locate short";
-                let want = want;
+
                 let before = count(p);
                 let value = (|| {
                     let (first, token) = locate(p, &target, 1);
@@ -641,7 +641,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let pinned = sinkfuls(opening.len(), TIGHT_WIRE);
     let token = {
         let label = "begin dial";
-        let want = want;
+
         let before = count(p);
         let value = {
             let y = pump(p, 0, Op::Begin(SIDE_DIAL, &target), &mut tight);
@@ -667,7 +667,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let want = Expected::Exact(yielded_line(&[], &heard, &[], 0, false));
         {
             let label = "dial answer";
-            let want = want;
+
             let before = count(p);
             let value = pump(p, token, Op::Ingest(&answer, false), &mut tight).line();
             assert_eq!(
@@ -751,7 +751,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let want = Expected::Exact(yielded_line(&wire, &[], &[], armed("emit"), false));
     {
         let label = "emit";
-        let want = want;
+
         let before = count(p);
         let value = pump(p, token, Op::Emit(&emit, true), &mut tight).line();
         assert_eq!(
@@ -775,7 +775,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let want = Expected::Exact(yielded_line(&answered, &frames, &[], ingest_flags, false));
     {
         let label = "ingest";
-        let want = want;
+
         let before = count(p);
         let value = pump(p, token, Op::Ingest(&ingest, false), &mut tight).line();
         assert_eq!(count(p) - before, ingest_calls, "{label} crossings");
@@ -789,7 +789,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let want = Expected::Exact(yielded_line(&[], &[], &[], YIELD_ENDED, false));
     {
         let label = "ingest end";
-        let want = want;
+
         let before = count(p);
         let value = pump(p, token, Op::Ingest(&[], true), &mut tight).line();
         assert_eq!(count(p) - before, 1, "{label} crossings");
@@ -804,7 +804,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let want = Expected::Exact(yielded_line(&finish, &[], &[], YIELD_ENDED, false));
     {
         let label = "finish";
-        let want = want;
+
         let before = count(p);
         let value = pump(p, token, Op::Finish, &mut tight).line();
         assert_eq!(
@@ -860,7 +860,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         };
         {
             let label = &format!("encode #{n}");
-            let want = want;
+
             let before = count(p);
             let value = once(p, 0, Op::Encode(&body, &fields), &mut Sink::ample()).line();
             assert_eq!(count(p) - before, 1, "{label} crossings");
@@ -887,7 +887,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let pinned = sinkfuls(accept_opening.len(), TIGHT_WIRE);
         let token = {
             let label = "begin accept";
-            let want = want;
+
             let before = count(p);
             let value = {
                 let y = pump(p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
@@ -909,7 +909,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             let want = Expected::Exact(yielded_line(&answer, &[], &[], 0, false));
             {
                 let label = "accept opening";
-                let want = want;
+
                 let before = count(p);
                 let value = pump(p, token, Op::Ingest(&opening, false), &mut tight).line();
                 assert_eq!(
@@ -936,7 +936,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         };
         {
             let label = "refuse";
-            let want = want;
+
             let before = count(p);
             let value = pump(p, token, Op::Refuse(&bytes), &mut tight).line();
             assert_eq!(
@@ -958,7 +958,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         };
         {
             let label = "timer";
-            let want = want;
+
             let before = count(p);
             let value = pump(p, token, Op::Timer, &mut tight).line();
             assert_eq!(count(p) - before, 1, "{label} crossings");
@@ -1160,7 +1160,7 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
         let want = Expected::Exact(yielded_line(&[], &[], &detached, YIELD_ENDED, false));
         {
             let label = "detach";
-            let want = want;
+
             let before = count(p);
             let value = pump(p, token, Op::Detach, &mut tight).line();
             assert_eq!(
@@ -1212,7 +1212,7 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     let want = Expected::Exact(yielded_line(&wire, &frames, &[], 0, true));
     let adopted = {
         let label = "adopt";
-        let want = want;
+
         let before = count(p);
         let value = {
             let y = pump(p, 0, Op::Adopt(&left), &mut tight);
