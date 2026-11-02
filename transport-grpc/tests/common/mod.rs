@@ -914,6 +914,21 @@ impl Host {
         (r, text(head.error))
     }
 
+    /// A `timer` call on this framing that another thread may make while this host is inside an
+    /// op: it states a sink of no room, and answers its outcome and its text.
+    pub fn crossing_timer(&self) -> impl Fn() -> (Outcome, String) + Send + 'static {
+        let (inst, framing, timer) = (self.inst as usize, self.framing, self.ops.timer);
+        move || {
+            let mut i: FramingIn = z();
+            i.framing = framing;
+            let mut o: FramerOut = z();
+            let r = call(timer, inst as *mut c_void, &mut i, &mut o, slot::TIMER);
+            // SAFETY: every `out` leads with an `OutHead`.
+            let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+            (r, text(head.error))
+        }
+    }
+
     pub fn close(self) {
         let mut i: InHead = z();
         let mut o: OutHead = z();
