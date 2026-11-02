@@ -959,7 +959,12 @@ impl Host {
             let mut i: FramingIn = z();
             i.framing = framing;
             let mut o: FramerOut = z();
-            let r = call(timer, inst as *mut c_void, &mut i, &mut o, slot::TIMER);
+            // SAFETY: TIMER takes these concrete FramingIn/FramerOut frames. Their zero-room
+            // sink has no nested loans, and both frames live exclusively on this calling thread
+            // until the synchronous crossing returns. The sole caller keeps this Host's open
+            // instance live and joins the timer thread before Host::close; linked tables are
+            // static and dropped() retains the actual library for the process lifetime.
+            let r = unsafe { call(timer, inst as *mut c_void, &mut i, &mut o, slot::TIMER) };
             // SAFETY: every `out` leads with an `OutHead`.
             let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
             (r, text(head.error))
