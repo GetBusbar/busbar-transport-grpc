@@ -599,6 +599,69 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
     }
 }
 
+/// AN EARLY ANSWER RESETS THE REQUEST STILL BEING SENT: a far end that answers a bare HTTP status
+/// (or trailers-only) before the host has finished its request sends no RST_STREAM, so the dialler
+/// must reset the stream itself rather than hold the request body, the send half and the
+/// concurrency slot until the connection closes.
+#[test]
+fn an_early_answer_resets_the_request_still_being_sent() {
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    // A head stating 1000 bytes of messages, and one message of them: the request is not whole.
+    let mut bytes = msg::render_head(&[("path", b"/pkg.Svc/Get")], Some(1000)).expect("a head");
+    bytes.extend_from_slice(&msg::frame(b"k"));
+    d.emit(1, &bytes, false, 0, now).expect("emit");
+    // The client connection preface (24 bytes) leads the wire, ahead of its frames.
+    const PREFACE: usize = 24;
+    let mut sent: Vec<u8> = Vec::new();
+    let turn = |d: &mut Conn, sent: &mut Vec<u8>| {
+        for _ in 0..20 {
+            d.drive(now);
+            sent.extend(d.take_wire(usize::MAX));
+            d.pieces().clear();
+        }
+    };
+    turn(&mut d, &mut sent);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d, &mut sent);
+    assert!(
+        !frame_types(&sent[PREFACE..]).contains(&3),
+        "no RST_STREAM while the call is open"
+    );
+    // The far end answers a bare 503 ending the stream, without resetting ours.
+    d.ingest(&h2(1, 0x05, 1, &[0x08, 3, b'5', b'0', b'3']), false);
+    turn(&mut d, &mut sent);
+    assert!(
+        frame_types(&sent[PREFACE..]).contains(&3),
+        "the unfinished request is reset: {:?}",
+        frame_types(&sent[PREFACE..])
+    );
+}
+
+/// A DIALLED CALL THE FRAMER CANNOT BUILD IS THE CALLER'S FAULT, NOT THE FAR END'S: a head stating
+/// a non-gRPC content type builds no request, nothing was sent, and the far end's breaker must not
+/// be charged a transient fault for it.
+#[test]
+fn a_dialled_call_that_cannot_be_built_is_the_callers_fault() {
+    use busbar_contract::abi::transport::FAULT_CALLER;
+    let now = 5 * SEC;
+    let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
+    d.emit(
+        1,
+        &call("/pkg.Svc/Get", &[("content-type", b"text/plain")], &[b"k"]),
+        true,
+        0,
+        now,
+    )
+    .expect("emit");
+    let got: Vec<Piece> = d.pieces().drain(..).collect();
+    let t = terminal(&got, 1).expect("the stream fails");
+    assert!(t.failed, "{t:?}");
+    assert_eq!(t.fault, Some(FAULT_CALLER), "{t:?}");
+}
+
 /// The calls an accepted connection still holds.
 fn held(c: &Conn) -> usize {
     match &c.side {
@@ -1810,6 +1873,42 @@ fn an_accepted_call_that_is_not_grpc_is_answered_415_and_never_handed_up() {
     assert_eq!(t.status, Some(msg::UNKNOWN), "415 maps to UNKNOWN");
     let end = last(&p.got_d, 1).expect("terminal");
     assert_eq!(end.bytes.as_ref(), b"HTTP status 415");
+}
+
+/// A REFUSED ARRIVAL IS REMEMBERED AS ENDED: a call answered 415 here (or `UNIMPLEMENTED` for an
+/// encoding) used an id and is never handed up, so it must enter the ended set, or every accepted
+/// id after it stands as a run of its own and the set grows without bound on a long connection.
+#[test]
+fn a_refused_arrival_is_remembered_as_ended() {
+    let mut p = Pair::new();
+    for id in [1u64, 2] {
+        let super::Side::Dial(d) = &mut p.d.side else {
+            panic!("a dialled connection");
+        };
+        let timer = p.d.io.timer();
+        let mut s = super::DialStream::new(timer.sleep_until_ns(p.now + 60 * SEC));
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://peer.test:50051/pkg.Svc/Say")
+            .version(http::Version::HTTP_2)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(s.chan.body())
+            .expect("a request");
+        s.chan.end();
+        s.stage = super::DStage::Queued(req);
+        d.calls.push((id, s));
+        p.settle();
+    }
+    assert!(of(&p.got_a, 1).is_empty(), "never handed up: {:?}", p.got_a);
+    let super::Side::Accept(a) = &p.a.side else {
+        panic!("an accepted connection");
+    };
+    assert_eq!(a.calls.len(), 0);
+    assert!(
+        a.ended.contains(1) && a.ended.contains(2),
+        "both refused arrivals are ended: {:?}",
+        a.ended.0
+    );
 }
 
 /// A DIALLED HEAD'S CONTENT TYPE MUST BE gRPC'S, and the fields this layer owns never go upstream

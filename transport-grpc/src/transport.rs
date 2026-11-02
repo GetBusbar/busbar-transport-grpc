@@ -59,6 +59,7 @@ use std::time::Duration;
 
 use crate::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
 use busbar_contract::abi::transport::fields::hop_by_hop;
+use busbar_contract::abi::transport::FAULT_CALLER;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body::{Body, Frame};
@@ -493,8 +494,10 @@ impl Conn {
                     // Reset, never ended: the far end must not take a cut request for a whole one.
                     s.chan.reset();
                     s.stage = DStage::Done;
+                    // Nothing was sent: the caller's call was unbuildable, not the far end's fault.
                     self.out.push_back(Piece {
                         status: Some(msg::INTERNAL),
+                        fault: Some(FAULT_CALLER),
                         ..Piece::failure(stream, &why)
                     });
                 } else if s.chan.queued() > bound {
@@ -765,6 +768,11 @@ impl Dial {
         let ended = &mut self.ended;
         self.calls.retain(|(id, s)| {
             if s.over() {
+                // An early answer leaves the request unfinished: reset it, so the connection
+                // sends RST_STREAM rather than hold the send half and the slot open.
+                if !s.chan.ended() {
+                    s.chan.reset();
+                }
                 ended.insert(*id);
             }
             !s.over()
@@ -1365,6 +1373,8 @@ impl Accept {
                 // Not a gRPC call: answered here, never handed up.
                 reply.head(StatusCode::UNSUPPORTED_MEDIA_TYPE, HeaderMap::new());
                 reply.chan.end();
+                // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
+                self.ended.insert(id);
                 continue;
             };
             if let Some(bad) = req
@@ -1393,6 +1403,8 @@ impl Accept {
                 }
                 reply.head(StatusCode::OK, fields);
                 reply.chan.end();
+                // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
+                self.ended.insert(id);
                 continue;
             }
             let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
