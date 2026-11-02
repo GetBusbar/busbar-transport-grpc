@@ -379,3 +379,29 @@ fn a_heads_debug_text_names_fields_and_lengths_only() {
     assert!(text.contains("authorization"), "{text}");
     assert!(text.contains("13"), "the value's length: {text}");
 }
+
+/// `message_text` CUTS ON A CHARACTER'S EDGE: a character that would cross the bound is dropped
+/// whole, a multibyte one never split, an expanded control escape never half-written.
+#[test]
+fn message_text_cuts_on_a_characters_edge() {
+    let with = |n: usize, tail: &[u8]| {
+        let mut v = vec![b'a'; n];
+        v.extend_from_slice(tail);
+        message_text(&v)
+    };
+    // A two-byte character that would cross the bound is dropped whole.
+    let out = with(MESSAGE_TEXT_MAX - 1, "é".as_bytes());
+    assert_eq!(out.len(), MESSAGE_TEXT_MAX - 1);
+    let text = String::from_utf8(out).expect("valid UTF-8");
+    assert!(text.bytes().all(|b| b == b'a'), "no U+FFFD tail");
+    // An ESC expands to `\u{1b}` (6 bytes): it crosses the bound, so none of it is written.
+    let out = with(MESSAGE_TEXT_MAX - 3, &[0x1b]);
+    assert_eq!(out, vec![b'a'; MESSAGE_TEXT_MAX - 3]);
+    // A bound already met by ASCII drops the next character whole.
+    let out = with(MESSAGE_TEXT_MAX, "é".as_bytes());
+    assert_eq!(out, vec![b'a'; MESSAGE_TEXT_MAX]);
+    // A character that fits exactly stays.
+    let out = with(MESSAGE_TEXT_MAX - 2, "é".as_bytes());
+    assert_eq!(out.len(), MESSAGE_TEXT_MAX);
+    assert!(out.ends_with("é".as_bytes()));
+}
