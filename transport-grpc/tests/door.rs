@@ -873,6 +873,13 @@ fn refresh_reads_its_settings_as_validate_does_and_applies_them() {
                     .to_owned()
             )
         );
+        // The refused blobs applied nothing: the default ceiling still takes a 17-byte message.
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        assert_ne!(
+            host.feed(&lpm(&[7u8; 17]), false),
+            Outcome::Failed,
+            "a refused refresh left the settings in force"
+        );
         assert_eq!(
             host.refresh(r#"{"limits.request_body_max_bytes":16}"#),
             (Outcome::Ready, String::new())
