@@ -23,9 +23,11 @@
 //!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in tonic
 //!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
-//!   mapped ([`msg::status_of_refusal`]); a body whose message was over the ceiling closes
-//!   `RESOURCE_EXHAUSTED` in this framer's words, naming the configured limit, whatever the
-//!   refusal; before any message went out the block is the whole answer (trailers-only:
+//!   mapped ([`msg::status_of_refusal`]); a body the framer refused closes in this framer's words,
+//!   whatever the refusal (and whatever close `finish` states): a message over the ceiling
+//!   `RESOURCE_EXHAUSTED`, naming the configured limit; a compression the door does not take
+//!   `UNIMPLEMENTED`; a message flagged compressed with none agreed, or a body that ended inside a
+//!   message, `INTERNAL`; before any message went out the block is the whole answer (trailers-only:
 //!   `:status: 200`, `content-type`, then the status lines).
 //!
 //! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
@@ -54,10 +56,12 @@ pub struct StreamCall {
     /// A reply message went out: a close is trailers, not the whole answer.
     answered: bool,
     closed: bool,
-    /// The body was refused for what it is (a message over the ceiling, a compression the door
-    /// does not take): the call closes with its status and words for it (`RESOURCE_EXHAUSTED`,
-    /// `UNIMPLEMENTED`), whatever refusal the host then closes it with.
-    oversize: Option<msg::Bad>,
+    /// The body was refused for what it is: the call closes with this status and these words,
+    /// whatever refusal the host then closes it with. `TooLarge` (a message over the ceiling)
+    /// closes `RESOURCE_EXHAUSTED`, `Encoding` (a compression the door does not take)
+    /// `UNIMPLEMENTED`, `Compressed` (a message flagged compressed, none agreed) and `Truncated`
+    /// (the body ended inside a message) `INTERNAL`.
+    refused: Option<msg::Bad>,
     /// The reply was cut ([`StreamCall::cut_reply`]), for these words.
     cut: Option<String>,
     /// An `emit` was answered `YIELD_STREAM_FULL`, and no writable piece has followed yet.
@@ -100,7 +104,7 @@ impl StreamCall {
             out: VecDeque::new(),
             answered: false,
             closed: false,
-            oversize: refused,
+            refused,
             cut: None,
             announced: false,
         })
@@ -113,12 +117,12 @@ impl StreamCall {
     /// A message is compressed or over the ceiling, or the body ended inside one.
     pub fn ingest(&mut self, bytes: &[u8], end: bool) -> Result<(), Failure> {
         let bad = |e: msg::Bad| Failure(e.to_string());
-        if let Some(e @ msg::Bad::Encoding(_)) = &self.oversize {
+        if let Some(e @ msg::Bad::Encoding(_)) = &self.refused {
             return Err(bad(e.clone()));
         }
         // Every refusal the framer states is the call's own close, as on the connection side.
         let got = self.messages.push(bytes).inspect_err(|e| {
-            self.oversize = Some(e.clone());
+            self.refused = Some(e.clone());
         });
         for m in got.map_err(bad)? {
             self.out.push_back(Piece::data(STREAM, m.slice(PREFIX..)));
@@ -127,7 +131,7 @@ impl StreamCall {
             self.messages
                 .end()
                 .inspect_err(|e| {
-                    self.oversize = Some(e.clone());
+                    self.refused = Some(e.clone());
                 })
                 .map_err(bad)?;
         }
@@ -203,7 +207,7 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        let lines = if let Some(e) = &self.oversize {
+        let lines = if let Some(e) = &self.refused {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else if let Some(why) = &self.cut {
             cut_lines(why)?
@@ -260,7 +264,7 @@ impl StreamCall {
         // Rendered first, closed after: a final status that cannot be written leaves the call
         // open, so the host's fallback refusal can still close it with a `grpc-status`.
         // A call whose body the framer refused closes with the framer's status, as `refuse` does.
-        let lines = if let Some(e) = &self.oversize {
+        let lines = if let Some(e) = &self.refused {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else {
             match &self.cut {
