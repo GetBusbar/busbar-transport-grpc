@@ -22,7 +22,7 @@ use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::guest_policy::{
     self, GuestLine, Open, EXT_GUEST_OPEN, EXT_GUEST_POLICY,
 };
-use busbar_contract::abi::transport::route::{METHOD_POST, PATH_EXACT};
+use busbar_contract::abi::transport::route::{METHOD_GET, METHOD_POST, PATH_EXACT};
 use busbar_contract::abi::transport::{
     slot, BeginIn, FramePiece, FramerOut, FramerSink, HeadSlots, IngestIn, Ops, CANCEL_PARTIAL,
     PIECE_FIELDS, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_ACCEPT_STREAM, YIELD_MORE,
@@ -125,6 +125,10 @@ fn blob(bytes: &[u8]) -> Blob {
 }
 
 fn policy(generation: u64, line: u32, path: &str) -> Vec<u8> {
+    policy_for_methods(generation, line, path, METHOD_POST)
+}
+
+fn policy_for_methods(generation: u64, line: u32, path: &str, methods: u32) -> Vec<u8> {
     let line = GuestLine {
         line,
         points: 0,
@@ -133,7 +137,7 @@ fn policy(generation: u64, line: u32, path: &str) -> Vec<u8> {
             mac: generation,
         },
         body_limit: 0,
-        methods: METHOD_POST,
+        methods,
         path_form: PATH_EXACT,
         path: path.into(),
         fields: Vec::new(),
@@ -607,26 +611,97 @@ fn a_host_stopped_hand_in_preserves_its_refusal_and_publishes_no_request() {
 
 #[test]
 fn the_actual_http_method_must_match_before_a_none_line_is_handed_in() {
-    let mut host = Host::new();
-    host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
-    let mut call = request(1, "/first", &[], true);
-    call[9] = 0x82;
-    let mut bytes = opening();
-    bytes.extend(call);
-    let (_, original) = host.until_open(&bytes, ticket(2));
-    let refused = host.ingest(&original, &policy(2, 22, "/first"), ticket(2));
-    assert_eq!(refused.outcome, Outcome::Ready);
-    assert!(refused
-        .pieces
-        .iter()
-        .all(|(piece, _)| piece.flags & PIECE_FIELDS == 0));
-    HANDED.with(|seen| assert!(seen.borrow().is_empty()));
-    REFUSED.with(|seen| {
+    let (dropped, _library) = common::dropped();
+    for ops in [linked(), dropped] {
+        let mut host = Host::on(ops);
+        host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+        let call = request(1, "/first", &[], true);
+        let mut bytes = opening();
+        bytes.extend(call);
+        let (_, original) = host.until_open(&bytes, ticket(2));
+        let refused = host.ingest(
+            &original,
+            &policy_for_methods(2, 22, "/first", METHOD_GET),
+            ticket(2),
+        );
+        assert_eq!(refused.outcome, Outcome::Ready);
+        assert!(refused
+            .pieces
+            .iter()
+            .all(|(piece, _)| piece.flags & PIECE_FIELDS == 0));
+        HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+        REFUSED.with(|seen| {
+            assert_eq!(
+                seen.borrow().as_slice(),
+                &[(REFUSE_METHOD_MISS, 22, UnitRef::NONE)]
+            )
+        });
+    }
+}
+
+#[test]
+fn an_invalid_get_is_refused_before_requesting_policy_or_handing_in_a_none_line() {
+    let (dropped, _library) = common::dropped();
+    for ops in [linked(), dropped] {
+        let mut host = Host::on(ops);
         assert_eq!(
-            seen.borrow().as_slice(),
-            &[(REFUSE_METHOD_MISS, 22, UnitRef::NONE)]
-        )
-    });
+            host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial")).outcome,
+            Outcome::Ready
+        );
+        let mut call = request(1, "/first", &[], true);
+        assert_eq!(
+            call[9], 0x83,
+            "the encoded request starts with :method POST"
+        );
+        call[9] = 0x82;
+        let mut bytes = opening();
+        bytes.extend(call);
+        let mut answer = host.ingest(&bytes, &[], ticket(2));
+        let mut wire = Vec::new();
+        let mut terminal = false;
+        for _ in 0..100 {
+            assert_eq!(answer.outcome, Outcome::Ready);
+            assert!(
+                answer.open.is_none(),
+                "an invalid gRPC method never requests a policy loan"
+            );
+            assert!(
+                answer.pieces.is_empty(),
+                "no request head or body crosses the admission boundary"
+            );
+            HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+            REFUSED.with(|seen| {
+                assert!(
+                    seen.borrow().is_empty(),
+                    "protocol refusal precedes any host none-line decision"
+                )
+            });
+            wire.extend_from_slice(&answer.wire);
+            let mut at = 0;
+            while at + 9 <= wire.len() {
+                let length = (usize::from(wire[at]) << 16)
+                    | (usize::from(wire[at + 1]) << 8)
+                    | usize::from(wire[at + 2]);
+                if at + 9 + length > wire.len() {
+                    break;
+                }
+                let stream =
+                    u32::from_be_bytes(wire[at + 5..at + 9].try_into().unwrap()) & 0x7fff_ffff;
+                if stream == 1 && matches!(wire[at + 3], 0 | 1) && wire[at + 4] & 1 != 0 {
+                    terminal = true;
+                }
+                at += 9 + length;
+            }
+            if terminal {
+                break;
+            }
+            answer = host.ingest(&[], &[], ticket(2));
+        }
+        assert!(
+            terminal,
+            "the actual door must send a terminal HTTP/2 refusal on the invalid request's stream"
+        );
+    }
 }
 
 #[test]
