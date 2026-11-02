@@ -2,51 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The engine: gRPC over `hyper`'s HTTP/2, both sides, run as a sans-IO framer.
-//!
-//! One [`Conn`] is one connection. Its HTTP/2 machine is `hyper`'s own — `client::conn::http2`
-//! on a dialled connection, `server::conn::http2` on an accepted one — driven over the host's
-//! bytes by the contract's drive (`busbar_contract::hyper_io!`, expanded at the crate root): no
-//! socket, no thread, no runtime, no clock of its own. This file adds the gRPC layer on top: the
-//! head block, the length-prefixed messages, the deadline and `grpc-status`.
-//!
-//! DIALLED. The host `emit`s a stream's head block and its messages; the head's `path` names the
-//! method. The request carries `content-type: application/grpc` (or the caller's `+proto`/`+json`
-//! form) and `te: trailers`. These are the framer's own head lines, stated at `locate`
-//! (`LocateIn::defaults_buf`) so the host puts them in the head BEFORE the auth signs it (nothing
-//! is added to the head after the auth has run): the head's own `content-type` goes out as it was
-//! signed, and only a head that states none has one written here. NO `grpc-timeout` goes upstream:
-//! one the head carries is dropped, and the attempt's deadline is held here. The request's body
-//! ENDS (END_STREAM) once the head's `content-length` bytes are in, or on an `emit` that ends the
-//! frame: a unary server waits for exactly that. The answer comes back as frames: the HEAD, always first, a field block with no status code; one frame per message; the
-//! TRAILERS, a field block carrying `grpc-status` as its code; then the terminal piece, empty when
-//! the status is `OK`, else a failure whose bytes are the decoded `grpc-message`. A trailers-only
-//! answer (status in the head) yields the same three. An answer that states a `grpc-status` is read
-//! by it, whatever its HTTP status or content type; one that states none and is not gRPC fails
-//! the stream with its HTTP status mapped the way gRPC maps it. A stream reset or a connection gone away
-//! (either end's) fails with the status its HTTP/2 error code stands for, before or after the
-//! answer's head alike ([`msg::status_of_reset`]); a connection lost before any status is
-//! `UNAVAILABLE`; an answer that ends with no trailers is `INTERNAL`. At the deadline the stream is
-//! reset and fails `DEADLINE_EXCEEDED`.
-//!
-//! ACCEPTED. Each call the far end opens is a stream: its head (a field block, with the call's
-//! method, target and authority in the stream's head slots, never as fields), one frame per
-//! message, and the end piece (`PIECE_END`) when the far end has sent its last. A `grpc-timeout`
-//! the caller states is one of the head's fields, a fact for the plane: this side enforces no
-//! deadline and never fails a call `DEADLINE_EXCEEDED`. `te` is
-//! checked by HTTP/2 itself: a `te` other than `trailers` resets the stream with
-//! `PROTOCOL_ERROR` before it is a call, and a missing one is served; it is then dropped as
-//! hop-by-hop. The host answers on the same stream: `emit` a head block (the answer's metadata) and
-//! messages; `refuse` with the trailer block (`grpc-status`, `grpc-message`, ...) ends the call —
-//! trailers-only when nothing was emitted first. A call that is not gRPC is answered `415` here and
-//! never reaches the host; nor does one whose `grpc-encoding` names a compression this door does
-//! not take, answered here trailers-only `UNIMPLEMENTED` with `grpc-accept-encoding: identity`
-//! (gRPC's compression rules, `compression.md`).
-//!
-//! A STREAM ENDS ONCE. A far end that resets an accepted call (before or after its last message,
-//! before or after the host's answer began) fails the stream `CANCELLED`, and nothing more is
-//! queued for it. A stream that ended, dialled or accepted, is remembered: an `emit` (or, accepted,
-//! a refusal) that arrives after its terminal piece is dropped, never a second call on the same
-//! stream and never a failure of its own.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -78,10 +33,7 @@ use hyper::server::conn::http2 as server;
 use crate::msg::{self, Head, Messages};
 
 /// A head block the host emitted, held until it is whole: wiped when it drops, since a dialled
-/// head carries the auth's credential lines (TSEAL: until the attach slot is sealed, credentials
-/// reach the framer as plaintext, and the framer wipes the copies it owns). The copies `hyper` and
-/// `http` make of the fields it sends (a `HeaderMap`, HPACK's table) are the libraries' and are not
-/// wiped here; nor is an earlier allocation a growing buffer moved out of.
+
 type HeadBuf = zeroize::Zeroizing<Vec<u8>>;
 
 /// The connection posture every framing carries.
@@ -148,17 +100,15 @@ struct ChanState {
 }
 
 /// A STREAM'S OWN BACKPRESSURE (the transport ABI): the payload bytes one stream may queue for
-/// the far end, framer-side, before the `emit` that reaches it is answered `YIELD_STREAM_FULL`.
+
 pub(crate) const STREAM_HIGH_WATER: usize = 1 << 20;
 
 /// A stream answered full that has drained to this many queued bytes is writable again
-/// (`PIECE_WRITABLE`).
+
 pub(crate) const STREAM_LOW_WATER: usize = 256 * 1024;
 
 /// THE HOST'S OWN BACKPRESSURE, the other way: what a connection holds for the host (pieces handed
-/// up and not yet taken), past which it reads no stream's body until the host takes them. A body
-/// left unread returns no flow-control credit, so HTTP/2 holds the far end back. Each piece counts
-/// [`PIECE_COST`] beside its bytes, so a flood of tiny messages is bounded too.
+
 const INBOUND_HIGH_WATER: usize = STREAM_HIGH_WATER;
 
 /// What one piece held for the host counts beside its bytes ([`INBOUND_HIGH_WATER`]).
@@ -170,17 +120,16 @@ fn held_for_host(out: &VecDeque<Piece>) -> usize {
 }
 
 /// Why a stream whose host emitted past its bound (the high-water mark and one whole message
-/// more) failed: the framer bounds what it holds for a far end that is not reading.
+
 pub(crate) const OVER_BOUND: &str =
     "the stream's queue is past its bound: the far end is not reading";
 
 /// The room a head block may take beside one whole message: an answer's head block is read up to
-/// `max_message_bytes` and this much, and a stream's bound counts it as part of the one message
-/// more it holds past the high-water mark.
+
 pub(crate) const HEAD_ALLOWANCE: usize = 64 * 1024;
 
 /// A STREAM'S BOUND: the payload bytes it may queue for the far end before a host that keeps
-/// emitting has it failed — the high-water mark, and one whole message (with its head block) more.
+
 pub(crate) fn stream_bound(max_message_bytes: usize) -> usize {
     STREAM_HIGH_WATER
         .saturating_add(max_message_bytes)
@@ -226,7 +175,7 @@ impl Chan {
         }
     }
     /// Whether the queue stands at its high-water mark; if so, the host is being told (the
-    /// stream is answered full), and it hears when the queue drains ([`Chan::take_writable`]).
+
     fn announce_full(&self) -> bool {
         let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let full = s.queued >= STREAM_HIGH_WATER;
@@ -282,7 +231,6 @@ impl Body for ChanBody {
     ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let mut s = self.0 .0.lock().unwrap_or_else(PoisonError::into_inner);
         if s.reset {
-            // The connection resets the stream on a body's error.
             return Poll::Ready(Some(Err(std::io::Error::other("the stream was failed"))));
         }
         if let Some(f) = s.frames.pop_front() {
@@ -305,7 +253,7 @@ impl Body for ChanBody {
 
 impl Drop for ChanBody {
     /// The connection drops a body it read to its end, or one whose stream the far end reset; the
-    /// second is the one the host has to hear about.
+
     fn drop(&mut self) {
         self.0.let_go();
     }
@@ -335,8 +283,7 @@ impl<F: Future<Output = ()> + Send + 'static> Executor<F> for Spawner {
                 list.tasks.push(Box::pin(future));
                 list.waker.clone()
             };
-            // A handshake may spawn after this round's task pass. Schedule another round so a
-            // new connection cannot wait for unrelated carrier input before its first poll.
+
             if let Some(wake) = wake {
                 wake.wake_by_ref();
             }
@@ -382,7 +329,6 @@ pub struct Conn {
     posture: Posture,
     side: Side,
     /// The last drive left a body unread because the host had not taken what it was handed
-    /// ([`INBOUND_HIGH_WATER`]): the host is owed a re-call once it has.
     held_back: bool,
     /// Drives so far: each reads the streams from one further on ([`Room::first`]).
     turn: usize,
@@ -398,9 +344,7 @@ impl Owed for Conn {
         self.io.take_wire(cap)
     }
     /// Wire bytes still owed, or a body the last drive left unread for the host's sake: either way
-    /// the host calls again (`YIELD_MORE`), and the re-call reads on once it has taken its pieces.
-    /// A failed connection owes no re-call: the op answers its failure once the host has taken
-    /// what it was handed.
+
     fn wire_pending(&self) -> bool {
         self.failed.is_none() && (self.io.wire_pending() || self.held_back)
     }
@@ -434,18 +378,13 @@ fn watch<F>(
 
 impl Conn {
     /// Open a dialled connection to `target` (an `http`/`https` URL: its scheme and authority are
-    /// every call's), at host time `now_ns`.
-    ///
-    /// # Errors
-    ///
-    /// `target` is not a URL with a host.
+
     pub fn dial(target: &str, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let uri: http::Uri = target.parse().map_err(|_| Failure("not a target".into()))?;
         let (Some(scheme), Some(authority)) = (uri.scheme(), uri.authority()) else {
             return Err(Failure("not a target".into()));
         };
-        // The authority without its userinfo: a credential never goes out as `:authority` (RFC
-        // 9113 §8.3.1), and the authority is the one `locate` stated.
+
         let authority = authority
             .as_str()
             .rsplit_once('@')
@@ -603,11 +542,7 @@ impl Conn {
     }
 
     /// Bytes for `stream` (`end` = they end the frame). `deadline_ns` is the attempt's deadline on
-    /// a dialled stream's first `emit` (`0` = none stated), `now_ns` the host's time.
-    ///
-    /// # Errors
-    ///
-    /// No such accepted stream.
+
     pub fn emit(
         &mut self,
         stream: u64,
@@ -641,20 +576,15 @@ impl Conn {
         now_ns: u64,
         sensitive: Option<SensitiveFields>,
     ) -> Result<(), Failure> {
-        // A re-call after `YIELD_MORE` carries no new bytes, and the frame's end was taken with
-        // the bytes: every step below is idempotent on it.
         let max = self
             .posture
             .max_message_bytes
             .saturating_add(HEAD_ALLOWANCE);
-        // A host that keeps emitting past the high-water mark (one whole message more) has the
-        // stream failed: the framer bounds what it holds for a far end that is not reading.
+
         let bound = stream_bound(self.posture.max_message_bytes);
         match &mut self.side {
             Side::Dial(d) => {
                 if d.ended.contains(stream) {
-                    // LATE: the stream already ended (an early answer, a failure, its deadline).
-                    // Its terminal piece is out; these bytes have nowhere to go.
                     return Ok(());
                 }
                 let timer = self.io.timer();
@@ -686,7 +616,6 @@ impl Conn {
                     s.take(&d.base, bytes, end, max)
                 };
                 if let Err(why) = read {
-                    // Reset, never ended: the far end must not take a cut request for a whole one.
                     s.chan.reset();
                     s.stage = DStage::Done;
                     self.out.push_back(Piece {
@@ -694,7 +623,6 @@ impl Conn {
                         ..Piece::failure(stream, &why)
                     });
                 } else if s.chan.queued() > bound {
-                    // Reset, never ended: the far end must not take the cut upload for a whole one.
                     s.chan.reset();
                     s.stage = DStage::Done;
                     self.out.push_back(Piece {
@@ -722,8 +650,7 @@ impl Conn {
                         Ok(None) => return Ok(()),
                         Err(why) => {
                             s.fail_reply(msg::INTERNAL, why.as_bytes());
-                            // The stream ends once, and the host learns it, as the over-bound
-                            // branch below tells it.
+
                             self.out.push_back(Piece {
                                 status: Some(msg::INTERNAL),
                                 ..Piece::failure(stream, &why)
@@ -731,11 +658,8 @@ impl Conn {
                             return Ok(());
                         }
                         Ok(Some((head, took))) => {
-                            // The head block's bytes are wiped as the buffer drops; the message
-                            // bytes after it go on.
                             let rest = std::mem::take(&mut s.head_buf)[took..].to_vec();
                             if let Err(why) = s.send_head(&head, None) {
-                                // Failed as a malformed head block is, above.
                                 s.fail_reply(msg::INTERNAL, why.as_bytes());
                                 self.out.push_back(Piece {
                                     status: Some(msg::INTERNAL),
@@ -768,8 +692,7 @@ impl Conn {
     }
 
     /// Whether `stream`'s queue stands at its high-water mark after an `emit`: the answer is then
-    /// `YIELD_STREAM_FULL`, and the stream hands a writable piece once it drains to its low-water
-    /// mark (the transport ABI's "A STREAM'S OWN BACKPRESSURE").
+
     #[must_use]
     pub fn announce_full(&self, stream: u64) -> bool {
         match &self.side {
@@ -787,14 +710,7 @@ impl Conn {
     }
 
     /// End accepted `stream` with `trailers` (a block of `name: value` lines). A block that does
-    /// not state `grpc-status` ends the call with the refusal's neutral `status` mapped
-    /// ([`msg::status_of_refusal`], with [`msg::refusal_message`]); with no status stated either
-    /// (`0`), `UNKNOWN` with the bytes as its message.
-    ///
-    /// # Errors
-    ///
-    /// This is a dialled connection, no such stream, or a trailer field the wire cannot carry (the
-    /// call is then left open for the host's fallback close).
+
     pub fn end_call(&mut self, stream: u64, trailers: &[u8], status: u32) -> Result<(), Failure> {
         let Side::Accept(a) = &mut self.side else {
             return Err(Failure("a dialled call is not answered".into()));
@@ -805,8 +721,7 @@ impl Conn {
         if s.reply_over {
             return Ok(());
         }
-        // A block that names `grpc-status` and cannot be read, or a trailer the wire cannot carry,
-        // fails the refusal, and the call stays open for the host's fallback close.
+
         match msg::refusal_block(trailers).map_err(Failure)? {
             Some(h) => s.finish(&h).map_err(Failure)?,
             None if status != 0 => s.fail_reply(
@@ -888,7 +803,7 @@ impl Room {
     }
 
     /// The order a round reads `n` streams in: from [`Room::first`] round, so that while the host is
-    /// the bottleneck no stream fills the room ahead of the others on every drive.
+
     fn order(&self, n: usize) -> impl Iterator<Item = usize> {
         let first = if n == 0 { 0 } else { self.first % n };
         (0..n).map(move |k| (first + k) % n)
@@ -913,7 +828,6 @@ struct Dial {
     base: String,
     calls: Vec<(u64, DialStream)>,
     /// Streams that have ended (their terminal piece is out). An `emit` on one is late and is
-    /// dropped: it never opens a second call under the same stream.
     ended: Ended,
 }
 
@@ -1018,8 +932,7 @@ impl DialStream {
                     }
                     return Ok(());
                 };
-                // The head block's bytes (an auth's credential lines among them) are wiped as the
-                // buffer drops; the message bytes after it go on.
+
                 let rest = std::mem::take(buf)[took..].to_vec();
                 let req = self.request(base, &head)?;
                 self.left = head.content_length;
@@ -1046,7 +959,6 @@ impl DialStream {
             }
         }
         if self.left == Some(0) || (end && self.left.is_none()) {
-            // The request's last byte: END_STREAM follows it.
             self.chan.end();
         }
         Ok(())
@@ -1072,8 +984,7 @@ impl DialStream {
             .version(http::Version::HTTP_2)
             .header(http::header::CONTENT_TYPE, content_type)
             .header(http::header::TE, "trailers");
-        // NO `grpc-timeout` goes upstream: the attempt's deadline is held here (the stream's
-        // timer), and one a head carries is dropped (`RESERVED_ON_REQUEST`).
+
         for (name, value) in &head.fields {
             if RESERVED_ON_REQUEST.contains(&name.as_str()) || hop_by_hop(name, []) {
                 continue;
@@ -1091,7 +1002,7 @@ impl DialStream {
 }
 
 /// Fields this layer owns on a request, beside the hop-by-hop ones HTTP/2 forbids: a head block's
-/// own are dropped.
+
 const RESERVED_ON_REQUEST: &[&str] = &[
     "path",
     "method",
@@ -1122,10 +1033,7 @@ impl Dial {
                 if conn {
                     return Err(Failure(why));
                 }
-                // A STREAM FAILED IS RESET ON THE WIRE, before its answer's head or after it: the
-                // request body is failed, so the connection resets the stream (RST_STREAM) rather
-                // than leave the far end's call open. Dropping the answer alone resets nothing
-                // while the request's body is still being piped.
+
                 s.chan.reset();
                 s.stage = DStage::Done;
                 out.push_back(Piece {
@@ -1142,7 +1050,7 @@ impl Dial {
 }
 
 /// Move one dialled stream as far as it goes this round. `Err((why, code, true))` is the
-/// connection's failure (the sender refused), `Err((why, code, false))` the stream's own.
+
 fn advance(
     id: u64,
     s: &mut DialStream,
@@ -1153,7 +1061,6 @@ fn advance(
     cx: &mut Context<'_>,
 ) -> Result<(), (String, u16, bool)> {
     if !s.over() && s.sleep.as_mut().poll(cx).is_ready() {
-        // The caller resets the stream on the wire ([`Dial::step`]).
         return Err(("deadline exceeded".into(), msg::DEADLINE_EXCEEDED, false));
     }
     loop {
@@ -1175,23 +1082,13 @@ fn advance(
             DStage::Asked(f) => match f.as_mut().poll(cx) {
                 Poll::Pending => return Ok(()),
                 Poll::Ready(r) => {
-                    // A reset or a GOAWAY is read by its code; any other loss is the
-                    // connection's, and UNAVAILABLE ([`wire_failure`]).
                     let r = r.map_err(|e| {
                         let (code, why) = wire_failure(&e);
                         (why, code, false)
                     })?;
-                    // A `grpc-status` the answer states is its status, whatever its HTTP status
-                    // or content type (`http-grpc-status-mapping.md`: "If grpc-status was
-                    // provided, it must be used"); the HTTP table reads only an answer without one.
+
                     let stated = r.headers().contains_key(msg::GRPC_STATUS);
                     if !stated && r.status() != StatusCode::OK {
-                        // A BARE HTTP STATUS IS AN ANSWER: a member (or a proxy or auth wall in
-                        // front of it) answered the call without gRPC. Its status is the gRPC
-                        // status that HTTP status stands for (`http-grpc-status-mapping.md`),
-                        // handed up as a trailers-only answer is: the head, then the status
-                        // block and its text. A failed stream would read as no answer at all,
-                        // and a member refusing its credential would never trip hard.
                         let code = r.status().as_u16();
                         out.push_back(Piece::fields(
                             id,
@@ -1207,8 +1104,7 @@ fn advance(
                             HeaderValue::from_str(&format!("HTTP status {code}"))
                                 .expect("digits and spaces are a field value"),
                         );
-                        // Its fault is the HTTP status's own reading, not the
-                        // mapped code's: a bare 400 maps to INTERNAL but is the caller's.
+
                         let [block, text] = trailers(id, &HeaderMap::new(), &status);
                         out.push_back(Piece {
                             fault: Some(crate::meta::fault_of_http(code)),
@@ -1234,8 +1130,7 @@ fn advance(
                                 false,
                             ));
                         }
-                        // Trailers-only: the status is in the head, and the body is empty. Its
-                        // fault is the gRPC status's own reading, as any trailers' is.
+
                         out.extend(trailers(id, &HeaderMap::new(), r.headers()));
                         s.stage = DStage::Done;
                         return Ok(());
@@ -1268,11 +1163,7 @@ fn advance(
                         }
                     }
                 },
-                // The answer's body ended with no trailers (a far end's END_STREAM on its data, or
-                // its RST_STREAM `NO_ERROR`, which `hyper` reads as the body's end): no status
-                // came, and the far end's stream is not whole. `INTERNAL` (PROTOCOL-HTTP2.md: a
-                // stream that ends without trailers is a protocol error), cut inside a message
-                // or between two.
+
                 Poll::Ready(None) => {
                     let why = if msgs.end().is_err() {
                         "the answer ended inside a message, with no grpc-status"
@@ -1287,12 +1178,7 @@ fn advance(
 }
 
 /// A DIALLED STREAM'S FAILURE BELOW gRPC, as the status it stands for and this framer's own text
-/// for it. A reset or a GOAWAY, either end's (`hyper` hands up `h2`'s error as its source), is read
-/// by its HTTP/2 error code ([`msg::status_of_reset`]), before or after the answer's head alike,
-/// except the far end's graceful GOAWAY (`NO_ERROR`), which refuses only streams it never
-/// processed: `UNAVAILABLE`, safe to retry.
-/// Anything else (the connection lost, an I/O error) is the far end become unreachable before any
-/// status came: `UNAVAILABLE`. The codes follow the gRPC over HTTP/2 table.
+
 fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
     let mut at = Some(e);
     while let Some(err) = at {
@@ -1304,9 +1190,7 @@ fn wire_failure(e: &(dyn std::error::Error + 'static)) -> (u16, String) {
                 } else {
                     "the stream was reset"
                 };
-                // A far end's graceful GOAWAY reaches a stream only when it is past the last one
-                // the far end accepted (`h2` fails no other stream with it): nothing was
-                // processed, and the call is safe to retry (PROTOCOL-HTTP2.md, "GOAWAY Frame").
+
                 let status = if h.is_go_away() && h.is_remote() && code == 0 {
                     msg::UNAVAILABLE
                 } else {
@@ -1338,8 +1222,7 @@ fn dial_bad_text(e: &msg::Bad) -> String {
 const STATUS_FIELDS: &[&str] = &[msg::GRPC_STATUS, msg::GRPC_MESSAGE];
 
 /// The stream's end, from the fields that carry `grpc-status` (`status`): the trailers (`fields`
-/// as a field block, its code the status), then the terminal piece — empty on `OK`, else the
-/// failure whose bytes are the decoded `grpc-message`, as printable text ([`msg::message_text`]).
+
 fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
     let code = status
         .get(msg::GRPC_STATUS)
@@ -1424,7 +1307,7 @@ impl Future for ReplyFut {
 
 impl Drop for ReplyFut {
     /// Dropped before the head went out: the far end reset the call while the host was still
-    /// working on it.
+
     fn drop(&mut self) {
         if !self.answered {
             self.reply.chan.let_go();
@@ -1436,7 +1319,6 @@ struct Accept {
     arrivals: Arc<Mutex<Arrivals>>,
     calls: Vec<(u64, AStream)>,
     /// Calls that have ended and been let go of. An `emit` or a refusal on one is late (it raced
-    /// the far end's cancel, or the call's own end) and is dropped, as on a dialled stream.
     ended: Ended,
     policy: Option<AcceptedPolicy>,
     waiting: VecDeque<Unadmitted>,
@@ -1494,10 +1376,7 @@ impl AStream {
     }
 
     /// Send the answer's head: `head`'s fields, and on a trailers-only answer `trailers`'.
-    ///
-    /// # Errors
-    ///
-    /// A field the wire cannot carry ([`answer_fields`]); nothing is sent.
+
     fn send_head(&mut self, head: &Head, trailers: Option<&Head>) -> Result<(), String> {
         let mut fields = HeaderMap::new();
         fields.insert(http::header::CONTENT_TYPE, self.content_type.clone());
@@ -1508,31 +1387,23 @@ impl AStream {
     }
 
     /// End the call with `trailers` (trailers-only before any head).
-    ///
-    /// # Errors
-    ///
-    /// A field the wire cannot carry ([`answer_fields`]); the call is left as it was.
+
     fn finish(&mut self, trailers: &Head) -> Result<(), String> {
         if self.head_sent {
             let mut map = HeaderMap::new();
             answer_fields([trailers], &mut map)?;
             self.reply.chan.push(Frame::trailers(map));
         } else {
-            // Trailers-only: one HEADERS frame carrying the status, and END_STREAM.
             self.send_head(&Head::default(), Some(trailers))?;
         }
         self.reply.chan.end();
         self.reply_over = true;
-        // The call is over: no more of its request is read. Letting go of the body has the
-        // connection stop the far end's upload once the answer is out (RST_STREAM `NO_ERROR`,
-        // RFC 9113 §8.1), and nothing more is queued for the host.
+
         self.body = None;
         Ok(())
     }
 
     fn fail_reply(&mut self, code: u16, why: &[u8]) {
-        // This framer's own fields: a status's digits and a percent-encoded message, each always a
-        // field value.
         let done = self.finish(&Head {
             fields: vec![
                 (msg::GRPC_STATUS.into(), code.to_string().into_bytes()),
@@ -1551,20 +1422,13 @@ impl AStream {
 const RESERVED_ON_ANSWER: &[&str] = &["content-type", "content-length"];
 
 /// Whether an answer field named `name` (lower case) is never the host's to send: one this layer
-/// owns ([`RESERVED_ON_ANSWER`]), or a connection-specific one HTTP/2 forbids in every field block
-/// (RFC 9113 §8.2.2).
+
 pub(crate) fn not_the_hosts(name: &str) -> bool {
     RESERVED_ON_ANSWER.contains(&name) || hop_by_hop(name, [])
 }
 
 /// The answer fields `blocks` state, appended to `map` in order: a head's or the trailers' alike,
-/// those this layer owns ([`RESERVED_ON_ANSWER`]) and the connection-specific ones HTTP/2 forbids in
-/// every field block (RFC 9113 §8.2.2) dropped.
-///
-/// # Errors
-///
-/// A field the wire cannot carry, named in the dial side's words; `map` is then left as it was
-/// found wanting, and the caller must not send it.
+
 fn answer_fields<'h>(
     blocks: impl IntoIterator<Item = &'h Head>,
     map: &mut HeaderMap,
@@ -1669,8 +1533,7 @@ impl Accept {
                     Some(loan),
                     UnitRef::NONE,
                 );
-                // The host owns the refusal's status, fields and body. Frame them as supplied,
-                // without turning its body into a gRPC message or inventing a replacement.
+
                 let mut fields = HeaderMap::new();
                 for (name, value) in refusal.fields {
                     let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
@@ -1740,7 +1603,7 @@ impl Accept {
     }
 
     /// An op on `stream`, which this connection does not hold: dropped when the call ended (A
-    /// STREAM ENDS ONCE), else no such stream.
+
     fn late(&self, stream: u64) -> Result<(), Failure> {
         if self.ended.contains(stream) {
             Ok(())
@@ -1766,7 +1629,6 @@ impl Accept {
         for (id, req, reply) in new {
             let ct = req.headers().get(http::header::CONTENT_TYPE).cloned();
             let Some(_ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
-                // Not a gRPC call: answered here, never handed up.
                 reply.head(StatusCode::UNSUPPORTED_MEDIA_TYPE, HeaderMap::new());
                 reply.chan.end();
                 continue;
@@ -1776,10 +1638,6 @@ impl Accept {
                 .get(msg::GRPC_ENCODING)
                 .and_then(|v| msg::unsupported_encoding(v.as_bytes()))
             {
-                // A compression this door does not take: answered here, trailers-only, before a
-                // message is read, `UNIMPLEMENTED` with the encodings it does take (gRPC's
-                // compression rules, `compression.md`): `content-type`, `grpc-accept-encoding`,
-                // `grpc-status`, `grpc-message`. Never handed up.
                 let mut fields = HeaderMap::new();
                 fields.insert(
                     http::header::CONTENT_TYPE,
@@ -1825,10 +1683,6 @@ impl Accept {
         for at in room.order(self.calls.len()) {
             let (id, s) = &mut self.calls[at];
             if !s.reply_over && s.reply.chan.gone() {
-                // The far end cancelled the call: it reset the stream, and the connection let go
-                // of the answer. Before the far end's last message its body says so too; after it
-                // (a call the far end half-closed, then cancelled) this is the only sign, and the
-                // host must hear it or it keeps answering into a stream nobody reads.
                 s.body = None;
                 s.reply_over = true;
                 s.reply.chan.end();
@@ -1867,7 +1721,6 @@ impl Accept {
                         let whole = msgs.end();
                         s.body = None;
                         match whole {
-                            // The far end sent its last: the stream's end (`PIECE_END`).
                             Ok(()) => out.push_back(Piece::end(*id)),
                             Err(e) => {
                                 let why = e.to_string();
@@ -1880,7 +1733,6 @@ impl Accept {
                         }
                     }
                     Poll::Ready(Some(Err(e))) => {
-                        // The far end reset the call.
                         s.body = None;
                         s.reply_over = true;
                         s.reply.chan.end();

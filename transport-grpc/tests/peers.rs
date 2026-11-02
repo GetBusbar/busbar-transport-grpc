@@ -2,13 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `grpc` DOOR AGAINST REAL tonic PEERS, on real sockets.
-//!
-//! Dialled: tonic's own server (`tonic::transport::Server`) on a TCP listener in the clear (h2c,
-//! HTTP/2 by prior knowledge). Over TLS, the host offers exactly what `locate` answered, and the
-//! same tonic service answers behind hyper's HTTP/2 server. Accepted: tonic's `Channel` dials a
-//! listener the test holds, and the host answers each call through this door.
-//!
-//! The host (`common`) owns the socket and the clock, as the connector does in production.
 
 mod common;
 
@@ -76,13 +69,10 @@ fn a_unary_call_half_closes_and_tonic_answers_it() {
 
 #[test]
 fn a_unary_peer_waits_for_end_stream_and_the_frames_end_is_it() {
-    // tonic's unary handler reads the one message and then waits for the request's end (its
-    // trailers or END_STREAM). A call whose head states no length and whose frame has not ended
-    // leaves the stream open, and tonic does not answer. The bound keeps this test from hanging.
     let rt = runtime();
     let mut host = dialled_h2c(&rt);
     let mut c = b"path: /t.T/Unary\r\n\r\n".to_vec();
-    // (The door's own head block: `path` names the method where no head word states it.)
+
     c.extend_from_slice(&lpm(b"hello"));
     assert_eq!(host.emit(1, &c, false, 0), Outcome::Ready);
     assert_eq!(
@@ -97,7 +87,7 @@ fn a_unary_peer_waits_for_end_stream_and_the_frames_end_is_it() {
         host.terminal(1).is_none(),
         "RED: without END_STREAM tonic's unary peer never answers"
     );
-    // The frame's end is the half-close: END_STREAM goes out, and tonic answers.
+
     assert_eq!(host.emit(1, b"", true, 0), Outcome::Ready);
     assert_eq!(host.pump_until(BOUND, ended(1)), Outcome::Ready);
     println!("PROOF half-closed: terminal {:?}", host.terminal(1));
@@ -192,7 +182,6 @@ fn over_tls_the_offer_is_h2_and_the_agreed_h2_carries_the_call() {
     assert!(loc.secure);
     assert_eq!(ids(&loc.offer), vec![b"h2".to_vec()]);
 
-    // The host's handshake offers exactly the framer's ids.
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .expect("versions")
@@ -232,7 +221,7 @@ fn a_connection_that_agreed_another_protocol_is_refused_at_begin() {
 }
 
 /// A listener the test holds, and tonic's (lazy) `Channel` to it: the channel connects on its
-/// first call.
+
 fn listening(
     rt: &tokio::runtime::Runtime,
 ) -> (
@@ -249,7 +238,7 @@ fn listening(
             let _ = tx.send(tcp);
         }
     });
-    // The lazy channel's connector lives on the runtime.
+
     let _in_rt = rt.enter();
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("endpoint")
@@ -363,7 +352,7 @@ fn tonic_sees_the_status_and_message_the_host_refuses_with() {
     });
     let mut host = accept(&rt, &rx);
     assert_eq!(host.pump_until(BOUND, last_in(1)), Outcome::Ready);
-    // Trailers-only: nothing emitted, the status goes out in the one HEADERS frame.
+
     assert_eq!(
         host.refuse(1, b"grpc-status: 7\r\ngrpc-message: denied%20here\r\n"),
         Outcome::Ready
@@ -398,7 +387,7 @@ fn tonic_sees_a_neutral_refusal_status_as_predevs_grpc_line_answered_it() {
     });
     let mut host = accept(&rt, &rx);
     assert_eq!(host.pump_until(BOUND, last_in(1)), Outcome::Ready);
-    // No grpc-status in the block: the door maps the refusal's neutral status.
+
     assert_eq!(host.refuse_as(1, b"", 401), Outcome::Ready);
     host.pump(QUIET);
     let st = rt

@@ -2,15 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE TEST HOST the `grpc` door's integration tests share, and the tonic peer they talk to.
-//!
-//! The host is what the connector is in production. It holds the socket (bridged from a tokio
-//! runtime of its own: an in-memory duplex, a TCP stream, or TLS over one), the clock (a virtual
-//! monotonic clock moved by hand), and the sink buffers. It calls the framer only through the
-//! transport kind's table, from the test's own thread and outside any runtime.
-//!
-//! The peer is tonic: `TestSvc` routes four methods of service `t.T` through
-//! `tonic::server::Grpc` with a byte-blind codec. The test serves it with tonic's own server, or with
-//! hyper's HTTP/2 server over TLS. On the accepted side, tonic's `Channel` is the client.
 
 #![allow(dead_code, unsafe_code, missing_docs)]
 
@@ -83,15 +74,7 @@ pub fn linked() -> &'static Ops {
 }
 
 /// THE IMAGE WHERE `cargo test` DID NOT BUILD IT, or built it before the code under test: the
-/// dropped-in door is the shipped one, the plugin crate's cdylib (`busbar-transport-grpc-plugin`),
-/// which `cargo test --workspace` builds beside the test binaries; `cargo test -p` this crate, or
-/// the fleet's coverage job (`cargo llvm-cov`, `cargo test --tests`), may not. So the image is built
-/// here, once per test binary, with
-/// the same cargo, manifest and profile, under this run's environment: under `cargo llvm-cov` that
-/// environment carries its instrumentation flags, so the dropped-in door is built under llvm-cov
-/// and its lines are measured like the linked door's. It goes to its own target directory beside
-/// this profile (`<target>/grpc-door-image`), never the one the running `cargo test` owns, so this
-/// build never waits on that cargo's build-directory lock.
+
 fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
     static BUILT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     BUILT
@@ -140,8 +123,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         std::env::consts::DLL_SUFFIX
     );
     let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    // The library the image links, as this run built it: the newest of this crate's rlibs beside
-    // the test binary. An image older than it predates the code under test.
+
     let lib_built = std::fs::read_dir(profile.join("deps"))
         .into_iter()
         .flatten()
@@ -154,8 +136,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         })
         .filter_map(|p| modified(&p))
         .max();
-    // The newest image `cargo test` built, and only if it is as new as the library: a stale one
-    // (`cargo test -p` this crate builds no plugin) is never loaded as the door under test.
+
     let built = || {
         [profile.join(&file), profile.join("deps").join(&file)]
             .into_iter()
@@ -182,7 +163,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
 }
 
 /// The socket the host holds: what the far end wrote and the host has not ingested (and whether
-/// it has ended), and the way to the far end.
+
 pub struct Socket {
     rx: Mutex<(VecDeque<u8>, bool)>,
     to_far: mpsc::UnboundedSender<Vec<u8>>,
@@ -251,8 +232,7 @@ impl Got {
 }
 
 /// Stream `stream`'s end, once it arrived: the status (code and class, from the trailers or a
-/// failure), and the terminal piece after it (whether the stream failed, and its whole bytes:
-/// empty on `OK`, else the decoded `grpc-message`).
+
 pub fn over(got: &[Got], stream: u64) -> Option<(u32, u8, bool, Vec<u8>)> {
     let mut status = None;
     let mut bytes = Vec::new();
@@ -290,7 +270,7 @@ pub struct Host {
     heads: Vec<HeadSlots>,
     /// Each accepted stream's head words: (stream, method, target, authority).
     pub words: Vec<(u64, String, String, String)>,
-    // Kept alive while the framer may read it.
+
     facts_text: String,
 }
 
@@ -447,14 +427,14 @@ impl Host {
     }
 
     /// `locate` as the connector asks it for an ACCEPTING listener (`LocateIn::accept`, an empty
-    /// target: a listener names no far end), judged by the kind's own check.
+
     pub fn locate_listener(&mut self) -> Result<Located, Outcome> {
         self.locate_as("", true)
     }
 
     fn locate_as(&mut self, target: &str, accept: bool) -> Result<Located, Outcome> {
         let (mut a, mut n, mut p) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
-        // The framer's own head lines for a request (`defaults`), offered as the host offers it.
+
         let mut d = vec![0_u8; 256];
         let mut i: LocateIn = z();
         i.target = s(target);
@@ -482,8 +462,7 @@ impl Host {
     }
 
     /// `locate` with the buffers lent at the given sizes (`authority`, `name`, `alpn`, `defaults`),
-    /// as a host with less room does, judged by the kind's own check: its outcome, its `out`, and
-    /// its text.
+
     pub fn locate_lent(
         &mut self,
         target: &str,
@@ -699,7 +678,7 @@ impl Host {
     }
 
     /// `finish` with a final tail stated by hand: `bytes`, and the `message` and `details` spans
-    /// into them, whatever they say. Its outcome and its text.
+
     pub fn finish_spans(
         &mut self,
         status: u32,
@@ -769,7 +748,7 @@ impl Host {
     }
 
     /// `encode` an envelope: `path` as the target head word, then `fields`, then the one message
-    /// `body`.
+
     pub fn encode(&mut self, path: &str, fields: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
         let all: Vec<Field> = fields
             .iter()
@@ -785,7 +764,7 @@ impl Host {
         i.body = body.as_ptr();
         i.body_len = body.len();
         i.sink = self.sink();
-        // `encode` renders a whole call at once, so the host gives it the whole buffer.
+
         i.sink.wire_cap = self.wire.len();
         let mut o: FramerOut = z();
         assert_eq!(
@@ -818,7 +797,7 @@ impl Host {
     }
 
     /// `emit` `bytes` on `stream` ONCE, as a host whose far end is not reading does: no `YIELD_MORE`
-    /// re-call drains what the sink could not take. Its outcome, its yield flags, and its text.
+
     pub fn emit_held(&mut self, stream: u64, bytes: &[u8], end: bool) -> (Outcome, u32, String) {
         let mut i: EmitIn = z();
         i.framing = self.framing;
@@ -836,7 +815,7 @@ impl Host {
     }
 
     /// Re-call `emit` on `stream` with no new bytes until it has nothing more: the far end reads
-    /// again.
+
     pub fn emit_drain(&mut self, stream: u64) -> Outcome {
         self.drain(slot::EMIT, stream)
     }
@@ -873,7 +852,7 @@ impl Host {
     }
 
     /// Ingest whatever the far end sends until it stays quiet for `quiet` or `until` holds; the
-    /// first op that fails ends the pump with its outcome.
+
     pub fn pump_until(&mut self, quiet: Duration, until: impl Fn(&[Got]) -> bool) -> Outcome {
         let mut idle = Duration::ZERO;
         let step = Duration::from_millis(5);
@@ -991,7 +970,7 @@ impl Host {
     }
 
     /// Stream `stream`'s whole frames (pieces joined up to each end-of-frame) up to its status:
-    /// the head, the messages and (on an accepted stream) the far end's empty last.
+
     pub fn frames(&self, stream: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut cur = Vec::new();

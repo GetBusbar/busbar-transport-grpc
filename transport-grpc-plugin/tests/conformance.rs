@@ -2,15 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE `grpc` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_grpc::door`) and
-//! this crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
-//! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
-//! Statement and the same answers. Run against the busbar rev this repo pins (`.busbar-ref`). The
-//! logic crate's own `tests/conformance.rs` and `tests/peers.rs` carry the full framing scenarios
-//! against real tonic peers.
-//!
-//! THE RED ARMS, same file: a differing answer is caught by the comparison, and the door asked for
-//! as another kind is refused, linked (by the door's own kind) and dropped in (by the stated kind,
-//! before `dlopen`). A missing cdylib PANICS: this test IS the dropped-in door's proof.
 
 use std::mem::zeroed;
 use std::sync::Arc;
@@ -35,7 +26,7 @@ fn z<T>() -> T {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip: this test IS the dropped-in door's proof.
+
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -172,8 +163,6 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
         "both doors begin the dial"
     );
 
-    // RED: the comparison the proof above rests on catches a dropped-in image that answered one
-    // line differently, or one line short.
     let mut off = b.clone();
     off[1].push('!');
     assert!(
@@ -201,8 +190,6 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
-// loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_test_kit::conformance_suite! {
     loaded: loaded(),
     cdylib: "busbar_transport_grpc_plugin",
@@ -220,9 +207,7 @@ fn the_statement_carries_the_declares_document() {
 }
 
 /// THE DOOR OFFERS NO AUTH POINT (ruling R2): it makes no auth call, on either side, so its
-/// Statement states an empty offered-points record and boot refuses a guest line whose auth needs
-/// a point on it, never defaulting to `{Head, HeadBody}`. RED: no record, read as
-/// `{Head, HeadBody}`.
+
 #[test]
 fn the_statement_offers_no_auth_point() {
     let row = row();

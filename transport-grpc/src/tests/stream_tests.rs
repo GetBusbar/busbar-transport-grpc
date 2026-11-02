@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! One stream's framing (`SIDE_ACCEPT_STREAM`): payloads out of the body, a reply framed, the close
-//! as status lines (trailers after a reply, the whole answer before one).
 
 use super::*;
 
@@ -98,10 +97,7 @@ fn the_status_message_is_encoded_as_predev_encoded_it() {
 }
 
 /// AN OVERSIZE MESSAGE ON ONE STREAM CLOSES IT `RESOURCE_EXHAUSTED` NAMING THE LIMIT. The body's message
-/// states a length past the ceiling: `ingest` fails, and the refusal the host then closes the
-/// stream with (its neutral status for a body it could not decode, the failure's text as its
-/// bytes) is rendered as `grpc-status: 8` and this framer's own words, which print the configured
-/// limit.
+
 #[test]
 fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
     let mut c = grpc();
@@ -118,9 +114,7 @@ fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
 }
 
 /// A FINAL STATUS THAT CANNOT BE RENDERED LEAVES THE CALL OPEN for the host's fallback refusal: a
-/// details value with a byte no field line may carry fails `finish`, writes nothing, and the
-/// refusal that follows still closes the call with a `grpc-status`. RED before the fix: `finish`
-/// marked the call closed first, so the refusal wrote nothing and the client saw no status.
+
 #[test]
 fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
     let mut c = grpc();
@@ -132,9 +126,7 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
 }
 
 /// A `grpc-timeout` THE CALLER STATES IS NEVER ENFORCED HERE, as predev's server enforced none:
-/// the call asks the host for no timer, and however long it runs it is never closed
-/// `DEADLINE_EXCEEDED` by this framing; the value stays in the head the host keeps, a fact for the
-/// plane.
+
 #[test]
 fn a_stated_grpc_timeout_is_never_enforced_here() {
     let mut c = StreamCall::open(
@@ -160,8 +152,7 @@ fn a_stated_grpc_timeout_is_never_enforced_here() {
 }
 
 /// AN EMIT AFTER THE CLOSE WRITES NOTHING: a reply message the host emits once the call is closed
-/// is dropped, as the dedicated listener drops one after its reply is over; it never lands behind
-/// the closing lines the host sends as trailers.
+
 #[test]
 fn an_emit_after_the_close_writes_nothing() {
     let mut c = grpc();
@@ -187,15 +178,13 @@ fn open_with(fields: &[(&'static [u8], &'static [u8])]) -> StreamCall {
 }
 
 /// The close a compression the door does not take ends a call with, before any reply: the whole
-/// answer, `UNIMPLEMENTED` with the encodings the door takes, and this framer's words.
+
 const UNIMPLEMENTED_GZIP: &str = ":status: 200\r\ncontent-type: application/grpc\r\n\
      grpc-accept-encoding: identity\r\ngrpc-status: 12\r\ngrpc-message: the%20message%20encoding\
      %20%60gzip%60%20is%20not%20supported:%20this%20server%20takes%20identity\r\n";
 
 /// A COMPRESSION THE DOOR DOES NOT TAKE IS `UNIMPLEMENTED` WITH THE ENCODINGS IT TAKES (gRPC's
-/// compression rules, `compression.md`): the call's first `ingest` fails, and whatever refusal the
-/// host then closes it with, the close is `grpc-accept-encoding: identity` and `grpc-status: 12`.
-/// `identity` is no compression.
+
 #[test]
 fn a_compression_the_door_does_not_take_closes_unimplemented() {
     let mut c = open_with(&[(&b"grpc-encoding"[..], &b"gzip"[..])]);
@@ -214,8 +203,7 @@ fn a_compression_the_door_does_not_take_closes_unimplemented() {
 }
 
 /// THE FIRST `grpc-encoding` FIELD IS THE CALL'S: a repeat is not read. A call that states
-/// `identity` and then `gzip` is served; one that states `gzip` and then `identity` is refused
-/// `UNIMPLEMENTED`.
+
 #[test]
 fn the_first_grpc_encoding_field_is_the_calls() {
     let mut c = open_with(&[
@@ -235,8 +223,7 @@ fn the_first_grpc_encoding_field_is_the_calls() {
 }
 
 /// A HEAD THE HOST ALREADY SENT IS NOT SENT AGAIN: when the host states
-/// `RefuseIn::head_sent`, the refusal is the call's closing lines only, the trailers after the
-/// head it answered.
+
 #[test]
 fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
     let mut c = grpc();
@@ -252,8 +239,7 @@ fn a_refusal_after_the_hosts_head_is_its_closing_lines_only() {
 }
 
 /// A REFUSAL STATING NO STATUS EITHER WAY IS `UNKNOWN` WITH ITS OWN WORDS, as the connection side
-/// ends the same refusal: no `grpc-status` in its bytes and no neutral status (`0`, none stated).
-/// RED: `busbar answered HTTP 0`, a status nobody stated and the refusal's words lost.
+
 #[test]
 fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
     let mut c = grpc();
@@ -266,8 +252,7 @@ fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
 }
 
 /// The same on one stream: a refusal whose block names `grpc-status` but is no field block fails in
-/// words, writes nothing, and leaves the call for the fallback close. RED: `busbar answered HTTP
-/// 500`.
+
 #[test]
 fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
     let mut c = grpc();
@@ -284,8 +269,7 @@ fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
 }
 
 /// A REFUSAL BLOCK'S OWN `content-type` (and any connection-specific field) IS DROPPED, as the
-/// connection side drops it: the trailers-only answer states one content type, the framer's, and
-/// never a field HTTP/2 forbids (RFC 9113 §8.2.2). RED: two `content-type` lines.
+
 #[test]
 fn a_refusal_blocks_own_content_type_and_connection_fields_are_dropped() {
     let mut c = grpc();

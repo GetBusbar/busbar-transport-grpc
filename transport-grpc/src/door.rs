@@ -2,33 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `grpc` DOOR: this transport as a FRAMER on the transport kind's table
-//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door.
-//!
-//! A framer frames; it does not dial. The connector owns the socket and connection security; this
-//! framer tells it, at `locate`, where a target is, whether it asks for security (`https`) and what
-//! to offer in the handshake (`h2`, alone: gRPC is HTTP/2 only). A cleartext target is HTTP/2 by
-//! prior knowledge. From there each op is one step of [`transport::Conn`], on either side:
-//!
-//! * `begin` opens a dialled connection (the HTTP/2 preface and settings are owed first) or an
-//!   accepted one;
-//! * `encode` renders an envelope (the target head word naming the method — or, where the host
-//!   states none, a `path` field — the call's metadata as fields, one message as the body) as a head
-//!   block and that message in its length-prefixed form; `emit` takes that on a stream — on a
-//!   dialled connection it is a call, on an accepted one the answer to one;
-//! * `refuse` on an accepted stream ends the call with its trailer block (`grpc-status`, ...);
-//! * `ingest` takes what the far end sent, `timer` is the host's clock reaching a deadline this
-//!   framer asked for, and `finish` drops the connection.
-//!
-//! One stream (`SIDE_ACCEPT_STREAM`): a framing begun on that side frames one call
-//! whose connection and head the host's own framer carries. Begin yields an initial response field
-//! block declaring the possible final fields. Its `finish` closes the call with
-//! the final status the unit stated (the close's final tail), rendered here alone
-//! (`crate::stream`).
-//!
-//! What a stream carries each way, and how `grpc-status` reaches the host (the terminal piece's
-//! code, in the `grpc` numbering this door's status rows class), is the framer's module note (`transport.rs`).
-//!
-//! No op pends. Every slot is a `SafeSlot` on the SDK's safe surface: this crate holds no `unsafe`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,8 +42,7 @@ use crate::meta::{class_of, decimal, fault_of, DEFAULT_TIMEOUT, SETTING_ROWS, TA
 pub use crate::meta::{setting, KEY};
 
 /// THE AUTH POINTS THIS DOOR OFFERS: none (ruling R2). It makes no auth call on either side (no
-/// op pends), so it states an empty record: boot refuses a guest line whose auth needs a point on
-/// it, rather than read the default `{Head, HeadBody}` it would not honour.
+
 const OFFERED_POINTS: [u8; 4] = 0u32.to_le_bytes();
 
 busbar_contract::statement_extensions!(
@@ -103,7 +75,6 @@ const OFFER_H2: &[u8] = b"\x02h2";
 /// What `open` read from the settings, and the framings it holds.
 pub struct Instance {
     /// The settings in force: what `open` read, or the last good `refresh`, copied by each `begin`
-    /// (a framing keeps the posture it began under).
     posture: Mutex<Posture>,
     framings: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
@@ -112,7 +83,7 @@ pub struct Instance {
 }
 
 /// HTTP/2 keep-alive on a dialled connection: a PING this often (fixed here, not an operator
-/// setting), so a far end gone silent is found while a call waits on it.
+
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a keep-alive PING may go unanswered before the dialled connection is failed.
@@ -122,10 +93,9 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const ADAPTIVE_WINDOW: bool = true;
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
-/// says. An absent blob reads as `{}`.
+
 fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
     let v = settings_reading(bytes, &SETTING_ROWS).map_err(|refusal| {
-        // Preserve the established per-unit count diagnostics from this door.
         for (row, unit) in SETTING_ROWS.iter().zip(["seconds", "bytes"]) {
             if refusal.text()
                 == Some(format!("settings: {} must be a count above 0", row.path).as_str())
@@ -138,9 +108,7 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
         }
         refusal
     })?;
-    // A count above 0, by its key and its unit (`settings: <key> must be a count of <unit> above
-    // 0`, http's words); an absent one reads as the default its declaration states (`SETTINGS`):
-    // one source.
+
     let count = |k: &'static str, unit: &str, declared: &str| match v.get(k) {
         None => Ok(decimal(declared)),
         Some(x) => x.as_u64().filter(|n| *n > 0).ok_or_else(|| {
@@ -203,7 +171,7 @@ impl Life for Instance {
     }
 
     /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
-    /// force stay; good ones apply to every framing begun after it.
+
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         let posture = read_settings(settings)?;
         *self.posture.lock().unwrap_or_else(PoisonError::into_inner) = posture;
@@ -337,16 +305,13 @@ slot!(
 );
 
 /// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a URL
-/// (refused outright, never read on, never echoed), as http and ws refuse it.
+
 fn carries_userinfo(uri: &http::Uri) -> bool {
     uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
 /// The framer's own head lines on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
-/// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
-/// auth signs the head, and the dial then sends them as signed: the content
-/// type and `te: trailers`, in the order the dial writes them. No `grpc-timeout`: none goes
-/// upstream.
+
 const DEFAULT_LINES: &str = "content-type: application/grpc\r\nte: trailers\r\n";
 
 slot!(
@@ -651,7 +616,7 @@ fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<Stre
 }
 
 /// Run `f` on a one-stream framing, then fill the sink with what it owes. A failure is `op`'s,
-/// in its words (`<op>: <reason>`).
+
 fn on_stream(
     op: &'static str,
     call: &Mutex<StreamCall>,

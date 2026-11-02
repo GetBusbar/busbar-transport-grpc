@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The engine, both sides at once: a dialled [`Conn`] and an accepted one wired back to back, the
-//! test carrying each one's wire bytes to the other and holding the clock.
 
 use std::time::Duration;
 
@@ -81,7 +80,7 @@ fn posture() -> Posture {
 }
 
 /// A call as `encode` renders it: the head block (its fields and the message stream's length),
-/// then the messages.
+
 fn call(path: &str, extra: &[(&str, &[u8])], messages: &[&[u8]]) -> Vec<u8> {
     let body: Vec<u8> = messages.iter().flat_map(|m| msg::frame(m)).collect();
     let mut fields: Vec<(&str, &[u8])> = vec![("path", path.as_bytes())];
@@ -184,9 +183,6 @@ fn a_unary_call_half_closes_and_its_answer_ends_with_status_ok() {
     p.d.emit(1, &c, true, 0, p.now).expect("emit");
     p.settle();
 
-    // The accepted side sees the call's head (its head words in the slots, never as fields), its
-    // one message, and the far end's last (the empty piece): the dialled side sent END_STREAM
-    // after the message.
     let h = head(&p.got_a, 1);
     let words = h.head.as_ref().expect("an accepted head states its words");
     assert_eq!(words.method.as_ref(), b"POST");
@@ -214,8 +210,6 @@ fn a_unary_call_half_closes_and_its_answer_ends_with_status_ok() {
     p.a.end_call(1, b"grpc-status: 0\r\n", 0).expect("end");
     p.settle();
 
-    // The dialled side: the head (no code), the message, the trailers carrying grpc-status, and
-    // the empty terminal piece.
     let h = head(&p.got_d, 1);
     assert!(h.head.is_none(), "an h2 answer has no reason phrase");
     let d = frames(&p.got_d, 1);
@@ -238,8 +232,6 @@ fn a_unary_call_half_closes_and_its_answer_ends_with_status_ok() {
 
 #[test]
 fn without_the_half_close_a_unary_peer_never_sees_the_calls_end() {
-    // RED arm of the half-close: a call whose head states no length and whose frame does not end
-    // leaves the request stream open, and the accepted side never sees the far end's last.
     let mut p = Pair::new();
     let mut c = msg::render_head(&[("path", b"/pkg.Svc/Say")], None).expect("head");
     c.extend_from_slice(&msg::frame(b"hello"));
@@ -251,7 +243,7 @@ fn without_the_half_close_a_unary_peer_never_sees_the_calls_end() {
         !a.iter().any(|f| f.is_empty()),
         "no end without the half-close"
     );
-    // The frame's end is the half-close.
+
     p.d.emit(1, b"", true, 0, p.now).expect("end");
     p.settle();
     assert!(frames(&p.got_a, 1).last().is_some_and(|f| f.is_empty()));
@@ -312,7 +304,7 @@ fn a_trailers_only_answer_carries_its_status_in_the_head() {
     p.d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, p.now)
         .expect("emit");
     p.settle();
-    // Nothing emitted first: the status goes out in the one HEADERS frame.
+
     p.a.end_call(1, b"grpc-status: 7\r\ngrpc-message: denied\r\n", 0)
         .expect("end");
     p.settle();
@@ -411,8 +403,7 @@ fn the_callers_deadline_fails_the_call_when_it_passes_and_never_goes_upstream() 
 }
 
 /// AN ACCEPTED CALL'S `grpc-timeout` IS A FACT FOR THE PLANE, NEVER ENFORCED HERE, as predev's
-/// server enforced none: it is handed up among the head's fields, and long past it the call is
-/// still open, with no `DEADLINE_EXCEEDED` from this side.
+
 #[test]
 fn an_accepted_calls_grpc_timeout_is_handed_up_and_never_enforced() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -444,7 +435,7 @@ fn two_calls_share_one_connection() {
     p.d.emit(3, &call("/pkg.Svc/B", &[], &[b"3"]), true, 0, p.now)
         .expect("emit");
     p.settle();
-    // The accepted side numbers calls in arrival order.
+
     let paths: Vec<_> = [1, 2]
         .iter()
         .map(|s| head(&p.got_a, *s).head.as_ref().map(|w| w.target.to_vec()))
@@ -494,8 +485,7 @@ fn h2(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// A client's preface and one HEADERS frame opening stream 1 with a gRPC call, `te` as given:
-/// HPACK by hand (indexed and literal-without-indexing fields, no Huffman), so a field hyper's own
-/// client would never send can be.
+
 fn opening(te: Option<&str>) -> Vec<u8> {
     opening_with(te, &[])
 }
@@ -506,12 +496,12 @@ fn opening_with(te: Option<&str>, extra: &[(&str, &str)]) -> Vec<u8> {
         out.push(u8::try_from(s.len()).expect("short"));
         out.extend_from_slice(s.as_bytes());
     };
-    let mut block = vec![0x83, 0x86]; // :method POST, :scheme http
-    block.push(0x04); // :path, by its static name
+    let mut block = vec![0x83, 0x86];
+    block.push(0x04);
     lit(&mut block, "/pkg.Svc/Say");
-    block.push(0x01); // :authority
+    block.push(0x01);
     lit(&mut block, "peer.test");
-    block.extend_from_slice(&[0x0f, 0x10]); // content-type (static index 31)
+    block.extend_from_slice(&[0x0f, 0x10]);
     lit(&mut block, "application/grpc");
     if let Some(te) = te {
         block.push(0x00);
@@ -525,7 +515,7 @@ fn opening_with(te: Option<&str>, extra: &[(&str, &str)]) -> Vec<u8> {
     }
     let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     out.extend(h2(4, 0, 0, &[]));
-    // END_HEADERS.
+
     out.extend(h2(1, 0x4, 1, &block));
     out
 }
@@ -551,7 +541,7 @@ fn resets(wire: &[u8]) -> Vec<(u32, u32)> {
 }
 
 /// RED: a `te` other than `trailers` is reset with HTTP/2 `PROTOCOL_ERROR` before it is a call,
-/// as predev's server (tonic 0.14 over h2 0.4; v1.5.5 served no gRPC) did; nothing is handed up.
+
 #[test]
 fn a_wrong_te_is_reset_protocol_error_and_never_handed_up() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -580,7 +570,7 @@ fn a_missing_te_is_served() {
         h.head.as_ref().map(|w| w.target.as_ref()),
         Some(&b"/pkg.Svc/Say"[..])
     );
-    // `te: trailers` is served too, and dropped as hop-by-hop.
+
     let mut a = Conn::accept(posture(), 5 * SEC);
     a.ingest(&opening(Some("trailers")), false);
     a.drive(5 * SEC);
@@ -589,19 +579,11 @@ fn a_missing_te_is_served() {
 }
 
 /// AN ANSWER THAT IS NOT gRPC IS STILL AN ANSWER. A member that answers a call with a bare HTTP
-/// status (no `grpc-status`, as a proxy or an auth wall in front of the service does) has
-/// answered: its status reaches the host as the gRPC status that HTTP status stands for
-/// (`http-grpc-status-mapping.md`: 401 -> UNAUTHENTICATED, 403 -> PERMISSION_DENIED, 503 ->
-/// UNAVAILABLE), on a head and its status block, exactly as a trailers-only answer arrives. It is
-/// never a failed stream with nothing read, which the host would take for no answer at all and
-/// fail over as transient. 1.5.5's breaker read an HTTP 401 or 403 as `Auth`, which is `HardDown`
-/// (v1.5.5 `crates/busbar/src/breaker.rs`, its step 2 and its `Auth | Billing => HardDown`
-/// arm), and this framer's fault table reads UNAUTHENTICATED and PERMISSION_DENIED as hard.
+
 #[test]
 fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
     use busbar_contract::abi::transport::{FAULT_CALLER, FAULT_HARD, FAULT_TRANSIENT};
-    // The fault reading is the HTTP status's own, by 1.5.5's bands:
-    // a bare 400 is INTERNAL to the caller but the caller's fault to the breaker, as 1.5.5 read it.
+
     for (http, grpc, fault) in [
         (401u16, msg::UNAUTHENTICATED, FAULT_HARD),
         (403, msg::PERMISSION_DENIED, FAULT_HARD),
@@ -622,9 +604,7 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
                 got.extend(d.pieces().drain(..));
             }
         };
-        // The far end, by hand: its SETTINGS and the ACK of ours once the call is on the wire,
-        // then one HEADERS frame ending the stream with `:status` alone (HPACK literal without
-        // indexing, the name `:status` at static index 8).
+
         turn(&mut d, &mut got);
         let mut wire = h2(4, 0, 0, &[]);
         wire.extend(h2(4, 1, 0, &[]));
@@ -684,10 +664,7 @@ fn cancel(a: &mut Conn) -> Vec<Piece> {
 }
 
 /// A CLIENT'S CANCEL AFTER ITS HALF-CLOSE IS TOLD TO THE HOST. The client sent its last message,
-/// the host is streaming the answer, and the client resets the call: the host hears it as the
-/// stream failing `CANCELLED`, the call is let go of, and an answer emitted after it (or a refusal
-/// racing the cancel) is dropped, as a STREAM ENDS ONCE says: the op is answered, nothing is queued.
-/// RED: the late emit and refusal answered FAILED `no such stream`.
+
 #[test]
 fn a_cancel_after_the_half_close_fails_the_stream_cancelled() {
     let mut a = half_closed();
@@ -720,7 +697,7 @@ fn a_cancel_after_the_half_close_fails_the_stream_cancelled() {
 }
 
 /// The same cancel, before the host stated the answer's head: the connection drops the call's
-/// pending answer, and the host hears `CANCELLED` all the same.
+
 #[test]
 fn a_cancel_before_the_answer_fails_the_stream_cancelled() {
     let mut a = half_closed();
@@ -751,9 +728,7 @@ fn an_answered_call_is_never_reported_cancelled() {
 }
 
 /// A LATE EMIT ON A DIALLED STREAM THAT ENDED IS DROPPED. The far end answers a client-streaming
-/// call early (trailers-only, before the upload is done); the host's next message and its end
-/// arrive after the stream's terminal piece. They open nothing: no second terminal piece, no
-/// held call, and no deadline firing later on a stream the host already saw end.
+
 #[test]
 fn a_late_emit_on_an_ended_dialled_stream_opens_nothing() {
     let mut p = Pair::new();
@@ -806,7 +781,7 @@ fn ended_streams_are_remembered_as_runs() {
 }
 
 /// The answer bytes an accepted call still queues for the far end, framer-side (not yet taken by
-/// the HTTP/2 connection, which takes them only as the far end grants room).
+
 fn queued_answer(c: &Conn, stream: u64) -> usize {
     let super::Side::Accept(a) = &c.side else {
         panic!("an accepted connection");
@@ -828,11 +803,7 @@ fn queued_answer(c: &Conn, stream: u64) -> usize {
 }
 
 /// AN ANSWER THE FAR END NEVER READS IS BOUNDED. The client half-closed its call and then grants
-/// no room (no WINDOW_UPDATE), while the host keeps emitting the answer: the framer holds at most
-/// its bound for the stream, and a host that emits past it hears the stream fail
-/// `RESOURCE_EXHAUSTED` (the transport ABI's "A STREAM'S OWN BACKPRESSURE": "A host that keeps
-/// emitting past the mark is the framer's to bound: it may fail the stream"). RED before the fix:
-/// every emitted message waited in an unbounded queue behind the shut window.
+
 #[test]
 fn an_answer_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
     let mut a = half_closed();
@@ -840,7 +811,6 @@ fn an_answer_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
     let m = msg::frame(&[7u8; 60_000]);
     let (mut most, mut got) = (0, Vec::new());
     for _ in 0..200 {
-        // Once the stream failed, an emit on it is the host's late one: dropped or refused.
         let _ = a.emit(1, &m, false, 0, 5 * SEC);
         a.drive(5 * SEC);
         drop(a.take_wire(usize::MAX));
@@ -857,10 +827,7 @@ fn an_answer_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
 }
 
 /// A FULL STREAM IS SAID, AND SO IS ITS DRAIN. The host emits an answer the far end grants no room
-/// for, until an emit leaves the queue at its high-water mark: that emit is answered full
-/// (`YIELD_STREAM_FULL`, which the door sets from [`Conn::announce_full`]), and nothing fails. Once
-/// the far end opens its windows and the queue drains to its low-water mark, the stream hands one
-/// writable piece (`PIECE_WRITABLE`), and only then.
+
 #[test]
 fn a_full_answer_is_announced_and_its_drain_hands_one_writable_piece() {
     let mut a = half_closed();
@@ -887,7 +854,7 @@ fn a_full_answer_is_announced_and_its_drain_hands_one_writable_piece() {
         got.iter().all(|p| !p.writable && !p.failed),
         "no writable piece and no failure before the drain: {got:?}"
     );
-    // The far end opens the connection's window and the stream's.
+
     let room = (1u32 << 30).to_be_bytes();
     let mut wire = h2(8, 0, 0, &room);
     wire.extend(h2(8, 0, 1, &room));
@@ -926,7 +893,7 @@ fn queued_request(c: &Conn, stream: u64) -> usize {
 }
 
 /// The same bound on a dialled call: an upload whose far end grants no room (its SETTINGS and
-/// nothing more) is held to the bound, and fails `RESOURCE_EXHAUSTED` past it. RED before the fix.
+
 #[test]
 fn an_upload_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
     let now = 5 * SEC;
@@ -941,7 +908,7 @@ fn an_upload_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
         got.extend(d.pieces().drain(..));
     };
     turn(&mut d, &mut got);
-    // The far end's SETTINGS and the ACK of ours: the call goes out, and no window ever opens.
+
     let mut wire = h2(4, 0, 0, &[]);
     wire.extend(h2(4, 1, 0, &[]));
     d.ingest(&wire, false);
@@ -962,7 +929,7 @@ fn an_upload_the_far_end_never_reads_is_bounded_and_fails_resource_exhausted() {
 }
 
 /// The `grpc-message` an accepted call's end carries, as it goes on the wire: in the head of a
-/// trailers-only answer, or in the trailers after one.
+
 fn sent_message(c: &Conn, stream: u64) -> Option<Vec<u8>> {
     let super::Side::Accept(a) = &c.side else {
         panic!("an accepted connection");
@@ -982,9 +949,7 @@ fn sent_message(c: &Conn, stream: u64) -> Option<Vec<u8>> {
 }
 
 /// A REFUSAL'S `grpc-message` IS PREDEV'S BYTES. A refusal naming no `grpc-status` ends the call
-/// with its neutral status mapped and predev's words, percent-encoded as predev's gRPC line
-/// (tonic 0.14's `Status`) encoded them: the space and each of `"#%<>`?{}` beside the controls.
-/// Both shapes: trailers-only, and trailers after the answer's head.
+
 #[test]
 fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
     let mut a = half_closed();
@@ -1005,10 +970,7 @@ fn a_refusals_grpc_message_is_percent_encoded_in_predevs_bytes() {
 }
 
 /// AN OVERSIZE MESSAGE FAILS `RESOURCE_EXHAUSTED` NAMING THE LIMIT. A call whose message states a length
-/// past the ceiling (`limits.request_body_max_bytes`, the knob that bounds every inbound body)
-/// fails `RESOURCE_EXHAUSTED` (code 8) in this framer's own words, which print that configured ceiling
-/// Both ends see it: the accepted side's failure piece, and the dialled
-/// side's trailers and decoded message.
+
 #[test]
 fn an_oversize_message_fails_resource_exhausted_naming_the_limit_on_the_accepted_side() {
     let mut p = Pair::new();
@@ -1043,7 +1005,7 @@ fn an_oversize_message_fails_resource_exhausted_naming_the_limit_on_the_accepted
 }
 
 /// AN OVERSIZE ANSWER ON THE DIAL is `RESOURCE_EXHAUSTED` in this framer's own words: predev's hop had no
-/// gRPC status for it (its refusal was `BodyTooLarge`), so nothing of predev's server is copied.
+
 #[test]
 fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
     let mut p = open_call(false, b"");
@@ -1065,7 +1027,7 @@ fn an_oversize_answer_on_the_dial_fails_in_this_framers_words() {
 }
 
 /// A dialled call on stream 1, sent whole and unanswered; with `after_head`, its answer's head is
-/// in and its body still open (after `partial` bytes of a message, where any).
+
 fn open_call(after_head: bool, partial: &[u8]) -> Pair {
     let mut p = Pair::new();
     p.d.emit(1, &call("/pkg.Svc/Say", &[], &[b"q"]), true, 0, p.now)
@@ -1094,7 +1056,7 @@ fn far_end_sends(mut p: Pair, frame: &[u8]) -> Piece {
 }
 
 /// The status and text a far end's RST_STREAM `code` fails the dialled stream with, before the
-/// answer's head and after it.
+
 fn reset_both_ways(code: u32) -> [(Option<u16>, String); 2] {
     [false, true].map(|after_head| {
         let t = far_end_sends(
@@ -1111,8 +1073,6 @@ fn assert_reset(code: u32, status: u16, name: &str) {
     let [before, after] = reset_both_ways(code);
     assert_eq!(before, (Some(status), text.clone()), "before the head");
     if code == 0 {
-        // `hyper` reads a NO_ERROR reset after the head as the body's end: the answer ended with
-        // no trailers, and that is INTERNAL in its own words.
         assert_eq!(
             after,
             (
@@ -1126,12 +1086,8 @@ fn assert_reset(code: u32, status: u16, name: &str) {
     }
 }
 
-// The gRPC over HTTP/2 table (PROTOCOL-HTTP2.md, "Errors"), one test per code.
-
 /// Every HTTP/2 reset code fails the call with its mapped gRPC status. `STREAM_CLOSED`, which the
-/// table does not list, and a code HTTP/2 does not define (RFC 9113 §7) are
-/// `INTERNAL`, never read as safe to retry; `REFUSED_STREAM` is `UNAVAILABLE` (the far end processed
-/// nothing).
+
 #[test]
 fn every_reset_code_fails_the_call_with_its_status() {
     let table = [
@@ -1157,12 +1113,9 @@ fn every_reset_code_fails_the_call_with_its_status() {
 }
 
 /// A RESET OF OUR OWN is read by its code as the far end's is: a malformed answer head (a
-/// connection-specific field, which HTTP/2 forbids) has the connection reset the stream
-/// `PROTOCOL_ERROR` itself, and the call fails `INTERNAL`. RED: UNAVAILABLE, a local reset not read
-/// by its code.
+
 #[test]
 fn a_local_reset_is_read_by_its_code() {
-    // HPACK: `:status: 200` (static index 8), then `connection: close` as a literal.
     let mut block = vec![0x88, 0x00, 10];
     block.extend_from_slice(b"connection");
     block.push(5);
@@ -1173,7 +1126,7 @@ fn a_local_reset_is_read_by_its_code() {
 }
 
 /// A GOAWAY THAT LEAVES THE STREAM UNPROCESSED is read by its code, as a reset is: last stream 0
-/// and `ENHANCE_YOUR_CALM` fail the open call `RESOURCE_EXHAUSTED`. RED: UNAVAILABLE.
+
 #[test]
 fn a_goaway_is_read_by_its_code() {
     let mut payload = 0u32.to_be_bytes().to_vec();
@@ -1187,7 +1140,7 @@ fn a_goaway_is_read_by_its_code() {
 }
 
 /// A CONNECTION LOST BEFORE ANY STATUS is `UNAVAILABLE`, before the answer's head or after it: the
-/// far end's bytes end with the call open. RED: INTERNAL after the head, with `hyper`'s text.
+
 #[test]
 fn a_connection_lost_before_any_status_fails_the_call_unavailable() {
     for after_head in [false, true] {
@@ -1206,7 +1159,7 @@ fn a_connection_lost_before_any_status_fails_the_call_unavailable() {
 }
 
 /// AN ANSWER THAT ENDS INSIDE A MESSAGE, with no trailers (here the far end's NO_ERROR reset after
-/// part of a message), is `INTERNAL` in this framer's words. RED: UNKNOWN.
+
 #[test]
 fn an_answer_cut_inside_a_message_fails_the_call_internal() {
     let part = &msg::frame(b"hello")[..3];
@@ -1219,9 +1172,7 @@ fn an_answer_cut_inside_a_message_fails_the_call_internal() {
 }
 
 /// A COMPRESSION THE SERVER DOES NOT TAKE IS ANSWERED `UNIMPLEMENTED` (gRPC's compression rules,
-/// `compression.md`): trailers-only, before a message is read, with `grpc-accept-encoding:
-/// identity` and this framer's words, and never handed up. A call stating `identity` is no
-/// compressed call, and is served.
+
 #[test]
 fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
     let mut p = Pair::new();
@@ -1263,7 +1214,7 @@ fn a_compression_the_server_does_not_take_is_answered_unimplemented() {
 }
 
 /// THE FIRST `grpc-encoding` FIELD IS THE CALL'S on the dedicated listener too: `identity` then
-/// `gzip` is served, `gzip` then `identity` is answered `UNIMPLEMENTED` and never handed up.
+
 #[test]
 fn the_first_grpc_encoding_field_is_the_calls() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -1291,8 +1242,7 @@ fn the_first_grpc_encoding_field_is_the_calls() {
 }
 
 /// NO `grpc-timeout` GOES UPSTREAM, as predev's hop sent none (predev
-/// `crates/busbar-a2a/src/a2a/relay.rs` `build_request`): not one of the dial's own, and not one
-/// the head carries. The attempt's deadline still holds the call, here.
+
 #[test]
 fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
     let mut p = Pair::new();
@@ -1325,10 +1275,7 @@ fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
 }
 
 /// A DIALLED STREAM FAILED AFTER ITS ANSWER'S HEAD IS RESET ON THE WIRE. A bidi call whose request
-/// is still open (no content-length, the frame not ended) has its answer's head in, and then its
-/// deadline passes: the host hears `DEADLINE_EXCEEDED`, and the far end hears the call reset, so it
-/// stops working on it and its stream slot is freed. RED: the request body stayed open forever and
-/// no RST_STREAM went out.
+
 #[test]
 fn a_dialled_stream_failed_after_its_answers_head_is_reset_on_the_wire() {
     let mut p = Pair::new();
@@ -1352,9 +1299,7 @@ fn a_dialled_stream_failed_after_its_answers_head_is_reset_on_the_wire() {
 }
 
 /// A GRACEFUL GOAWAY THAT LEAVES THE STREAM UNPROCESSED IS `UNAVAILABLE`: a far end draining
-/// (`NO_ERROR`, last stream 0) never processed the open call, which is safe to retry
-/// (PROTOCOL-HTTP2.md, "GOAWAY Frame": a stream past the last one accepted is `UNAVAILABLE`). RED:
-/// INTERNAL, read as a reset's `NO_ERROR`.
+
 #[test]
 fn a_graceful_goaway_refusing_an_unprocessed_stream_is_unavailable() {
     let mut payload = 0u32.to_be_bytes().to_vec();
@@ -1365,9 +1310,7 @@ fn a_graceful_goaway_refusing_an_unprocessed_stream_is_unavailable() {
 }
 
 /// A DIALLED FRAME THAT ENDS SHORT OF ITS HEAD'S `content-length` FAILS AT ONCE, in words: the head
-/// states 20 message bytes and the frame ends after 12. The host hears `INTERNAL` with the reason
-/// on that emit, never a `DEADLINE_EXCEEDED` minutes later. RED: the request never ended, and the
-/// call hung to its deadline with nothing said.
+
 #[test]
 fn a_dialled_frame_ending_short_of_its_content_length_fails_in_words() {
     let mut p = Pair::new();
@@ -1388,7 +1331,7 @@ fn a_dialled_frame_ending_short_of_its_content_length_fails_in_words() {
 }
 
 /// A dialled head whose message bytes run past its `content-length` fails the stream `INTERNAL` in
-/// words, never sending the extra bytes on as a second call's.
+
 #[test]
 fn a_dialled_frame_running_past_its_content_length_fails_in_words() {
     let mut p = Pair::new();
@@ -1414,7 +1357,7 @@ fn lit_field(block: &mut Vec<u8>, name: &str, value: &str) {
 }
 
 /// A dialled call on stream 1 whose far end answers, by hand, one HEADERS frame ending the stream:
-/// `:status` `status`, then `fields`. The pieces the dial hands up.
+
 fn answered_by_hand(status: &str, fields: &[(&str, &str)]) -> Vec<Piece> {
     let now = 5 * SEC;
     let mut d = Conn::dial("http://peer.test:50051", posture(), now).expect("dial");
@@ -1444,10 +1387,7 @@ fn answered_by_hand(status: &str, fields: &[(&str, &str)]) -> Vec<Piece> {
 }
 
 /// A `grpc-status` THE ANSWER STATES IS USED, whatever its HTTP status (`http-grpc-status-mapping.md`:
-/// the table is only for an answer with no `grpc-status`; one that was provided must be used). A
-/// gateway's 403 carrying `grpc-status: 5` and its message is `NOT_FOUND` with that message, and the
-/// breaker reads the gRPC status (the caller's), never the 403's hard fault. RED: PERMISSION_DENIED,
-/// `HTTP status 403`, hard.
+
 #[test]
 fn a_non_200_answer_stating_grpc_status_is_read_by_its_grpc_status() {
     let got = answered_by_hand(
@@ -1469,7 +1409,7 @@ fn a_non_200_answer_stating_grpc_status_is_read_by_its_grpc_status() {
 }
 
 /// The same for a 200 whose content type is not gRPC's (or absent): the `grpc-status` it states is
-/// its status. RED: UNKNOWN, `the answer is not gRPC`.
+
 #[test]
 fn a_200_answer_without_a_grpc_content_type_stating_grpc_status_is_read_by_it() {
     for ct in [Some("text/plain"), None] {
@@ -1486,7 +1426,7 @@ fn a_200_answer_without_a_grpc_content_type_stating_grpc_status_is_read_by_it() 
 }
 
 /// A 200 answer with no gRPC content type and no `grpc-status` is no gRPC answer: `UNKNOWN`, in this
-/// framer's words, never its body read as length-prefixed messages.
+
 #[test]
 fn a_200_answer_that_is_not_grpc_fails_unknown() {
     let got = answered_by_hand("200", &[("content-type", "text/html")]);
@@ -1512,8 +1452,7 @@ fn failed_with_message(message: &[u8]) -> Piece {
 }
 
 /// A FAR END'S `grpc-message` REACHES THE HOST AS TEXT IT CAN PRINT: decoded, invalid UTF-8 replaced,
-/// every control character escaped (a terminal escape or a forged log line arrives as visible
-/// `\u{1b}` and `\n`), and bounded in length. RED: the raw bytes, ESC and LF among them.
+
 #[test]
 fn a_far_ends_grpc_message_reaches_the_host_as_printable_bounded_text() {
     let end = failed_with_message(b"%1B%5B2J%0D%0Afake%20log%20line%FF");
@@ -1528,8 +1467,7 @@ fn a_far_ends_grpc_message_reaches_the_host_as_printable_bounded_text() {
 }
 
 /// A TARGET'S USERINFO NEVER GOES ON THE WIRE: a target stating `user:secret@` dials its host and
-/// port alone, so `:authority` carries no credential (RFC 9113 §8.3.1) and is the authority
-/// `locate` stated. RED: `:authority` was `user:secret@peer.test:50051`.
+
 #[test]
 fn a_targets_userinfo_never_reaches_the_authority() {
     let mut p = Pair::new();
@@ -1542,10 +1480,7 @@ fn a_targets_userinfo_never_reaches_the_authority() {
 }
 
 /// A CALL THE HOST ENDED READS NO MORE OF ITS REQUEST. The client is still uploading (no
-/// END_STREAM) when the host refuses the call: the trailers go out, the upload is stopped
-/// (RST_STREAM `NO_ERROR`, RFC 9113 §8.1), the call is let go of, and a message the client sends
-/// after it is never handed up. RED: the request body was still read, each later message queued as
-/// a piece for a call the host had finished, and the call held until the client's body ended.
+
 #[test]
 fn a_call_the_host_ended_reads_no_more_of_its_request() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -1571,8 +1506,7 @@ fn held_for_host(c: &Conn) -> usize {
 }
 
 /// Run `turns` rounds of a pair whose `sender` streams 60 kB messages on stream 1 as fast as its own
-/// backpressure lets it, while the `reader`'s host takes NOTHING it is handed; the most bytes the
-/// reader held for its host.
+
 fn stream_into_a_host_not_reading(p: &mut Pair, dial_sends: bool, turns: usize) -> usize {
     let m = msg::frame(&[7u8; 60_000]);
     let mut most = 0;
@@ -1591,13 +1525,11 @@ fn stream_into_a_host_not_reading(p: &mut Pair, dial_sends: bool, turns: usize) 
         let to_s = r.take_wire(usize::MAX);
         r.ingest(&to_r, false);
         s.ingest(&to_s, false);
-        // The sender's own host takes what it is handed (a writable piece, say).
+
         s.pieces().clear();
         most = most.max(held_for_host(r));
     }
-    // The host takes what it was handed: it is owed a re-call (`YIELD_MORE`), and the re-call reads
-    // on with no new byte from the far end, so a far end held back by flow control never waits on
-    // a host that has nothing left to take.
+
     let r = if dial_sends { &mut p.a } else { &mut p.d };
     r.pieces().clear();
     assert!(r.wire_pending(), "the host is owed a re-call");
@@ -1607,9 +1539,7 @@ fn stream_into_a_host_not_reading(p: &mut Pair, dial_sends: bool, turns: usize) 
 }
 
 /// AN ACCEPTED CALL'S MESSAGES ARE BOUNDED BY THE HOST'S TAKING THEM: a client uploads faster than
-/// the host takes the pieces it is handed, and the connection stops reading the call's body once it
-/// holds its mark for the host, so HTTP/2 flow control holds the client back. RED: every message
-/// was read and queued, and the window credit returned, whatever the host had taken.
+
 #[test]
 fn an_accepted_upload_the_host_does_not_take_is_bounded() {
     let mut p = Pair::new();
@@ -1625,7 +1555,7 @@ fn an_accepted_upload_the_host_does_not_take_is_bounded() {
 }
 
 /// The same bound on a dialled call's answer: a server streaming faster than the host takes the
-/// pieces is held back once the connection holds its mark for the host. RED: unbounded.
+
 #[test]
 fn a_dialled_answer_the_host_does_not_take_is_bounded() {
     let mut p = open_call(true, b"");
@@ -1638,9 +1568,7 @@ fn a_dialled_answer_the_host_does_not_take_is_bounded() {
 }
 
 /// A TRAILER BLOCK'S FORBIDDEN FIELDS ARE FILTERED AS A HEAD'S ARE: connection-specific fields
-/// (RFC 9113 §8.2.2) and the answer's own `content-type` never go out in the trailers, and the
-/// call ends with the block's `grpc-status`. RED: they went to HTTP/2 as given, which refused the
-/// trailers, and the call was reset instead of ending OK.
+
 #[test]
 fn a_trailer_blocks_forbidden_fields_are_filtered_as_a_heads_are() {
     let mut p = Pair::new();
@@ -1667,8 +1595,7 @@ fn a_trailer_blocks_forbidden_fields_are_filtered_as_a_heads_are() {
 }
 
 /// AN ANSWER HEAD FIELD THE WIRE CANNOT CARRY FAILS THE CALL IN WORDS, as the dial side refuses the
-/// same input: the host hears `INTERNAL` naming the field, and the client is answered. RED: the
-/// field was dropped and the call went on as if the head were whole.
+
 #[test]
 fn an_answer_head_field_the_wire_cannot_carry_fails_the_call_in_words() {
     let mut a = half_closed();
@@ -1683,8 +1610,7 @@ fn an_answer_head_field_the_wire_cannot_carry_fails_the_call_in_words() {
 }
 
 /// A TRAILER FIELD THE WIRE CANNOT CARRY FAILS THE REFUSAL IN WORDS and leaves the call open for
-/// the host's fallback close: never trailers that silently lack a field (`grpc-status` among
-/// them). RED: the field was dropped and the refusal answered as done.
+
 #[test]
 fn a_trailer_field_the_wire_cannot_carry_fails_the_refusal_in_words() {
     let mut a = half_closed();
@@ -1704,7 +1630,7 @@ fn a_trailer_field_the_wire_cannot_carry_fails_the_refusal_in_words() {
 }
 
 /// The terminal piece an accepted call's host hears after it emits `bytes` (`end` = they end the
-/// frame) as the answer's first bytes.
+
 fn answer_head_fails(bytes: &[u8], end: bool) -> Piece {
     let mut a = half_closed();
     a.emit(1, bytes, end, 0, 5 * SEC).expect("taken");
@@ -1717,8 +1643,7 @@ fn answer_head_fails(bytes: &[u8], end: bool) -> Piece {
 }
 
 /// AN ACCEPTED ANSWER'S FRAME THAT ENDS INSIDE ITS HEAD BLOCK FAILS IN WORDS, as the dial side's
-/// does: the host hears `INTERNAL` and the client is answered. RED: the partial block was held, the
-/// call never answered, and nothing said.
+
 #[test]
 fn an_accepted_answers_frame_ending_inside_its_head_block_fails_in_words() {
     let t = answer_head_fails(b"x-partial: yes\r\n", true);
@@ -1733,9 +1658,7 @@ fn an_accepted_answers_malformed_head_block_fails_in_words() {
 }
 
 /// A REFUSAL WHOSE BLOCK NAMES `grpc-status` BUT IS NO FIELD BLOCK FAILS IN WORDS and leaves the
-/// call open for the host's fallback close: the status the host meant is never silently replaced by
-/// its neutral status's mapping. Words that are no block at all still close with the neutral status
-/// (`a_refusal_without_a_status_is_unknown_with_its_text`). RED: `busbar answered HTTP 500`.
+
 #[test]
 fn a_refusal_naming_grpc_status_in_a_broken_block_fails_in_words() {
     let mut a = half_closed();
@@ -1765,8 +1688,7 @@ fn frame_types(wire: &[u8]) -> Vec<u8> {
 }
 
 /// THE DIALLED KEEP-ALIVE IS HONOURED: with a call open on a connection whose far end has gone
-/// silent, a PING goes out at the interval, and when it is not answered within the timeout the
-/// call fails rather than wait out its deadline.
+
 #[test]
 fn a_dialled_keep_alive_pings_and_fails_a_silent_far_end() {
     let now = 5 * SEC;
@@ -1803,8 +1725,7 @@ fn a_dialled_keep_alive_pings_and_fails_a_silent_far_end() {
 }
 
 /// A DIALLED CALL THAT STATES NO DEADLINE IS HELD TO `limits.upstream_request_timeout_secs`: the host
-/// is asked back at that time, and a far end that never answers fails the call
-/// `DEADLINE_EXCEEDED` then, not before and not never.
+
 #[test]
 fn a_dialled_call_stating_no_deadline_fails_at_the_configured_timeout() {
     let mut p = Pair::new();
@@ -1826,8 +1747,7 @@ fn a_dialled_call_stating_no_deadline_fails_at_the_configured_timeout() {
 }
 
 /// AN ACCEPTED CALL THAT IS NOT gRPC IS ANSWERED `415` HERE AND NEVER HANDED UP: a request whose
-/// content type is not gRPC's (sent by hand, as no dial of this framer would) reaches the far end as
-/// a bare HTTP 415, and the host hears nothing of it.
+
 #[test]
 fn an_accepted_call_that_is_not_grpc_is_answered_415_and_never_handed_up() {
     let mut p = Pair::new();
@@ -1856,8 +1776,7 @@ fn an_accepted_call_that_is_not_grpc_is_answered_415_and_never_handed_up() {
 }
 
 /// A DIALLED HEAD'S CONTENT TYPE MUST BE gRPC'S, and the fields this layer owns never go upstream
-/// from it: a head stating `application/json` fails `INTERNAL` in words; one stating `host` or
-/// `authority` sends neither (the call's authority is the target's).
+
 #[test]
 fn a_dialled_heads_content_type_and_reserved_fields_are_this_layers() {
     let mut p = Pair::new();
@@ -1882,14 +1801,12 @@ fn a_dialled_heads_content_type_and_reserved_fields_are_this_layers() {
 }
 
 /// A CONNECTION THAT FAILS WHILE IT HOLDS A BODY BACK FOR THE HOST STILL SAYS SO: the far end goes
-/// away while the dialled side holds its mark for a host not taking its pieces, and once the host
-/// has taken them the connection owes nothing more, so the op answers the failure. RED: the held
-/// body kept the host owed a re-call forever, and the failure was never answered.
+
 #[test]
 fn a_connection_failing_while_it_holds_a_body_back_still_says_so() {
     let mut p = open_call(true, b"");
     stream_into_a_host_not_reading(&mut p, false, 400);
-    // Hold back again, then the far end goes away mid-call.
+
     let m = msg::frame(&[7u8; 60_000]);
     for _ in 0..40 {
         if !p.a.announce_full(1) {
@@ -1909,9 +1826,7 @@ fn a_connection_failing_while_it_holds_a_body_back_still_says_so() {
 }
 
 /// ONE BUSY STREAM DOES NOT STARVE ANOTHER while the host holds the connection at its mark: two
-/// accepted calls both upload far faster than the host takes its pieces, and each drive reads from
-/// a different stream first, so both keep making headway. RED: the first stream filled the room on
-/// every drive, and once the connection was at its mark the second was never read.
+
 #[test]
 fn one_busy_stream_does_not_starve_another_while_the_host_is_slow() {
     let mut p = Pair::new();
@@ -1921,7 +1836,7 @@ fn one_busy_stream_does_not_starve_another_while_the_host_is_slow() {
         c.extend_from_slice(&m);
         p.d.emit(id, &c, false, 0, p.now).expect("open");
     }
-    // Pieces of each accepted call (1 and 2) the host takes once the connection is saturated.
+
     let mut late = [0usize; 2];
     for turn in 0..300 {
         for id in [1, 3] {
@@ -1939,7 +1854,7 @@ fn one_busy_stream_does_not_starve_another_while_the_host_is_slow() {
         p.a.ingest(&to_a, false);
         p.d.ingest(&to_d, false);
         p.d.pieces().clear();
-        // The host takes two pieces a turn, oldest first.
+
         for _ in 0..2 {
             if let Some(piece) = p.a.pieces().pop_front() {
                 if turn >= 150 && !piece.bytes.is_empty() && !piece.fields {
@@ -1975,7 +1890,7 @@ fn manual_reply_turn(d: &mut Conn, got: &mut Vec<Piece>, now: u64) {
 }
 
 fn response_head_with_status(status: Option<&str>) -> Vec<u8> {
-    let mut block = vec![0x88]; // HPACK :status 200.
+    let mut block = vec![0x88];
     lit_field(&mut block, "content-type", "application/grpc");
     if let Some(status) = status {
         lit_field(&mut block, "grpc-status", status);
@@ -2046,7 +1961,7 @@ fn terminal_response_headers_and_real_body_trailers_remain_successful() {
 }
 
 /// Both actual HTTP/2 peers have live connection and stream tasks when the host finishes them.
-/// Their task lists belong to the framing; an executor retained by a task must not retain them.
+
 #[test]
 fn dropping_active_grpc_framings_releases_both_connection_tasks_and_the_service() {
     let mut pair = Pair::new();

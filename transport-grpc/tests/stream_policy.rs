@@ -343,8 +343,7 @@ impl Host {
             if answer.open.is_some() {
                 return (answer, original);
             }
-            // Ordinary YIELD_MORE drains take no new input. A guest.open recall, by contrast,
-            // preserves the operation's original input, returned above for the host reply.
+
             original.clear();
             answer = self.ingest(&[], &[], ticket);
         }
@@ -390,7 +389,6 @@ fn opening() -> Vec<u8> {
 }
 
 fn request(stream: u32, target: &str, body: &[u8], end: bool) -> Vec<u8> {
-    // The same no-Huffman, literal-without-indexing HPACK fixture as engine_tests::opening.
     let mut head = vec![0x83, 0x86];
     for (name, value) in [
         (":path", target),
@@ -612,7 +610,7 @@ fn the_actual_http_method_must_match_before_a_none_line_is_handed_in() {
     let mut host = Host::new();
     host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
     let mut call = request(1, "/first", &[], true);
-    call[9] = 0x82; // The static HPACK entry for GET, replacing POST.
+    call[9] = 0x82;
     let mut bytes = opening();
     bytes.extend(call);
     let (_, original) = host.until_open(&bytes, ticket(2));

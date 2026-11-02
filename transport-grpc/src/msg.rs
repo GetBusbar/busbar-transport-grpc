@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 pub const PREFIX: usize = 5;
 
 /// The one content type every gRPC answer and request carries (its `+proto`/`+json` forms extend
-/// it).
+
 pub const CONTENT_TYPE: &str = "application/grpc";
 
 /// Whether `v` is a gRPC content type: `application/grpc`, or it followed by `+` or `;`.
@@ -42,7 +42,7 @@ pub fn is_grpc_content_type(v: &[u8]) -> bool {
 }
 
 /// The prefix of a message whose payload is `len` bytes; `None` past `u32::MAX`, a length no
-/// prefix states.
+
 #[must_use]
 pub fn prefix(len: usize) -> Option<[u8; PREFIX]> {
     let n = u32::try_from(len).ok()?.to_be_bytes();
@@ -73,10 +73,7 @@ pub enum Bad {
 
 impl Bad {
     /// The `grpc-status` a call fails with for it: `RESOURCE_EXHAUSTED` for an oversize message, on
-    /// the dial and both accept paths (gRPC's status codes: "received message larger than max");
-    /// `UNIMPLEMENTED` for
-    /// a compression the door does not take (gRPC's compression rules, `compression.md`);
-    /// `INTERNAL` else.
+
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
@@ -87,12 +84,7 @@ impl Bad {
     }
 
     /// The closing status lines a call this failed closes with ([`status_lines`]): for a compression
-    /// the door does not take, `grpc-accept-encoding` (the encodings it takes, `compression.md`)
-    /// first, then the status.
-    ///
-    /// # Errors
-    ///
-    /// Never for these texts: [`status_lines`] refuses only details, and these state none.
+
     pub fn close_lines(&self) -> Result<Vec<u8>, &'static str> {
         let mut out = Vec::new();
         if matches!(self, Self::Encoding(_)) {
@@ -110,13 +102,13 @@ impl Bad {
 }
 
 /// The compression a call's `grpc-encoding` value `v` names, where this door does not take it:
-/// every value but `identity`, the one encoding it takes. `None` = the call is not compressed.
+
 #[must_use]
 pub fn unsupported_encoding(v: &[u8]) -> Option<Bad> {
     if v == b"identity" {
         return None;
     }
-    // Text where it is text; else the bytes, each as its number.
+
     Some(Bad::Encoding(
         std::str::from_utf8(v).map_or_else(|_| format!("{v:?}"), str::to_owned),
     ))
@@ -132,8 +124,7 @@ impl std::fmt::Display for Bad {
                 f,
                 "the message encoding `{name}` is not supported: this server takes identity"
             ),
-            // This framer's own words, naming the configured ceiling: the
-            // same `limits.request_body_max_bytes` that bounds every inbound body.
+
             Self::TooLarge(n, limit) => write!(
                 f,
                 "the message is {n} bytes, over the limit of {limit} bytes \
@@ -165,21 +156,13 @@ impl Messages {
     }
 
     /// Take `bytes`, and answer every message they complete (each in its length-prefixed form).
-    ///
-    /// # Errors
-    ///
-    /// A message is compressed or over the ceiling.
+
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, Bad> {
         self.push_bytes(Bytes::copy_from_slice(bytes))
     }
 
     /// [`Messages::push`] for bytes already shared: with nothing held back, each whole message in
-    /// `data` is a slice of it (no copy), and only a cut tail is held. Once the stream failed,
-    /// every push answers that failure and holds nothing.
-    ///
-    /// # Errors
-    ///
-    /// A message is compressed or over the ceiling.
+
     pub fn push_bytes(&mut self, mut data: Bytes) -> Result<Vec<Bytes>, Bad> {
         if let Some(e) = &self.failed {
             return Err(e.clone());
@@ -205,7 +188,7 @@ impl Messages {
     }
 
     /// THE ONE CUT: the length (prefix and payload) of each whole message off the front of `data`,
-    /// in order; a cut tail is left for the next push.
+
     fn whole(&self, data: &[u8]) -> Result<Vec<usize>, Bad> {
         let mut lens = Vec::new();
         let mut rest = data;
@@ -214,7 +197,7 @@ impl Messages {
                 return Err(Bad::Compressed);
             }
             let n = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
-            // Checked: on a 32-bit target a ceiling near `usize::MAX` must not wrap the length.
+
             let Some(len) = PREFIX.checked_add(n).filter(|_| n <= self.max) else {
                 return Err(Bad::TooLarge(n, self.max));
             };
@@ -228,10 +211,7 @@ impl Messages {
     }
 
     /// The stream ended.
-    ///
-    /// # Errors
-    ///
-    /// It ended inside a message.
+
     pub fn end(&self) -> Result<(), Bad> {
         if self.buf.is_empty() {
             Ok(())
@@ -276,7 +256,7 @@ pub const UNAVAILABLE: u16 = 14;
 pub const UNAUTHENTICATED: u16 = 16;
 
 /// The `grpc-status` an answer that is not gRPC stands for, by its HTTP status
-/// (`http-grpc-status-mapping.md`).
+
 #[must_use]
 pub fn status_of_http(code: u16) -> u16 {
     use http::StatusCode;
@@ -298,17 +278,7 @@ pub fn status_of_http(code: u16) -> u16 {
 }
 
 /// The `grpc-status` an HTTP/2 error `code` stands for on a dialled stream it ended (a reset or a
-/// GOAWAY, either end's), before or after the answer's head alike: gRPC over HTTP/2
-/// (PROTOCOL-HTTP2.md, "Errors"). `REFUSED_STREAM` is `UNAVAILABLE` (nothing was processed: safe
-/// to retry), `CANCEL` is `CANCELLED`, `ENHANCE_YOUR_CALM` is `RESOURCE_EXHAUSTED`,
-/// `INADEQUATE_SECURITY` is `PERMISSION_DENIED`, and every other code is `INTERNAL`: the ones the
-/// table lists so (`NO_ERROR`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `FLOW_CONTROL_ERROR`,
-/// `SETTINGS_TIMEOUT`, `FRAME_SIZE_ERROR`, `COMPRESSION_ERROR`, `CONNECT_ERROR`,
-/// `HTTP_1_1_REQUIRED`), `STREAM_CLOSED`, which it does not list, and a code HTTP/2 does not
-/// define. RFC 9113 §7 permits this, saying an unknown code MAY be treated as `INTERNAL_ERROR`, and
-/// nothing about such a stream says the far end processed nothing, so it is never read as safe to
-/// retry. (The one exception is the caller's: a far end's graceful GOAWAY, `NO_ERROR`, says exactly
-/// that, and the dial reads it `UNAVAILABLE`.)
+
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
     match h2::Reason::from(code) {
@@ -346,9 +316,7 @@ pub fn reset_name(code: u32) -> String {
 }
 
 /// The `grpc-status` a refusal's neutral status ([`RefuseIn::status`]) stands for on a call's
-/// end: the HTTP-to-status table, and `413` as `RESOURCE_EXHAUSTED`.
-///
-/// [`RefuseIn::status`]: busbar_contract::abi::transport::RefuseIn::status
+
 #[must_use]
 pub fn status_of_refusal(status: u32) -> u16 {
     match status {
@@ -358,7 +326,7 @@ pub fn status_of_refusal(status: u32) -> u16 {
 }
 
 /// The `grpc-message` a refusal's neutral status ends a call with when its trailer block states
-/// no `grpc-status`.
+
 #[must_use]
 pub fn refusal_message(status: u32) -> String {
     format!("busbar answered HTTP {status}")
@@ -383,7 +351,6 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len());
     let mut i = 0;
     while i < v.len() {
-        // Two ASCII hex digits, nothing else (`from_str_radix` alone also takes a sign).
         if v[i] == b'%'
             && i + 2 < v.len()
             && v[i + 1].is_ascii_hexdigit()
@@ -403,10 +370,7 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
 }
 
 /// A far end's `grpc-message` value as the text the host is handed for the call's failure:
-/// percent-decoded ([`decode_message`]), read as UTF-8 with every invalid sequence replaced (U+FFFD),
-/// every control character escaped as Rust writes it (`\n`, `\u{1b}`), so no terminal escape or
-/// forged log line passes through, and cut to at most [`MESSAGE_TEXT_MAX`] bytes on a character's
-/// edge.
+
 #[must_use]
 pub fn message_text(v: &[u8]) -> Vec<u8> {
     let decoded = decode_message(v);
@@ -427,8 +391,7 @@ pub fn message_text(v: &[u8]) -> Vec<u8> {
 }
 
 /// `text` as a `grpc-message` value, for every `grpc-message` this door writes, on either accept
-/// side. The encoding is tonic 0.14's `Status`: every control byte, every byte past ASCII, and each of
-/// `` "#%<>`?{}`` and the space percent-encoded, upper-case hex; every other byte as it is.
+
 #[must_use]
 pub fn encode_status_message(text: &[u8]) -> String {
     let mut out = String::with_capacity(text.len());
@@ -455,15 +418,7 @@ pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// A refusal's bytes read as a trailer block: the block, where it states a `grpc-status`; `None`
-/// where it states none, or where the bytes are words and no block at all (both close with the
-/// refusal's neutral status). Words that merely mention `grpc-status` (a failure's text relayed as
-/// the refusal, say) are words.
-///
-/// # Errors
-///
-/// A line of the bytes is a `grpc-status:` field but the bytes are no field block: the host meant
-/// a status it did not write whole, which is said, never silently replaced by the neutral status's
-/// mapping.
+
 pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
     match read_head(&terminate_block(bytes), usize::MAX) {
         Ok(Some((h, _))) => Ok(h.get(GRPC_STATUS).is_some().then_some(h)),
@@ -489,15 +444,7 @@ pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
 }
 
 /// A stream's closing status lines in tonic 0.14's bytes and order (`Status::add_header`):
-/// `grpc-status`, then `grpc-message` where there is a message, then `grpc-status-details-bin`
-/// where there are details, the value the plane wrote, verbatim. A refusal's words and its neutral
-/// status's mapping are this door's own ([`refusal_message`], [`status_of_refusal`]; tonic has no
-/// refusal), and the details go out as the value the plane wrote (already the unpadded base64
-/// tonic wrote of the raw bytes).
-///
-/// # Errors
-///
-/// The details are not one field value (a byte outside visible ASCII and the space).
+
 pub fn status_lines(code: u32, message: &[u8], details: &[u8]) -> Result<Vec<u8>, &'static str> {
     if !details.iter().all(|b| (0x20..=0x7e).contains(b)) {
         return Err("the status details are not one field value");
@@ -547,13 +494,8 @@ impl Head {
 }
 
 /// Read a head block off the front of `buf`: `Ok(None)` while it is incomplete, else the head and
-/// how many bytes of `buf` it took.
-///
-/// # Errors
-///
-/// A line is not `name: value`, or `content-length` is not a number.
+
 pub fn read_head(buf: &[u8], max: usize) -> Result<Option<(Head, usize)>, String> {
-    // An empty block is the blank line alone; otherwise the block ends at the first blank line.
     let (lines, took) = if buf.starts_with(b"\r\n") {
         (&buf[..0], 2)
     } else if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -596,10 +538,7 @@ pub fn read_head(buf: &[u8], max: usize) -> Result<Option<(Head, usize)>, String
 }
 
 /// Render a head block: `fields`, then `content-length` when given, then the blank line.
-///
-/// # Errors
-///
-/// A name or value carries a CR, an LF or a NUL (it would end a line the caller does not own).
+
 pub fn render_head(
     fields: &[(&str, &[u8])],
     content_length: Option<usize>,

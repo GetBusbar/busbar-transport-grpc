@@ -56,7 +56,7 @@ fn a_compressed_flag_is_refused() {
 fn an_oversize_length_is_refused_before_the_body_arrives() {
     let mut m = Messages::new(4);
     assert_eq!(m.push(&[0, 0, 0, 0, 5]), Err(Bad::TooLarge(5, 4)));
-    // exactly the ceiling is fine
+
     let mut ok = Messages::new(4);
     assert_eq!(ok.push(&frame(b"abcd")).unwrap().len(), 1);
 }
@@ -108,7 +108,7 @@ fn a_percent_escape_is_decoded() {
     assert_eq!(decode_message(b"a%20b"), b"a b");
     assert_eq!(decode_message(b"%20"), b" ");
     assert_eq!(decode_message(b"%C3%A9"), "é".as_bytes());
-    // A signed escape is malformed and stays as it was sent.
+
     assert_eq!(decode_message(b"a%+fb"), b"a%+fb");
 }
 
@@ -287,9 +287,7 @@ fn a_refusals_neutral_status_maps_as_predevs_grpc_line_answered_it() {
 }
 
 /// A MESSAGE STREAM THAT FAILED HOLDS NOTHING MORE: once a message is over the ceiling (or
-/// compressed), every later push answers the same failure and buffers none of its bytes, through
-/// either way in. RED: each push was appended to the buffer before the check, so the ceiling bounded
-/// nothing after the first failure.
+
 #[test]
 fn a_failed_message_stream_holds_nothing_more() {
     let mut over = vec![0u8];
@@ -306,8 +304,7 @@ fn a_failed_message_stream_holds_nothing_more() {
 }
 
 /// A PAYLOAD NO LENGTH PREFIX CAN STATE HAS NONE: past `u32::MAX` bytes there is no prefix, never a
-/// saturated one that lies about the length and desynchronises the far end's framing. RED:
-/// `[0, 255, 255, 255, 255]`.
+
 #[test]
 fn a_payload_past_u32_max_has_no_prefix() {
     let past = usize::try_from(u64::from(u32::MAX) + 1).expect("a 64-bit host");
@@ -316,8 +313,7 @@ fn a_payload_past_u32_max_has_no_prefix() {
 }
 
 /// A refusal's bytes are a block only where they are one: a block stating `grpc-status` is the
-/// close; words (even words naming `grpc-status`, a relayed failure's text) close with the neutral
-/// status; a broken block with a `grpc-status:` line is refused in words.
+
 #[test]
 fn a_refusals_bytes_are_a_block_only_where_they_are_one() {
     let block = refusal_block(b"grpc-status: 5\r\ngrpc-message: gone\r\n").expect("a block");

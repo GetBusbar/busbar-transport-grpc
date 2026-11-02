@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The door's statement passes the kind's own checks, its status rows class every canonical
-//! `grpc-status`, and its settings read as their declarations say.
 
 use busbar_contract::abi::transport::check::{
     check_claim_rows, check_claims, check_composes_over, check_fault_cover, check_fault_rows,
@@ -20,7 +19,7 @@ use crate::meta::{COMPOSES_OVER, FAULT_ROWS, SETTINGS, STATUS_ROWS};
 #[test]
 fn the_tail_is_a_framer_that_names_no_other_transport() {
     assert_eq!(check_tail(&TAIL), Ok(()));
-    // One row per scheme the Statement names: the names are the Statement's alone.
+
     assert_eq!(check_claim_rows(STATEMENT.claims_len(), &TAIL), Ok(()));
     assert_eq!(CLAIM_NAMES.len(), CLAIMS.len());
     assert_eq!(check_claims(CLAIMS), Ok(()));
@@ -30,8 +29,7 @@ fn the_tail_is_a_framer_that_names_no_other_transport() {
     assert_eq!(check_fault_cover(STATUS_ROWS, FAULT_ROWS), Ok(()));
     assert_eq!(check_settings(SETTINGS), Ok(()));
     assert_eq!(TAIL.role, ROLE_FRAMER);
-    // No transport names another. The connector picks the
-    // carrier; the tail names none, so the connector serves it over the host's socket.
+
     assert!(COMPOSES_OVER.is_empty());
     assert_eq!(TAIL.composes_over_len(), 0);
 }
@@ -49,8 +47,7 @@ fn every_canonical_status_has_the_class_its_http_mapping_gives_it() {
 }
 
 /// Every code gRPC defines, stated as the breaker's reading. Written out rather than derived from
-/// the table, so a row that drifted fails here: which codes penalise the destination, which take it
-/// down across every pool, and which are the caller's own and cost the destination nothing.
+
 #[test]
 fn every_canonical_status_has_the_breakers_fault_reading() {
     let expect: [(u16, u8); 17] = [
@@ -76,7 +73,7 @@ fn every_canonical_status_has_the_breakers_fault_reading() {
         assert_eq!(fault_of(code), fault, "code {code}");
     }
     assert_eq!(FAULT_ROWS.len(), expect.len(), "one row per code, no more");
-    // A code gRPC has not defined is evidence about nobody: no reading.
+
     assert_eq!(fault_of(17), FAULT_NONE);
     assert_eq!(fault_of(200), FAULT_NONE);
 }
@@ -86,8 +83,7 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     let p = read_settings(b"").expect("absent reads as {}");
     assert_eq!(p.timeout.as_secs(), 300);
     assert_eq!(p.max_message_bytes, 33_554_432);
-    // The fixed connection posture: keep-alive pings every 30 s, failed after 10 s unanswered, and
-    // the adaptive window.
+
     assert_eq!(
         p.keep_alive_interval,
         Some(std::time::Duration::from_secs(30))
@@ -104,7 +100,7 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
 }
 
 /// EACH DECLARED DEFAULT IS THE VALUE THE DOOR APPLIES when the setting is absent: the declaration
-/// the host shows and validates, and the posture `open` reads from `{}`, never two facts.
+
 #[test]
 fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
     use crate::meta::DEFAULT_TIMEOUT;
@@ -115,8 +111,7 @@ fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
 }
 
 /// AN ILL-TYPED OR ZERO SETTING IS REFUSED BY ITS NAME, in http's words (`settings: <key> must be a
-/// count of <unit> above 0`, the kind's grammar): a zero timeout would fail every call at once, and
-/// a zero ceiling would refuse every message. RED: `must be a count of <unit>`, and zero taken.
+
 #[test]
 fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
     let why = |json: &[u8]| {
@@ -146,8 +141,7 @@ fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
 }
 
 /// THE TAIL STATES EXACTLY THE OPS THIS DOOR SERVES (ruling R1: every framer states its own): it
-/// dials and it serves the accepted side (`begin` on `SIDE_ACCEPT` and `SIDE_ACCEPT_STREAM`); it
-/// neither detaches nor adopts (both `not_served!`). RED: no op bit, which declares no op.
+
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
@@ -156,12 +150,7 @@ fn the_tail_states_the_ops_the_door_serves() {
 }
 
 /// THE CLAIM DECLARES ONLY THE SELECTOR FORMS SOMETHING HONOURS (ruling R3): the route vocabulary
-/// at the pin (`abi::transport::route`: the exact, pattern, prefix, suffix and contains path forms;
-/// a field present or its value's prefix), every one of which this door can honour, since a call
-/// states its path and its metadata. Nothing evaluates an exact field value, an SNI, an ALPN or a
-/// port for a framer's claim, and a `Port` form marks a claim as an address carrier's
-/// (plugin-loader `ported`). RED: `HeaderExact`, `Sni`, `Alpn` and `Port` declared, and the
-/// suffix and contains path forms missing.
+
 #[test]
 fn the_claim_declares_only_the_selector_forms_something_honours() {
     use busbar_contract::SelectorForm;
