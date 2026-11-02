@@ -136,7 +136,7 @@ impl StreamCall {
 
     /// One reply message's payload bytes (`ends` = they complete it). A call already closed takes
     /// none: body bytes after the closing lines would follow the trailers. Nor does a reply that
-    /// was cut ([`StreamCall::cut`]).
+    /// was cut ([`StreamCall::cut_reply`]).
     ///
     /// # Errors
     ///
