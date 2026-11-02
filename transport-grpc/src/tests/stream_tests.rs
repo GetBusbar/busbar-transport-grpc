@@ -416,9 +416,8 @@ fn an_encoding_name_with_controls_is_escaped_in_the_refusal() {
     assert!(why.0.contains("\\xc2\\x9b"), "{}", why.0);
 }
 
-/// A CLOSE WHILE A REPLY MESSAGE IS STILL BEING WRITTEN never closes whole: the partial message is
-/// dropped and the call closes `INTERNAL` in words, whatever status the host states. RED: the
-/// partial message was dropped silently and the call closed `grpc-status: 0`.
+/// An unfinished reply refuses a successful close without writes and remains recoverable;
+/// an explicit nonzero host refusal retains its status.
 #[test]
 fn an_unfinished_reply_cannot_close_successfully_and_a_refusal_keeps_its_status() {
     for status in [0, 5] {
