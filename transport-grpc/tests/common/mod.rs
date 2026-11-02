@@ -73,43 +73,6 @@ pub fn linked() -> &'static Ops {
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
-/// THE IMAGE WHERE `cargo test` DID NOT BUILD IT, or built it before the code under test: the
-fn image_built_here(profile: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
-    static BUILT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    BUILT
-        .get_or_init(|| {
-            let name = profile.file_name()?;
-            let target = profile.parent()?.join("grpc-door-image");
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut build = std::process::Command::new(cargo);
-            build
-                .args([
-                    "build",
-                    "--locked",
-                    "--package",
-                    "busbar-transport-grpc-plugin",
-                    "--lib",
-                    "--manifest-path",
-                ])
-                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
-                .arg("--target-dir")
-                .arg(&target);
-            if name == "release" {
-                build.arg("--release");
-            }
-            let status = build
-                .status()
-                .expect("run cargo to build the dropped-in image");
-            assert!(
-                status.success(),
-                "cargo build --package busbar-transport-grpc-plugin: {status}"
-            );
-            let path = target.join(name).join(file);
-            path.exists().then_some(path)
-        })
-        .clone()
-}
-
 pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -121,33 +84,21 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
-    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-
-    let lib_built = std::fs::read_dir(profile.join("deps"))
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("libbusbar_transport_grpc-") && n.ends_with(".rlib"))
-        })
-        .filter_map(|p| modified(&p))
-        .max();
-
-    let built = || {
-        [profile.join(&file), profile.join("deps").join(&file)]
-            .into_iter()
-            .filter_map(|p| Some((modified(&p)?, p)))
-            .max()
-            .filter(|(at, _)| lib_built.is_none_or(|lib| *at >= lib))
-            .map(|(_, p)| p)
+    let path = match std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+            path
+        }
+        None => profile.join(file),
     };
-    let path = built()
-        .or_else(|| image_built_here(profile, &file))
-        .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
-    // SAFETY: our own plugin cdylib, built by this `cargo test` (or by `image_built_here`).
+    assert!(
+        path.is_file(),
+        "build this product's actual cdylib before testing: {}",
+        path.display()
+    );
+    // SAFETY: the test runner supplies this freshly built actual product cdylib; local runs
+    // use the same product's deterministic target/profile path, with a missing image fatal.
     let lib: &'static libloading::Library = Box::leak(Box::new(
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));
