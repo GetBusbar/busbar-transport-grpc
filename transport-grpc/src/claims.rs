@@ -8,7 +8,7 @@ use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::transport::{Claim, STATUS_AT_TERMINAL, UNIT0_FIRST_MESSAGE};
-use busbar_contract::transport::registry::{facts as tfacts, status_ns};
+use busbar_contract::transport::registry::facts as tfacts;
 use busbar_contract::SelectorForm;
 
 /// The shapes an ingress claim over this wire may take: a call is a path (`/<service>/<method>`)
@@ -40,7 +40,7 @@ pub(crate) const CLAIMS: &[Claim] = &[{
     let mut c = Claim::EMPTY.with_facts(FACTS);
     c.selector_forms = AbiStr::of_bytes(&SELECTOR_CODES);
     c.egress_selector_forms = abi_str("");
-    c.status_namespace = abi_str(status_ns::GRPC);
+    c.status_namespace = abi_str("grpc");
 
     c.session = crate::meta::SESSION as u8;
     c.session_bound = 1;

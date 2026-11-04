@@ -57,6 +57,10 @@ busbar_contract::statement_extensions!(
             busbar_contract::abi::transport::EXT_OFFERED_POINTS,
             &OFFERED_POINTS
         ),
+        (
+            busbar_contract::abi::transport::status::EXT_HANDOFF_STATUS,
+            br#"[{"claim":"grpc","namespace":"http"}]"#
+        ),
     ]
 );
 
@@ -635,7 +639,15 @@ fn on_stream(
     if let Err(e) = f(&mut c) {
         return o.fail(op_failed(op, &e));
     }
-    fill(&mut *c, sink, o, class_of, fault_of);
+    // A one-stream framing only emits a numeric piece for its opening head; final gRPC
+    // numbers remain in the transport-rendered trailers.
+    fill(
+        &mut *c,
+        sink,
+        o,
+        |_| busbar_contract::abi::transport::STATUS_SUCCESS,
+        |_| busbar_contract::abi::transport::FAULT_NONE,
+    );
     Outcome::Ready
 }
 

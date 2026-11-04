@@ -108,7 +108,7 @@ const HTTP_FAULTS: &[(u16, u16, u8)] = &[
     (401, 401, FAULT_HARD),
     (403, 403, FAULT_HARD),
     (408, 408, FAULT_TRANSIENT),
-    (429, 429, FAULT_TRANSIENT),
+    (429, 429, busbar_contract::abi::transport::FAULT_RATE_LIMIT),
     (500, 599, FAULT_TRANSIENT),
 ];
 

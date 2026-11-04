@@ -69,7 +69,7 @@ fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
     c.refuse(b"", 429, false).unwrap();
     assert_eq!(
         wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 14\r\n\
+        "content-type: application/grpc\r\ngrpc-status: 14\r\n\
          grpc-message: busbar%20answered%20HTTP%20429\r\n"
     );
     let mut c = grpc();
@@ -77,7 +77,7 @@ fn a_close_after_a_reply_is_trailers_and_before_one_the_whole_answer() {
         .unwrap();
     assert_eq!(
         wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 7\r\ngrpc-message: no\r\n",
+        "content-type: application/grpc\r\ngrpc-status: 7\r\ngrpc-message: no\r\n",
         "a block that states its status is the close, verbatim"
     );
 }
@@ -124,7 +124,7 @@ fn an_oversize_message_closes_the_stream_resource_exhausted_naming_the_limit() {
     c.refuse(why.0.as_bytes(), 400, false).unwrap();
     assert_eq!(
         wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 8\r\n\
+        "content-type: application/grpc\r\ngrpc-status: 8\r\n\
          grpc-message: the%20message%20is%201025%20bytes,%20over%20the%20limit%20of%201024%20bytes\
          %20(limits.request_body_max_bytes)\r\n"
     );
@@ -200,7 +200,7 @@ fn open_with(fields: &[(&'static [u8], &'static [u8])]) -> StreamCall {
 
 /// The close a compression the door does not take ends a call with, before any reply: the whole
 /// answer, `UNIMPLEMENTED` with the encodings the door takes, and this framer's words.
-const UNIMPLEMENTED_GZIP: &str = ":status: 200\r\ncontent-type: application/grpc\r\n\
+const UNIMPLEMENTED_GZIP: &str = "content-type: application/grpc\r\n\
      grpc-accept-encoding: identity\r\ngrpc-status: 12\r\ngrpc-message: the%20message%20encoding\
      %20%60gzip%60%20is%20not%20supported:%20this%20server%20takes%20identity\r\n";
 
@@ -270,7 +270,7 @@ fn a_refusal_stating_no_status_either_way_is_unknown_with_its_words() {
     c.refuse(b"upstream gone", 0, false).unwrap();
     assert_eq!(
         wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 2\r\n\
+        "content-type: application/grpc\r\ngrpc-status: 2\r\n\
          grpc-message: upstream%20gone\r\n"
     );
 }
@@ -306,7 +306,7 @@ fn a_refusal_blocks_own_content_type_and_connection_fields_are_dropped() {
     .unwrap();
     assert_eq!(
         wire(&mut c),
-        ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 7\r\n"
+        "content-type: application/grpc\r\ngrpc-status: 7\r\n"
     );
 }
 
@@ -481,6 +481,9 @@ fn unfinished_reply_can_be_refused_and_empty_success_remains_valid() {
     assert!(failed.contains("grpc-status:"));
     assert!(!failed.contains("grpc-status: 0\r\n"));
     assert!(!failed.contains("unfinished"));
+    let opening = c.pieces().pop_front().expect("refusal opening status");
+    assert_eq!(opening.status, Some(200));
+    assert!(StreamCall::code_handoff(&opening));
     assert!(c.ended());
 
     let mut c = grpc();
@@ -526,4 +529,15 @@ fn unfinished_fragments_past_the_bound_cut_the_reply() {
         c.take_wire(usize::MAX).is_empty(),
         "a cut reply writes nothing more"
     );
+}
+
+#[test]
+fn refusal_opening_status_is_metadata_in_its_declared_domain() {
+    let mut call = grpc();
+    call.refuse(b"", 429, false).unwrap();
+    let opening = call.pieces().pop_front().expect("opening status piece");
+    assert_eq!(opening.status, Some(200));
+    assert!(StreamCall::code_handoff(&opening));
+    assert!(opening.fields);
+    assert!(!wire(&mut call).contains(":status"));
 }

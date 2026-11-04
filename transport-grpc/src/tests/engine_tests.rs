@@ -597,7 +597,11 @@ fn a_bare_http_status_answer_is_an_answer_with_the_status_it_stands_for() {
         (409, msg::UNKNOWN, FAULT_CALLER),
         (500, msg::UNKNOWN, FAULT_TRANSIENT),
         (408, msg::UNKNOWN, FAULT_TRANSIENT),
-        (429, msg::UNAVAILABLE, FAULT_TRANSIENT),
+        (
+            429,
+            msg::UNAVAILABLE,
+            busbar_contract::abi::transport::FAULT_RATE_LIMIT,
+        ),
         (599, msg::UNKNOWN, FAULT_TRANSIENT),
         (404, msg::UNIMPLEMENTED, FAULT_CALLER),
     ] {
@@ -2759,4 +2763,59 @@ fn accepted_reset_keeps_its_reason_when_the_reply_is_dropped_first() {
             assert!(accepted.waiting.is_empty());
         }
     }
+}
+
+/// A peer can close a drained connection without first sending GOAWAY.
+#[test]
+fn eof_after_a_complete_call_ends_the_connection_without_failure() {
+    for same_drive in [false, true] {
+        let mut p = open_call(true, b"");
+        p.a.end_call(1, b"grpc-status: 0\r\n", 0).expect("end");
+        if same_drive {
+            p.a.drive(p.now);
+            let wire = p.a.take_wire(usize::MAX);
+            p.d.ingest(&wire, true);
+            p.d.drive(p.now);
+            p.got_d.extend(p.d.pieces().drain(..));
+        } else {
+            p.settle();
+            p.d.ingest(&[], true);
+            p.d.drive(p.now);
+        }
+        assert_eq!(terminal(&p.got_d, 1).unwrap().status, Some(msg::OK));
+        assert!(p.d.ended(), "same_drive {same_drive}");
+        assert_eq!(p.d.failure(), None, "same_drive {same_drive}");
+    }
+}
+
+#[test]
+fn eof_with_an_unfinished_call_still_fails_the_connection() {
+    let mut p = open_call(true, b"");
+    p.d.ingest(&[], true);
+    p.d.drive(p.now);
+    assert!(p.d.failure().is_some());
+    assert!(p.d.pieces().iter().any(|piece| piece.failed));
+}
+
+#[test]
+fn eof_inside_a_frame_after_a_complete_call_still_fails() {
+    for prefix in [3, 10] {
+        let mut p = open_call(true, b"");
+        p.a.end_call(1, b"grpc-status: 0\r\n", 0).expect("end");
+        p.settle();
+        // A PING truncated in its frame header or payload is never a clean EOF.
+        let ping = h2(6, 0, 0, &[0; 8]);
+        p.d.ingest(&ping[..prefix], true);
+        p.d.drive(p.now);
+        assert!(p.d.failure().is_some(), "prefix {prefix}");
+    }
+}
+
+#[test]
+fn eof_before_the_peer_settings_still_fails() {
+    let mut d = Conn::dial("http://peer.test:50051", posture(), 0).expect("dial");
+    d.drive(0);
+    d.ingest(&[], true);
+    d.drive(0);
+    assert!(d.failure().is_some());
 }

@@ -28,7 +28,7 @@
 //!   `RESOURCE_EXHAUSTED`, naming the configured limit; a compression the door does not take
 //!   `UNIMPLEMENTED`; a message flagged compressed with none agreed, or a body that ended inside a
 //!   message, `INTERNAL`; before any message went out the block is the whole answer (trailers-only:
-//!   `:status: 200`, `content-type`, then the status lines).
+//!   opening status metadata `200`, `content-type`, then the status lines).
 //!
 //! Every block is field lines (`name: value` CRLF each) in `wire`, which the host sends verbatim.
 
@@ -241,7 +241,10 @@ impl StreamCall {
 
         self.closed = true;
         if !self.answered && !head_sent {
-            self.wire.extend(b":status: 200\r\n");
+            self.out.push_back(Piece {
+                status: Some(200),
+                ..Piece::fields(STREAM, bytes::Bytes::new())
+            });
             self.wire
                 .extend(format!("content-type: {}\r\n", msg::CONTENT_TYPE).as_bytes());
         }
@@ -283,6 +286,10 @@ fn cut_lines(why: &str) -> Result<Vec<u8>, Failure> {
 }
 
 impl Owed for StreamCall {
+    fn code_handoff(piece: &Piece) -> bool {
+        piece.status.is_some()
+    }
+
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
         let n = cap.min(self.wire.len());
         let taken = self.wire.drain(..n).collect();
@@ -304,7 +311,7 @@ impl Owed for StreamCall {
         None
     }
     fn ended(&self) -> bool {
-        self.closed && self.wire.is_empty()
+        self.closed && self.wire.is_empty() && self.out.is_empty()
     }
 }
 

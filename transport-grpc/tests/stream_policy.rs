@@ -116,7 +116,6 @@ extern "C" fn refuse(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> 
         input.answer.write_unaligned(RefusalAnswer {
             size: size_of::<RefusalAnswer>() as u32,
             status: if mode == 1 { 99 } else { 403 },
-            _reserved: 0,
             fields,
             fields_len: usize::from(!fields.is_null()),
             body: Blob::of(b"denied-verbatim"),

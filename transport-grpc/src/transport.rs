@@ -357,7 +357,7 @@ pub struct Conn {
     io: HostIo,
     tasks: Tasks,
     out: VecDeque<Piece>,
-    conn_err: Arc<Mutex<Option<String>>>,
+    conn_err: Arc<Mutex<Option<hyper::Error>>>,
     conn_done: Arc<AtomicBool>,
     failed: Option<Failure>,
     posture: Posture,
@@ -398,7 +398,7 @@ impl Owed for Conn {
 fn watch<F>(
     exec: &impl Executor<BoxFut<()>>,
     conn: F,
-    err: &Arc<Mutex<Option<String>>>,
+    err: &Arc<Mutex<Option<hyper::Error>>>,
     done: &Arc<AtomicBool>,
 ) where
     F: Future<Output = hyper::Result<()>> + Send + 'static,
@@ -406,7 +406,7 @@ fn watch<F>(
     let (err, done) = (err.clone(), done.clone());
     exec.execute(Box::pin(async move {
         if let Err(e) = conn.await {
-            *err.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
+            *err.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
         }
         done.store(true, Ordering::Release);
     }));
@@ -790,6 +790,7 @@ impl Conn {
         let turn = self.turn;
         self.turn = self.turn.wrapping_add(1);
         let held_back = &mut self.held_back;
+        let mut stream_failed = false;
         let r = io.rounds(|cx| {
             self.tasks.run(cx);
             let mut room = Room::of(&self.out, turn);
@@ -810,7 +811,9 @@ impl Conn {
                     .sum(),
             };
             let r = match &mut self.side {
-                Side::Dial(d) => d.step(&mut self.out, &mut room, max, cx),
+                Side::Dial(d) => d.step(&mut self.out, &mut room, max, cx).map(|failed| {
+                    stream_failed |= failed;
+                }),
                 Side::Accept(a) => {
                     a.step(&mut self.out, &mut room, max, cx);
                     Ok(())
@@ -827,9 +830,16 @@ impl Conn {
             .conn_err
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+            .take();
         if let Some(e) = err {
-            self.failed = Some(Failure(e));
+            // h2 reports a frame-boundary EOF as BrokenPipe even after the last RPC
+            // completed. Keep truncated frames and unfinished calls as failures, including
+            // calls that this drive swept after reporting a stream failure.
+            let drained = matches!(&self.side, Side::Dial(d)
+                if d.calls.is_empty() && !d.ended.0.is_empty());
+            if !(drained && !stream_failed && boundary_eof(&e)) {
+                self.failed = Some(Failure(e.to_string()));
+            }
         }
     }
 
@@ -838,6 +848,25 @@ impl Conn {
     pub fn failure(&self) -> Option<&Failure> {
         self.failed.as_ref()
     }
+}
+
+/// h2 distinguishes a complete frame boundary (BrokenPipe) from a truncated frame
+/// (UnexpectedEof). Preserve that distinction instead of matching Hyper's display text.
+fn boundary_eof(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut at = Some(e);
+    while let Some(err) = at {
+        // Hyper unwraps h2 I/O errors before exposing its connection error.
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return io.kind() == std::io::ErrorKind::BrokenPipe;
+        }
+        if let Some(h) = err.downcast_ref::<h2::Error>() {
+            return h
+                .get_io()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe);
+        }
+        at = err.source();
+    }
+    false
 }
 
 /// What one drive round may still hand the host before it reads no more ([`INBOUND_HIGH_WATER`]).
@@ -1092,19 +1121,21 @@ impl Dial {
         room: &mut Room,
         max: usize,
         cx: &mut Context<'_>,
-    ) -> Result<(), Failure> {
+    ) -> Result<bool, Failure> {
         if let Some(h) = self.handshake.as_mut() {
             if let Poll::Ready(r) = h.as_mut().poll(cx) {
                 self.handshake = None;
                 self.sender = Some(r.map_err(|e| Failure(e.to_string()))?);
             }
         }
+        let mut stream_failed = false;
         for at in room.order(self.calls.len()) {
             let (id, s) = &mut self.calls[at];
             if let Err((why, code, conn)) = advance(*id, s, &mut self.sender, out, room, max, cx) {
                 if conn {
                     return Err(Failure(why));
                 }
+                stream_failed = true;
 
                 if let DStage::Body(_, msgs) = &s.stage {
                     room.partial = room.partial.saturating_sub(msgs.buffered());
@@ -1120,7 +1151,7 @@ impl Dial {
             }
         }
         self.sweep();
-        Ok(())
+        Ok(stream_failed)
     }
 }
 
@@ -1654,7 +1685,6 @@ impl Accept {
         match decision {
             Ok(Ok(unit)) => self.publish(request, max, Some(loan), unit, out),
             Ok(Err(refusal)) => {
-                let refused_status = msg::status_of_http(refusal.status);
                 let mut stream = AStream::new(
                     request.request,
                     request.reply,
@@ -1674,8 +1704,11 @@ impl Accept {
                         })?;
                         fields.append(name, value);
                     }
-                    let status = StatusCode::from_u16(refusal.status)
-                        .map_err(|_| Failure("the host refusal has an invalid status".into()))?;
+                    let status = u16::try_from(refusal.status)
+                        .ok()
+                        .filter(|status| (100..=599).contains(status))
+                        .and_then(|status| StatusCode::from_u16(status).ok())
+                        .ok_or_else(|| Failure("the host refusal has an invalid status".into()))?;
                     Ok::<_, Failure>((status, fields))
                 })();
                 let (status, fields) = match validated {
@@ -1703,7 +1736,7 @@ impl Accept {
                 stream.reply_over = true;
                 self.calls.push((request.id, stream));
                 out.push_back(Piece {
-                    status: Some(refused_status),
+                    status: Some(msg::status_of_http(status.as_u16())),
                     ..Piece::failure(request.id, "the host refused the call")
                 });
             }
