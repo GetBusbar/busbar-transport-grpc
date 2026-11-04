@@ -2819,3 +2819,89 @@ fn eof_before_the_peer_settings_still_fails() {
     d.drive(0);
     assert!(d.failure().is_some());
 }
+
+/// Leave a legal maximum-sized response incomplete so normal WINDOW_UPDATE traffic
+/// transfers its prefix without filling the host's output queue. The final DATA,
+/// a second message, trailers and EOF arrive in one drive.
+fn buffered_reply_eof(trailers: bool, truncated: bool) -> (Pair, Vec<u8>) {
+    let mut p = open_call(true, b"");
+    let payload = vec![0x5a; super::INBOUND_HIGH_WATER];
+    let framed = msg::frame(&payload);
+    let split = framed.len() - 1024;
+    p.a.emit(1, &framed[..split], false, 0, p.now).unwrap();
+    p.settle();
+    assert!(p.d.pieces().is_empty());
+    let mut last = framed[split..].to_vec();
+    last.extend(msg::frame(b"tail"));
+    p.a.emit(1, &last, false, 0, p.now).unwrap();
+    if trailers {
+        p.a.end_call(1, b"grpc-status: 0\r\n", 0).unwrap();
+    }
+    p.a.drive(p.now);
+    let mut wire = p.a.take_wire(usize::MAX);
+    assert!(!wire.is_empty());
+    if truncated {
+        wire.extend_from_slice(&h2(6, 0, 0, &[0; 8])[..10]);
+    }
+    p.d.ingest(&wire, true);
+    p.d.drive(p.now);
+    assert!(
+        p.d.held_back,
+        "the actual response reached the host high-water mark"
+    );
+    assert!(held_for_host(&p.d) >= super::INBOUND_HIGH_WATER);
+    (p, payload)
+}
+
+#[test]
+fn eof_drains_buffered_body_and_trailers_after_host_backpressure() {
+    let (mut p, payload) = buffered_reply_eof(true, false);
+    assert_eq!(p.d.failure(), None, "complete frames remain drainable");
+    assert!(
+        p.d.wire_pending(),
+        "the host must be recalled to drain the reply"
+    );
+    assert!(terminal(&p.got_d, 1).is_none());
+    let queued = held_for_host(&p.d);
+    for _ in 0..3 {
+        p.d.drive(p.now);
+        assert_eq!(held_for_host(&p.d), queued, "backpressure remains bounded");
+        assert_eq!(p.d.failure(), None);
+    }
+    p.got_d.extend(p.d.pieces().drain(..));
+    p.d.drive(p.now);
+    p.got_d.extend(p.d.pieces().drain(..));
+    let bodies: Vec<_> = p
+        .got_d
+        .iter()
+        .filter(|piece| !piece.fields && !piece.end && !piece.bytes.is_empty())
+        .map(|piece| piece.bytes.as_ref())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            msg::frame(&payload).as_slice(),
+            msg::frame(b"tail").as_slice()
+        ]
+    );
+    assert_eq!(terminal(&p.got_d, 1).unwrap().status, Some(msg::OK));
+    assert!(!p.got_d.iter().any(|piece| piece.failed));
+    assert_eq!(held(&p.d), 0);
+    assert!(p.d.ended());
+    assert_eq!(p.d.failure(), None);
+}
+
+#[test]
+fn eof_buffered_body_without_trailers_still_fails_after_drain() {
+    let (mut p, _) = buffered_reply_eof(false, false);
+    p.got_d.extend(p.d.pieces().drain(..));
+    p.d.drive(p.now);
+    assert!(p.d.failure().is_some());
+    assert!(p.d.pieces().iter().any(|piece| piece.failed));
+}
+
+#[test]
+fn eof_buffered_body_with_truncated_frame_still_fails() {
+    let (p, _) = buffered_reply_eof(true, true);
+    assert!(p.d.failure().is_some());
+}

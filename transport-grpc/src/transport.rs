@@ -837,9 +837,20 @@ impl Conn {
             // calls that this drive swept after reporting a stream failure.
             let drained = matches!(&self.side, Side::Dial(d)
                 if d.calls.is_empty() && !d.ended.0.is_empty());
-            if !(drained && !stream_failed && boundary_eof(&e)) {
-                self.failed = Some(Failure(e.to_string()));
+            if !stream_failed && boundary_eof(&e) {
+                if drained {
+                    return;
+                }
+                // Complete frames can still be queued in Incoming behind the host's
+                // high-water mark. Keep the terminal error until those bodies and
+                // trailers have been read; the next drive still rejects missing trailers
+                // or any stream failure. Do not bypass the bounded output queue.
+                if self.held_back && matches!(&self.side, Side::Dial(_)) {
+                    *self.conn_err.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
+                    return;
+                }
             }
+            self.failed = Some(Failure(e.to_string()));
         }
     }
 
