@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! What this transport declares about itself: its key, the settings it reads, its status classes
+//! and the transport kind's tail its door states.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::transport::{setting_decls, SettingRow, DEFAULT_BODY_MAX};
@@ -16,6 +17,7 @@ use busbar_contract::transport::registry::DEFAULT_REQUEST_TIMEOUT_SECS;
 pub const KEY: &str = "grpc";
 
 /// Whether its claim carries sessions: a connection multiplexes calls, each its own stream and
+/// session (the claim row's `session`).
 pub(crate) const SESSION: bool = true;
 
 /// The settings this transport reads.
@@ -27,9 +29,11 @@ pub mod setting {
 }
 
 /// What `grpc` composes over: NOTHING. No transport names another. The connector builds every
+/// connection as carrier -> [TLS] -> framer, and it picks the carrier from the target's scheme.
 pub(crate) const COMPOSES_OVER: &[AbiStr] = &[];
 
 /// `grpc-status` by class, as the canonical HTTP mapping of each code reads it: a `4xx` code is
+/// the caller's fault, a `5xx` the far end's.
 pub(crate) const STATUS_ROWS: &[StatusRow] = &[
     row(0, 0, STATUS_SUCCESS),
     row(1, 1, STATUS_CALLER_FAULT),
@@ -41,7 +45,7 @@ pub(crate) const STATUS_ROWS: &[StatusRow] = &[
     row(16, 16, STATUS_CALLER_FAULT),
 ];
 
-pub(crate) const fn row(lo: u32, hi: u32, class: u8) -> StatusRow {
+const fn row(lo: u32, hi: u32, class: u8) -> StatusRow {
     StatusRow {
         claim: 0,
         lo,
@@ -58,6 +62,8 @@ pub(crate) fn class_of(code: u16) -> u8 {
 }
 
 /// What each `grpc-status` means to the BREAKER: the fault table, beside the status table and
+/// never folded into it (the status class is the fee decision's leg, and the two disagree where the
+/// money and the destination's health do).
 pub(crate) const FAULT_ROWS: &[FaultRow] = &[
     fault_row(0, FAULT_CALLER),
     fault_row(1, FAULT_CALLER),
@@ -96,6 +102,8 @@ pub(crate) fn fault_of(code: u16) -> u8 {
 }
 
 /// How the breaker reads a BARE HTTP ANSWER (a far end, or a proxy or auth wall in front of it,
+/// answering a call with an HTTP status and no `grpc-status`), by that HTTP status: 401/403 hard
+/// (`Auth` -> `HardDown`); 408, 429, 529 and 5xx transient; every other status the caller's.
 const HTTP_FAULTS: &[(u16, u16, u8)] = &[
     (401, 401, FAULT_HARD),
     (403, 403, FAULT_HARD),
@@ -105,6 +113,7 @@ const HTTP_FAULTS: &[(u16, u16, u8)] = &[
 ];
 
 /// The breaker's reading of a bare HTTP answer's `status` ([`HTTP_FAULTS`]; off the table, the
+/// caller's).
 pub(crate) fn fault_of_http(status: u16) -> u8 {
     HTTP_FAULTS
         .iter()

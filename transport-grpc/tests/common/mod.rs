@@ -113,6 +113,7 @@ pub fn dropped() -> (&'static Ops, &'static libloading::Library) {
 }
 
 /// The socket the host holds: what the far end wrote and the host has not ingested (and whether
+/// it has ended), and the way to the far end.
 pub struct Socket {
     rx: Mutex<(VecDeque<u8>, bool)>,
     to_far: mpsc::UnboundedSender<Vec<u8>>,
@@ -181,6 +182,8 @@ impl Got {
 }
 
 /// Stream `stream`'s end, once it arrived: the status (code and class, from the trailers or a
+/// failure), and the terminal piece after it (whether the stream failed, and its whole bytes:
+/// empty on `OK`, else the decoded `grpc-message`).
 pub fn over(got: &[Got], stream: u64) -> Option<(u32, u8, bool, Vec<u8>)> {
     let mut status = None;
     let mut bytes = Vec::new();
@@ -375,6 +378,7 @@ impl Host {
     }
 
     /// `locate` as the connector asks it for an ACCEPTING listener (`LocateIn::accept`, an empty
+    /// target: a listener names no far end), judged by the kind's own check.
     pub fn locate_listener(&mut self) -> Result<Located, Outcome> {
         self.locate_as("", true)
     }
@@ -409,6 +413,8 @@ impl Host {
     }
 
     /// `locate` with the buffers lent at the given sizes (`authority`, `name`, `alpn`, `defaults`),
+    /// as a host with less room does, judged by the kind's own check: its outcome, its `out`, and
+    /// its text.
     pub fn locate_lent(
         &mut self,
         target: &str,
@@ -624,6 +630,7 @@ impl Host {
     }
 
     /// `finish` with a final tail stated by hand: `bytes`, and the `message` and `details` spans
+    /// into them, whatever they say.
     pub fn finish_spans(
         &mut self,
         status: u32,
@@ -693,6 +700,7 @@ impl Host {
     }
 
     /// `encode` an envelope: `path` as the target head word, then `fields`, then the one message
+    /// `body`.
     pub fn encode(&mut self, path: &str, fields: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
         let all: Vec<Field> = fields
             .iter()
@@ -741,6 +749,7 @@ impl Host {
     }
 
     /// `emit` `bytes` on `stream` ONCE, as a host whose far end is not reading does: no `YIELD_MORE`
+    /// re-call drains what the sink could not take.
     pub fn emit_held(&mut self, stream: u64, bytes: &[u8], end: bool) -> (Outcome, u32, String) {
         let mut i: EmitIn = z();
         i.framing = self.framing;
@@ -758,6 +767,7 @@ impl Host {
     }
 
     /// Re-call `emit` on `stream` with no new bytes until it has nothing more: the far end reads
+    /// again.
     pub fn emit_drain(&mut self, stream: u64) -> Outcome {
         self.drain(slot::EMIT, stream)
     }
@@ -794,6 +804,7 @@ impl Host {
     }
 
     /// Ingest whatever the far end sends until it stays quiet for `quiet` or `until` holds; the
+    /// first op that fails ends the pump with its outcome.
     pub fn pump_until(&mut self, quiet: Duration, until: impl Fn(&[Got]) -> bool) -> Outcome {
         let mut idle = Duration::ZERO;
         let step = Duration::from_millis(5);
@@ -931,6 +942,7 @@ impl Host {
     }
 
     /// Stream `stream`'s whole frames (pieces joined up to each end-of-frame) up to its status:
+    /// the head, the messages and (on an accepted stream) the far end's empty last.
     pub fn frames(&self, stream: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut cur = Vec::new();

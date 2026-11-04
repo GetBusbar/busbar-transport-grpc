@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **`grpc` transport as a droppable busbar plugin**: the `cdylib` a signed tarball of the wire
+//! carries (`kind: transport`, key `grpc`).
 
 #![deny(unsafe_code)]
 

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The claims this transport declares: the scheme it answers for and the selector forms and facts a claim over it reads. A declaration
+//! and nothing else, read once at registration.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
@@ -11,6 +12,7 @@ use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 use busbar_contract::SelectorForm;
 
 /// The shapes an ingress claim over this wire may take: a call is a path (`/<service>/<method>`)
+/// and its metadata.
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,

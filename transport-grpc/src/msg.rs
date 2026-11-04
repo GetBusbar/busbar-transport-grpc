@@ -19,9 +19,9 @@
 //! compressed; this door negotiates no compression, and a call whose `grpc-encoding` names one is
 //! answered `UNIMPLEMENTED` with the `grpc-accept-encoding` it takes, [`unsupported_encoding`]), a
 //! four-byte big-endian length, the payload.
-//! A frame this door answers is one whole message in that form, so it is never empty — an empty
+//! On connection framings, a data frame is one whole message in that form; an empty
 //! payload is still five bytes; the stream's end is its own piece (`PIECE_END`), never an empty
-//! frame.
+//! frame. One-stream framings hand up the payload alone, which may be empty.
 
 use bytes::{Bytes, BytesMut};
 
@@ -29,6 +29,7 @@ use bytes::{Bytes, BytesMut};
 pub const PREFIX: usize = 5;
 
 /// The one content type every gRPC answer and request carries (its `+proto`/`+json` forms extend
+/// it).
 pub const CONTENT_TYPE: &str = "application/grpc";
 
 /// Whether `v` is a gRPC content type: `application/grpc`, or it followed by `+` or `;`.
@@ -41,26 +42,26 @@ pub fn is_grpc_content_type(v: &[u8]) -> bool {
 }
 
 /// The prefix of a message whose payload is `len` bytes; `None` past `u32::MAX`, a length no
+/// prefix states.
 #[must_use]
 pub fn prefix(len: usize) -> Option<[u8; PREFIX]> {
     let n = u32::try_from(len).ok()?.to_be_bytes();
     Some([0, n[0], n[1], n[2], n[3]])
 }
 
-/// `payload` in its length-prefixed form.
 #[cfg(test)]
-pub fn frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PREFIX + payload.len());
-    out.extend_from_slice(&prefix(payload.len()).expect("a test payload is short"));
-    out.extend_from_slice(payload);
-    out
-}
+#[path = "tests/frame.rs"]
+mod frame_support;
+#[cfg(test)]
+pub use frame_support::frame;
 
 /// Why a message stream is not one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bad {
     /// A message is compressed, and no compression was agreed.
     Compressed,
+    /// The compression flag is neither zero nor one.
+    InvalidFlag(u8),
     /// The call's `grpc-encoding` names a compression this door does not take: the name, as text.
     Encoding(String),
     /// A message is larger than the ceiling: its stated length, and the ceiling.
@@ -71,16 +72,22 @@ pub enum Bad {
 
 impl Bad {
     /// The `grpc-status` a call fails with for it: `RESOURCE_EXHAUSTED` for an oversize message, on
+    /// the dial and both accept paths (gRPC's status codes: "received message larger than max");
+    /// `UNIMPLEMENTED` for
+    /// a compression the door does not take (gRPC's compression rules, `compression.md`);
+    /// `INTERNAL` else.
     #[must_use]
     pub fn status(&self) -> u16 {
         match self {
             Self::TooLarge(..) => RESOURCE_EXHAUSTED,
             Self::Encoding(_) => UNIMPLEMENTED,
-            Self::Compressed | Self::Truncated => INTERNAL,
+            Self::Compressed | Self::InvalidFlag(_) | Self::Truncated => INTERNAL,
         }
     }
 
     /// The closing status lines a call this failed closes with ([`status_lines`]): for a compression
+    /// the door does not take, `grpc-accept-encoding` (the encodings it takes, `compression.md`)
+    /// first, then the status.
     pub fn close_lines(&self) -> Result<Vec<u8>, &'static str> {
         let mut out = Vec::new();
         if matches!(self, Self::Encoding(_)) {
@@ -98,6 +105,7 @@ impl Bad {
 }
 
 /// The compression a call's `grpc-encoding` value `v` names, where this door does not take it:
+/// every value but `identity`, the one encoding it takes.
 #[must_use]
 pub fn unsupported_encoding(v: &[u8]) -> Option<Bad> {
     if v == ACCEPT_ENCODING.as_bytes() {
@@ -112,6 +120,7 @@ impl std::fmt::Display for Bad {
             Self::Compressed => {
                 f.write_str("a message is compressed and no compression was agreed")
             }
+            Self::InvalidFlag(flag) => write!(f, "invalid gRPC compression flag: {flag}"),
             Self::Encoding(name) => write!(
                 f,
                 "the message encoding `{name}` is not supported: this server takes identity"
@@ -150,10 +159,35 @@ impl Messages {
 
     /// Take `bytes`, and answer every message they complete (each in its length-prefixed form).
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, Bad> {
-        self.push_bytes(Bytes::copy_from_slice(bytes))
+        if self.buf.is_empty() {
+            return self.push_bytes(Bytes::copy_from_slice(bytes));
+        }
+        self.buf.extend_from_slice(bytes);
+        self.cut_buffer()
+    }
+
+    fn cut_buffer(&mut self) -> Result<Vec<Bytes>, Bad> {
+        let cut = self.whole(&self.buf).map(|lens| {
+            lens.into_iter()
+                .map(|n| self.buf.split_to(n).freeze())
+                .collect()
+        });
+        if self.buf.is_empty() {
+            self.buf = BytesMut::new();
+        } else if cut
+            .as_ref()
+            .is_ok_and(|messages: &Vec<Bytes>| !messages.is_empty())
+        {
+            self.buf = BytesMut::from(self.buf.as_ref());
+        }
+        cut.inspect_err(|e| {
+            self.failed = Some(e.clone());
+            self.buf = BytesMut::new();
+        })
     }
 
     /// [`Messages::push`] for bytes already shared: with nothing held back, each whole message in
+    /// `data` is a slice of it (no copy), and only a cut tail is held.
     pub fn push_bytes(&mut self, mut data: Bytes) -> Result<Vec<Bytes>, Bad> {
         if let Some(e) = &self.failed {
             return Err(e.clone());
@@ -166,12 +200,11 @@ impl Messages {
             })
         } else {
             self.buf.extend_from_slice(&data);
-            self.whole(&self.buf).map(|lens| {
-                lens.into_iter()
-                    .map(|n| self.buf.split_to(n).freeze())
-                    .collect()
-            })
+            self.cut_buffer()
         };
+        if self.buf.is_empty() {
+            self.buf = BytesMut::new();
+        }
         cut.inspect_err(|e| {
             self.failed = Some(e.clone());
             self.buf = BytesMut::new();
@@ -179,12 +212,15 @@ impl Messages {
     }
 
     /// THE ONE CUT: the length (prefix and payload) of each whole message off the front of `data`,
+    /// in order; a cut tail is left for the next push.
     fn whole(&self, data: &[u8]) -> Result<Vec<usize>, Bad> {
         let mut lens = Vec::new();
         let mut rest = data;
         while rest.len() >= PREFIX {
-            if rest[0] != 0 {
-                return Err(Bad::Compressed);
+            match rest[0] {
+                0 => {}
+                1 => return Err(Bad::Compressed),
+                flag => return Err(Bad::InvalidFlag(flag)),
             }
             let n = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
 
@@ -198,6 +234,10 @@ impl Messages {
             rest = &rest[len..];
         }
         Ok(lens)
+    }
+
+    pub(crate) fn buffered(&self) -> usize {
+        self.buf.len()
     }
 
     /// The stream ended.
@@ -245,6 +285,7 @@ pub const UNAVAILABLE: u16 = 14;
 pub const UNAUTHENTICATED: u16 = 16;
 
 /// The `grpc-status` an answer that is not gRPC stands for, by its HTTP status
+/// (`http-grpc-status-mapping.md`).
 #[must_use]
 pub fn status_of_http(code: u16) -> u16 {
     use http::StatusCode;
@@ -266,6 +307,8 @@ pub fn status_of_http(code: u16) -> u16 {
 }
 
 /// The `grpc-status` an HTTP/2 error `code` stands for on a dialled stream it ended (a reset or a
+/// GOAWAY, either end's), before or after the answer's head alike: gRPC over HTTP/2
+/// (PROTOCOL-HTTP2.md, "Errors").
 #[must_use]
 pub fn status_of_reset(code: u32) -> u16 {
     match h2::Reason::from(code) {
@@ -303,6 +346,7 @@ pub fn reset_name(code: u32) -> String {
 }
 
 /// The `grpc-status` a refusal's neutral status ([`RefuseIn::status`]) stands for on a call's
+/// end: the HTTP-to-status table, and `413` as `RESOURCE_EXHAUSTED`.
 #[must_use]
 pub fn status_of_refusal(status: u32) -> u16 {
     match status {
@@ -312,6 +356,7 @@ pub fn status_of_refusal(status: u32) -> u16 {
 }
 
 /// The `grpc-message` a refusal's neutral status ends a call with when its trailer block states
+/// no `grpc-status`.
 #[must_use]
 pub fn refusal_message(status: u32) -> String {
     format!("busbar answered HTTP {status}")
@@ -320,11 +365,19 @@ pub fn refusal_message(status: u32) -> String {
 /// A `grpc-status` value, read: the canonical codes are `0..=16`; anything else is `UNKNOWN`.
 #[must_use]
 pub fn parse_status(v: &[u8]) -> u16 {
+    canonical_status(v).unwrap_or(UNKNOWN)
+}
+
+pub(crate) fn canonical_status(v: &[u8]) -> Option<u16> {
+    let v = v.trim_ascii();
+    if v.is_empty() || (v.len() > 1 && v[0] == b'0') || !v.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
     std::str::from_utf8(v)
+        .ok()?
+        .parse::<u16>()
         .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .filter(|c| *c <= UNAUTHENTICATED)
-        .unwrap_or(UNKNOWN)
+        .filter(|code| *code <= UNAUTHENTICATED)
 }
 
 /// The most bytes of a far end's `grpc-message` handed to the host as a failure's text.
@@ -355,13 +408,17 @@ pub fn decode_message(v: &[u8]) -> Vec<u8> {
 }
 
 /// A far end's `grpc-message` value as the text the host is handed for the call's failure:
+/// percent-decoded ([`decode_message`]), read as UTF-8 with every invalid sequence replaced (U+FFFD),
+/// every control character escaped as Rust writes it (`\n`, `\u{1b}`), so no terminal escape or
+/// forged log line passes through, and cut to at most [`MESSAGE_TEXT_MAX`] bytes on a character's
+/// edge.
 #[must_use]
 pub fn message_text(v: &[u8]) -> Vec<u8> {
     let decoded = decode_message(v);
     let mut out = String::with_capacity(decoded.len().min(MESSAGE_TEXT_MAX));
     for c in String::from_utf8_lossy(&decoded).chars() {
         let before = out.len();
-        if c.is_control() {
+        if c.is_control() || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
             out.extend(c.escape_debug());
         } else {
             out.push(c);
@@ -375,6 +432,7 @@ pub fn message_text(v: &[u8]) -> Vec<u8> {
 }
 
 /// `text` as a `grpc-message` value, for every `grpc-message` this door writes, on either accept
+/// side.
 #[must_use]
 pub fn encode_status_message(text: &[u8]) -> String {
     let mut out = String::with_capacity(text.len());
@@ -382,7 +440,10 @@ pub fn encode_status_message(text: &[u8]) -> String {
         if (0x21..=0x7e).contains(&b) && !b"\"#%<>`?{}".contains(&b) {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 15)]));
         }
     }
     out
@@ -401,6 +462,8 @@ pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// A refusal's bytes read as a trailer block: the block, where it states a `grpc-status`; `None`
+/// where it states none, or where the bytes are words and no block at all (both close with the
+/// refusal's neutral status).
 pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
     match read_head(&terminate_block(bytes), usize::MAX) {
         Ok(Some((h, _))) => Ok(h.get(GRPC_STATUS).is_some().then_some(h)),
@@ -426,6 +489,8 @@ pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
 }
 
 /// A stream's closing status lines in tonic 0.14's bytes and order (`Status::add_header`):
+/// `grpc-status`, then `grpc-message` where there is a message, then `grpc-status-details-bin`
+/// where there are details, the value the plane wrote, verbatim.
 pub fn status_lines(code: u32, message: &[u8], details: &[u8]) -> Result<Vec<u8>, &'static str> {
     if !details.iter().all(|b| (0x20..=0x7e).contains(b)) {
         return Err("the status details are not one field value");
@@ -498,6 +563,7 @@ impl Head {
 }
 
 /// Read a head block off the front of `buf`: `Ok(None)` while it is incomplete, else the head and
+/// how many bytes of `buf` it took.
 pub fn read_head(buf: &[u8], max: usize) -> Result<Option<(Head, usize)>, String> {
     let (lines, took) = if buf.starts_with(b"\r\n") {
         (&buf[..0], 2)
@@ -549,7 +615,15 @@ pub fn render_head(
     content_length: Option<usize>,
 ) -> Result<Vec<u8>, &'static str> {
     let clean = |v: &[u8]| !v.iter().any(|b| matches!(b, b'\r' | b'\n' | 0));
-    let mut out = Vec::new();
+    let capacity = fields
+        .iter()
+        .try_fold(48usize, |n, (name, value)| {
+            n.checked_add(name.len())?
+                .checked_add(value.len())?
+                .checked_add(4)
+        })
+        .ok_or("head block is too large")?;
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
     for (name, value) in fields {
         if name.is_empty() || name.contains(':') || !clean(name.as_bytes()) || !clean(value) {
             return Err("a field cannot be written as one head line");
@@ -566,7 +640,7 @@ pub fn render_head(
         out.extend_from_slice(format!("content-length: {n}\r\n").as_bytes());
     }
     out.extend_from_slice(b"\r\n");
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }
 
 #[cfg(test)]

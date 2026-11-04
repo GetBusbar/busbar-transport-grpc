@@ -48,7 +48,9 @@ fn assert_rebuild(error: &LoadError) {
 }
 #[test]
 fn red_a_door_at_another_kind_abi_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let real = actual();
     let host = KindCode::Transport.abi_version();
     assert_eq!(real.kind_abi, host);
@@ -81,7 +83,9 @@ fn red_a_door_at_another_kind_abi_is_refused() {
 }
 #[test]
 fn red_a_door_built_against_another_kind_layout_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let real = actual();
     let kind = KindCode::Transport;
     let host = kind.layout_fingerprint();
@@ -123,7 +127,9 @@ fn red_a_door_built_against_another_kind_layout_is_refused() {
 }
 #[test]
 fn red_a_transport_built_against_another_frame_piece_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let real = actual();
     let d = Dispatcher::new(Default::default());
     // SAFETY: the loaded real transport provides a complete static Statement and TransportTail.
@@ -163,7 +169,9 @@ fn red_a_transport_built_against_another_frame_piece_is_refused() {
 }
 #[test]
 fn red_a_statement_other_than_the_stated_one_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let real = actual();
     let d = Dispatcher::new(Default::default());
     // SAFETY: the genuine door's complete immutable static statement was validated above.
@@ -217,7 +225,9 @@ extern "C" fn fail_ready(
 }
 #[test]
 fn red_a_failing_ready_refuses_the_boot() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     READY_CALLS.store(0, Ordering::SeqCst);
     change(DoorParts {
         ready: Some(fail_ready),

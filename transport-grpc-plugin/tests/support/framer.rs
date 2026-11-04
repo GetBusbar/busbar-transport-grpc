@@ -200,18 +200,27 @@ impl Yielded {
             return;
         }
 
-        let wire_len = (o.yielded.wire_len as usize).min(sink.wire.len());
+        let wire_len = o.yielded.wire_len as usize;
+        assert!(wire_len <= sink.wire.len(), "door over-reported wire bytes");
         self.wire.extend_from_slice(&sink.wire[..wire_len]);
-        let frame_len = (o.yielded.frame_len as usize).min(sink.frame.len());
-        let pieces = (o.yielded.pieces_len as usize).min(sink.pieces.len());
+        let frame_len = o.yielded.frame_len as usize;
+        assert!(
+            frame_len <= sink.frame.len(),
+            "door over-reported frame bytes"
+        );
+        let pieces = o.yielded.pieces_len as usize;
+        assert!(pieces <= sink.pieces.len(), "door over-reported pieces");
         if pieces == 0 {
             self.raw.extend_from_slice(&sink.frame[..frame_len]);
         }
         for p in &sink.pieces[..pieces] {
             let at = p.offset as usize;
-            let bytes = sink
-                .frame
-                .get(at..at + p.len as usize)
+            let bytes = sink.frame[..frame_len]
+                .get(
+                    at..at
+                        .checked_add(p.len as usize)
+                        .expect("piece length overflow"),
+                )
                 .unwrap_or_else(|| panic!("a piece past the frame bytes: {p:?}"));
             self.partial.extend_from_slice(bytes);
             if p.flags & PIECE_END_OF_FRAME != 0 {

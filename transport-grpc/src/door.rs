@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `grpc` DOOR: this transport as a FRAMER on the transport kind's table
+//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +75,7 @@ const OFFER_H2: &[u8] = b"\x02h2";
 /// What `open` read from the settings, and the framings it holds.
 pub struct Instance {
     /// The settings in force: what `open` read, or the last good `refresh`, copied by each `begin`
+    /// (a framing keeps the posture it began under).
     posture: Mutex<Posture>,
     framings: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     /// The one-stream framings (`SIDE_ACCEPT_STREAM`), by the same token space.
@@ -82,6 +84,7 @@ pub struct Instance {
 }
 
 /// HTTP/2 keep-alive on a dialled connection: a PING this often (fixed here, not an operator
+/// setting), so a far end gone silent is found while a call waits on it.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a keep-alive PING may go unanswered before the dialled connection is failed.
@@ -91,6 +94,7 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const ADAPTIVE_WINDOW: bool = true;
 
 /// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
+/// says.
 fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
     let v = settings_reading(bytes, &SETTING_ROWS).map_err(|refusal| {
         for (row, unit) in SETTING_ROWS.iter().zip(["seconds", "bytes"]) {
@@ -168,6 +172,7 @@ impl Life for Instance {
     }
 
     /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
+    /// force stay; good ones apply to every framing begun after it.
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         let posture = read_settings(settings)?;
         *self.posture.lock().unwrap_or_else(PoisonError::into_inner) = posture;
@@ -301,11 +306,15 @@ slot!(
 );
 
 /// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a URL
+/// (refused outright, never read on, never echoed), as http and ws refuse it.
 fn carries_userinfo(uri: &http::Uri) -> bool {
     uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
 /// The framer's own head lines on a dialled call (`LocateIn::defaults_buf`): the lines gRPC's
+/// wire carries on every request, stated so the host adds each the call does not carry BEFORE the
+/// auth signs the head, and the dial then sends them as signed: the content
+/// type and `te: trailers`, in the order the dial writes them.
 const DEFAULT_LINES: &str = "content-type: application/grpc\r\nte: trailers\r\n";
 
 slot!(
@@ -389,7 +398,13 @@ slot!(
         o.set(|x| &x.framing, token);
         let mut h = held.lock().unwrap_or_else(PoisonError::into_inner);
         let mut host = host_admission(&p, i.field(|x| &x.head), token);
-        step("begin", &mut h, i.sink(), &mut o, |_| Ok(()), &mut host)
+        let outcome = step("begin", &mut h, i.sink(), &mut o, |_| Ok(()), &mut host);
+        drop(h);
+        if outcome == Outcome::Failed || outcome == Outcome::Refused {
+            inst.framings.lock().unwrap_or_else(PoisonError::into_inner).remove(&token);
+            o.set(|x| &x.framing, 0);
+        }
+        outcome
     }
 );
 
@@ -608,6 +623,7 @@ fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<Stre
 }
 
 /// Run `f` on a one-stream framing, then fill the sink with what it owes. A failure is `op`'s,
+/// in its words (`<op>: <reason>`).
 fn on_stream(
     op: &'static str,
     call: &Mutex<StreamCall>,

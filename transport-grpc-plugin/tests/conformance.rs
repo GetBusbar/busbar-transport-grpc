@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE `grpc` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_grpc::door`) and
+//! this crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
+//! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
+//! Statement and the same answers.
 
 use std::mem::zeroed;
 use std::sync::Arc;

@@ -44,6 +44,8 @@ struct Handed {
 
 thread_local! {
     static HANDED: RefCell<Vec<Handed>> = const { RefCell::new(Vec::new()) };
+    static REFUSAL_MODE: Cell<u8> = const { Cell::new(0) };
+    static REFUSAL_FIELD: RefCell<Option<Field>> = const { RefCell::new(None) };
     static FLOW: Cell<u32> = const { Cell::new(FLOW_CONTINUE) };
     static REFUSED: RefCell<Vec<(u32, u32, UnitRef)>> = const { RefCell::new(Vec::new()) };
 }
@@ -95,12 +97,28 @@ extern "C" fn refuse(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> 
             seen.borrow_mut()
                 .push((input.cause, input.line, input.unit))
         });
+        let mode = REFUSAL_MODE.with(Cell::get);
+        let fields = REFUSAL_FIELD.with(|stored| {
+            let mut stored = stored.borrow_mut();
+            *stored = match mode {
+                2 => Some(Field {
+                    name: s("bad name"),
+                    value: s("value"),
+                }),
+                3 => Some(Field {
+                    name: s("x-refusal"),
+                    value: s("bad\r\nvalue"),
+                }),
+                _ => None,
+            };
+            stored.as_ref().map_or(std::ptr::null(), std::ptr::from_ref)
+        });
         input.answer.write_unaligned(RefusalAnswer {
             size: size_of::<RefusalAnswer>() as u32,
-            status: 403,
+            status: if mode == 1 { 99 } else { 403 },
             _reserved: 0,
-            fields: std::ptr::null(),
-            fields_len: 0,
+            fields,
+            fields_len: usize::from(!fields.is_null()),
             body: Blob::of(b"denied-verbatim"),
         });
         (*out).outcome = RawOutcome::of(Outcome::Ready);
@@ -177,6 +195,7 @@ impl Host {
         HANDED.with(|seen| seen.borrow_mut().clear());
         REFUSED.with(|seen| seen.borrow_mut().clear());
         FLOW.with(|flow| flow.set(FLOW_CONTINUE));
+        REFUSAL_MODE.with(|mode| mode.set(0));
         let mut slots: Box<HostSlots> = Box::new(z());
         slots.size = size_of::<HostSlots>() as u32;
         slots.slots = SERVICES;
@@ -534,8 +553,9 @@ fn a_peer_reset_while_waiting_reports_failure_without_handing_in_or_publishing_a
     bytes.extend(request(1, "/first", &[], false));
     host.until_open(&bytes, ticket(2));
     let reset = frame(3, 0, 1, &8_u32.to_be_bytes());
-    let _ = host.ingest(&reset, &[], ticket(3));
-    let failed = host.ingest(&[], &policy(2, 22, "/first"), ticket(2));
+    let reset_result = host.ingest(&reset, &[], ticket(3));
+    let mut failed = host.ingest(&[], &policy(2, 22, "/first"), ticket(2));
+    failed.pieces.extend(reset_result.pieces);
     assert_eq!(failed.outcome, Outcome::Ready);
     assert!(failed
         .pieces
@@ -841,5 +861,57 @@ fn unsupported_neutral_emit_kinds_refuse_before_consuming_in_every_grpc_mode() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn invalid_host_refusals_retire_the_stream_and_leave_the_connection_usable() {
+    use busbar_contract::abi::transport::EmitIn;
+    for mode in [1, 2, 3] {
+        let mut host = Host::new();
+        host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+        let mut bytes = opening();
+        bytes.extend(request(1, "/first", &[], true));
+        let (_, original) = host.until_open(&bytes, ticket(2));
+        FLOW.with(|flow| flow.set(FLOW_STOP));
+        REFUSAL_MODE.with(|value| value.set(mode));
+        let failed = host.ingest(&original, &policy(2, 22, "/first"), ticket(2));
+        assert_eq!(
+            failed.outcome,
+            Outcome::Failed,
+            "invalid refusal mode {mode}"
+        );
+        let mut input: EmitIn = z();
+        input.framing = host.framing;
+        input.stream = 1;
+        input.head.ticket = ticket(4);
+        input.end_of_frame = 1;
+        input.sink = host.sink();
+        let mut out: FramerOut = z();
+        // SAFETY: the matching ABI frames and sink buffers remain live through the call.
+        let outcome = unsafe {
+            call(
+                host.ops.emit,
+                host.instance,
+                &mut input,
+                &mut out,
+                slot::EMIT,
+            )
+        };
+        assert_eq!(
+            host.capture(outcome, out).outcome,
+            Outcome::Ready,
+            "late emit is dropped"
+        );
+        FLOW.with(|flow| flow.set(FLOW_CONTINUE));
+        REFUSAL_MODE.with(|value| value.set(0));
+        let (open, original) = host.until_open(&request(3, "/second", &[], true), ticket(3));
+        assert_eq!(open.open.unwrap().stream, 2);
+        let admitted = host.ingest(&original, &policy(3, 33, "/second"), ticket(3));
+        assert_eq!(admitted.outcome, Outcome::Ready);
+        assert!(admitted
+            .pieces
+            .iter()
+            .any(|(piece, _)| piece.stream == 2 && piece.flags & PIECE_FIELDS != 0));
     }
 }

@@ -18,6 +18,21 @@ First-party signed kind:transport plugin cdylib: the grpc transport, packaged as
 
 Configured under the `grpc` module name.
 
+## Limits and failure handling
+
+Message payloads obey `limits.request_body_max_bytes`. Across a connection,
+partial incoming messages share a budget of that limit plus 1 MiB and 64 KiB;
+a stream exceeding the budget fails with `RESOURCE_EXHAUSTED`. Requests awaiting
+host admission and newly arrived requests each have a 200-request queue limit;
+overflow receives HTTP 503, and peer resets release pending admission state.
+
+Malformed message flags and invalid host refusals fail explicitly. Premature
+status fields are removed from initial response headers so they cannot override
+the final gRPC status.
+Credential-bearing head buffers are wiped when released. A request whose host
+marks `:path` sensitive is refused because this HTTP/2 client cannot mark its
+request target as sensitive for header compression.
+
 ## Build
 
 ```bash

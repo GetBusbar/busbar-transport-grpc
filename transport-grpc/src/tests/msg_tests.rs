@@ -287,6 +287,8 @@ fn a_refusals_neutral_status_maps_as_predevs_grpc_line_answered_it() {
 }
 
 /// A MESSAGE STREAM THAT FAILED HOLDS NOTHING MORE: once a message is over the ceiling (or
+/// compressed), every later push answers the same failure and buffers none of its bytes, through
+/// either way in.
 #[test]
 fn a_failed_message_stream_holds_nothing_more() {
     let mut over = vec![0u8];
@@ -303,6 +305,7 @@ fn a_failed_message_stream_holds_nothing_more() {
 }
 
 /// A PAYLOAD NO LENGTH PREFIX CAN STATE HAS NONE: past `u32::MAX` bytes there is no prefix, never a
+/// saturated one that lies about the length and desynchronises the far end's framing.
 #[test]
 fn a_payload_past_u32_max_has_no_prefix() {
     let past = usize::try_from(u64::from(u32::MAX) + 1).expect("a 64-bit host");
@@ -311,6 +314,8 @@ fn a_payload_past_u32_max_has_no_prefix() {
 }
 
 /// A refusal's bytes are a block only where they are one: a block stating `grpc-status` is the
+/// close; words (even words naming `grpc-status`, a relayed failure's text) close with the neutral
+/// status; a broken block with a `grpc-status:` line is refused in words.
 #[test]
 fn a_refusals_bytes_are_a_block_only_where_they_are_one() {
     let block = refusal_block(b"grpc-status: 5\r\ngrpc-message: gone\r\n").expect("a block");
@@ -397,4 +402,61 @@ fn message_text_cuts_on_a_characters_edge() {
     let out = with(MESSAGE_TEXT_MAX - 2, "é".as_bytes());
     assert_eq!(out.len(), MESSAGE_TEXT_MAX);
     assert!(out.ends_with("é".as_bytes()));
+}
+
+#[test]
+fn invalid_compression_flags_are_not_reported_as_compression() {
+    for flag in [2, 128, 255] {
+        let mut messages = Messages::new(8);
+        assert_eq!(
+            messages.push(&[flag, 0, 0, 0, 0]),
+            Err(Bad::InvalidFlag(flag))
+        );
+    }
+}
+
+#[test]
+fn completed_fragmented_messages_release_the_cutter_allocation() {
+    let mut messages = Messages::new(8192);
+    let wire = frame(&vec![7; 8192]);
+    messages.push(&wire[..4096]).unwrap();
+    let complete = messages.push(&wire[4096..]).unwrap();
+    assert_eq!(complete[0].as_ref(), wire.as_slice());
+    assert_eq!(messages.buf.capacity(), 0);
+}
+
+#[test]
+fn diagnostic_messages_escape_bidi_and_unicode_line_separators() {
+    for text in ["\u{202e}", "\u{2028}", "\u{2029}", "\u{2066}"] {
+        let escaped = message_text(text.as_bytes());
+        assert!(escaped.is_ascii());
+        assert!(escaped.starts_with(b"\\u{"));
+    }
+}
+
+#[test]
+fn status_signs_never_turn_a_malformed_status_into_success() {
+    for value in [b"+0".as_slice(), b"+00", b"-0", b"00", b"013"] {
+        assert_eq!(parse_status(value), UNKNOWN);
+    }
+    assert_eq!(parse_status(b"0"), OK);
+}
+
+#[test]
+fn a_partial_tail_does_not_keep_a_completed_messages_allocation_alive() {
+    let mut messages = Messages::new(1024 * 1024);
+    let whole = frame(&vec![7; 900 * 1024]);
+    assert!(messages.push(&whole[..whole.len() - 1]).unwrap().is_empty());
+    let mut ending = vec![7];
+    ending.extend_from_slice(&prefix(100).unwrap()[..2]);
+    let complete = messages.push(&ending).unwrap();
+    assert_eq!(complete.len(), 1);
+    assert_eq!(messages.buffered(), 2);
+    let old_tail = complete[0].as_ptr().wrapping_add(complete[0].len());
+    assert_ne!(
+        messages.buf.as_ptr(),
+        old_tail,
+        "tail must own a fresh allocation"
+    );
+    assert_eq!(messages.buf.as_ref(), &prefix(100).unwrap()[..2]);
 }

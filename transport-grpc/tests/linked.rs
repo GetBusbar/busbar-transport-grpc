@@ -30,6 +30,7 @@ fn the_linked_entry_equals_the_statement() {
     let rows = unsafe { std::slice::from_raw_parts(tail.claim_rows, tail.claim_rows_len) };
     assert_eq!(statement.claims_len, 1);
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session, 1);
     assert_eq!(rows[0].session != 0, linked::SESSION);
     // SAFETY: the Statement's claim names, `claims_len` of them, `'static`.
     let name = unsafe { (*statement.claims).bytes() };

@@ -50,6 +50,7 @@ pub struct StreamCall {
     max: usize,
     writing: Vec<u8>,
     /// The bytes owed the host's wire, taken from the front ([`Owed::take_wire`]): a deque, so a
+    /// partial take copies only what it takes, never the rest.
     wire: VecDeque<u8>,
     out: VecDeque<Piece>,
     /// A reply message went out: a close is trailers, not the whole answer.
@@ -118,7 +119,7 @@ impl StreamCall {
         })
     }
 
-    /// The response's possible final fields, declared before the host sends its HTTP/1 head.
+    /// The response's possible final fields, declared before the host sends its response head.
     pub(crate) fn declare_response_fields(&mut self) {
         self.wire.extend(b"trailer: grpc-status, grpc-message, grpc-status-details-bin, grpc-accept-encoding\r\n");
     }
@@ -173,13 +174,14 @@ impl StreamCall {
             )));
         };
         self.wire.extend(prefix);
-        self.wire.extend(self.writing.drain(..));
+        self.wire.extend(std::mem::take(&mut self.writing));
         self.wire.extend(bytes);
         self.answered = true;
         Ok(())
     }
 
     /// The reply bytes queued and not yet taken by the host: the wire, and the message being
+    /// written.
     fn queued(&self) -> usize {
         self.wire.len().saturating_add(self.writing.len())
     }
@@ -192,6 +194,8 @@ impl StreamCall {
     }
 
     /// Cut the reply for `why`: the message being written is dropped, no reply byte more is taken,
+    /// and the call closes `RESOURCE_EXHAUSTED` in these words, whatever close the host states (the
+    /// far end never takes a reply missing a message for a whole one).
     fn cut_reply(&mut self, why: String) -> Failure {
         self.writing = Vec::new();
         self.cut = Some(why.clone());
@@ -199,6 +203,8 @@ impl StreamCall {
     }
 
     /// Close the call refused: the block `bytes` state when they state a `grpc-status`, else the
+    /// neutral `status` mapped, else (no status stated either way) `UNKNOWN` with the bytes as its
+    /// message.
     pub fn refuse(&mut self, bytes: &[u8], status: u32, head_sent: bool) -> Result<(), Failure> {
         if self.closed {
             return Ok(());
@@ -244,6 +250,7 @@ impl StreamCall {
     }
 
     /// Close the call with the unit's final status (`status` in gRPC's numbering, its message and
+    /// its details value).
     pub fn finish(&mut self, status: u32, message: &[u8], details: &[u8]) -> Result<(), Failure> {
         if self.closed {
             return Ok(());

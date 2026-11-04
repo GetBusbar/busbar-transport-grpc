@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The door's statement passes the kind's own checks, its status rows class every canonical
+//! `grpc-status`, and its settings read as their declarations say.
 
 use busbar_contract::abi::transport::check::{
     check_claim_rows, check_claims, check_composes_over, check_fault_cover, check_fault_rows,
@@ -47,6 +48,8 @@ fn every_canonical_status_has_the_class_its_http_mapping_gives_it() {
 }
 
 /// Every code gRPC defines, stated as the breaker's reading. Written out rather than derived from
+/// the table, so a row that drifted fails here: which codes penalise the destination, which take it
+/// down across every pool, and which are the caller's own and cost the destination nothing.
 #[test]
 fn every_canonical_status_has_the_breakers_fault_reading() {
     let expect: [(u16, u8); 17] = [
@@ -99,6 +102,7 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
 }
 
 /// EACH DECLARED DEFAULT IS THE VALUE THE DOOR APPLIES when the setting is absent: the declaration
+/// the host shows and validates, and the posture `open` reads from `{}`, never two facts.
 #[test]
 fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
     use crate::meta::DEFAULT_TIMEOUT;
@@ -109,6 +113,8 @@ fn each_declared_default_is_the_value_an_absent_setting_reads_as() {
 }
 
 /// AN ILL-TYPED OR ZERO SETTING IS REFUSED BY ITS NAME, in http's words (`settings: <key> must be a
+/// count of <unit> above 0`, the kind's grammar): a zero timeout would fail every call at once, and
+/// a zero ceiling would refuse every message.
 #[test]
 fn an_ill_typed_or_zero_setting_is_refused_by_its_name() {
     let why = |json: &[u8]| {
