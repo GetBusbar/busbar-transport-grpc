@@ -213,8 +213,8 @@ skip = [
     { crate = "getrandom@0.4.3", reason = "busbar's own lock holds this duplicate" },
     { crate = "r-efi@5.3.0", reason = "busbar's own lock holds this duplicate" },
     { crate = "r-efi@6.0.0", reason = "busbar's own lock holds this duplicate" },
-    { crate = "syn@2.0.117", reason = "busbar's own lock holds this duplicate" },
-    { crate = "syn@3.0.3", reason = "busbar's own lock holds this duplicate" },
+    { crate = "syn@2.0.119", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
+    { crate = "syn@3.0.9", reason = "busbar's own lock holds this duplicate semver line; this plugin locks the exact version" },
     { crate = "windows-sys@0.52.0", reason = "busbar's own lock holds this duplicate" },
     { crate = "windows-sys@0.61.2", reason = "busbar's own lock holds this duplicate" },
 ]
