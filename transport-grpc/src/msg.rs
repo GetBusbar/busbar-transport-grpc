@@ -256,6 +256,49 @@ pub const GRPC_STATUS: &str = "grpc-status";
 pub const GRPC_MESSAGE: &str = "grpc-message";
 /// The field a call's deadline travels in.
 pub const GRPC_TIMEOUT: &str = "grpc-timeout";
+/// Parse a gRPC timeout into nanoseconds. The wire carries at most eight decimal digits
+/// followed by one case-sensitive unit. Very long budgets saturate the host clock.
+pub(crate) fn timeout_ns(value: &[u8]) -> Result<u64, &'static str> {
+    let Some((&unit, digits)) = value.split_last() else {
+        return Err("grpc-timeout is not a duration");
+    };
+    if digits.is_empty() || digits.len() > 8 || !digits.iter().all(u8::is_ascii_digit) {
+        return Err("grpc-timeout must have one to eight decimal digits");
+    }
+    let scale = match unit {
+        b'H' => 3_600_000_000_000_u64,
+        b'M' => 60_000_000_000,
+        b'S' => 1_000_000_000,
+        b'm' => 1_000_000,
+        b'u' => 1_000,
+        b'n' => 1,
+        _ => return Err("grpc-timeout has an invalid unit"),
+    };
+    let count = digits
+        .iter()
+        .fold(0_u64, |n, digit| n * 10 + u64::from(digit - b'0'));
+    Ok(count.saturating_mul(scale))
+}
+
+/// Render a remaining nanosecond budget without extending it. Use the finest unit that
+/// fits gRPC's eight-digit limit; an exhausted budget is explicitly `0n`, never absent.
+pub(crate) fn timeout_value(remaining_ns: u64) -> String {
+    for (unit, scale) in [
+        ('n', 1_u64),
+        ('u', 1_000),
+        ('m', 1_000_000),
+        ('S', 1_000_000_000),
+        ('M', 60_000_000_000),
+        ('H', 3_600_000_000_000),
+    ] {
+        let value = remaining_ns / scale;
+        if value <= 99_999_999 {
+            return format!("{value}{unit}");
+        }
+    }
+    unreachable!("every u64 nanosecond budget fits in eight digits of hours")
+}
+
 /// The field naming the compression a call's messages are in.
 pub const GRPC_ENCODING: &str = "grpc-encoding";
 /// The field naming the compressions a server takes, on an answer refusing another.

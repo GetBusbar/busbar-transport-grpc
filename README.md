@@ -26,6 +26,16 @@ a stream exceeding the budget fails with `RESOURCE_EXHAUSTED`. Requests awaiting
 host admission and newly arrived requests each have a 200-request queue limit;
 overflow receives HTTP 503, and peer resets release pending admission state.
 
+A valid inbound `grpc-timeout` bounds each accepted call on the host monotonic
+clock, including time awaiting admission. Expiry yields a stream failure and
+closes with `DEADLINE_EXCEEDED`. The body-only adapter exposes the same timer
+contract; its host must drive timers and cancel admitted work on stream failure.
+When the host supplies a request deadline to `locate` in its CLOCK_NOW provider's
+epoch, the framer declares a `grpc-timeout` default from the remaining budget before
+authentication. An unavailable host clock fails preparation. The host retains an
+explicit timeout field in preference to this default; the authenticated head is
+preserved on emit, and the local attempt deadline remains independent.
+
 Malformed message flags and invalid host refusals fail explicitly. Premature
 status fields are removed from initial response headers so they cannot override
 the final gRPC status.

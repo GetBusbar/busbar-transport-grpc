@@ -1023,3 +1023,59 @@ fn a_target_carrying_userinfo_is_refused_and_never_echoed() {
         host.close();
     }
 }
+
+/// Zero-capacity hosts receive the same required-size response as every short buffer.
+#[test]
+fn locate_requires_its_defaults_buffer_even_at_zero_capacity() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let needed = b"content-type: application/grpc\r\nte: trailers\r\n".len() as u64;
+        for cap in [0, 1, needed as usize - 1] {
+            let (outcome, out, _) =
+                host.locate_lent("http://peer.test", false, [256, 256, 64, cap]);
+            assert_eq!(outcome, Outcome::Failed);
+            assert_eq!(out.defaults_needed, needed);
+            assert_eq!(out.defaults_written, 0);
+        }
+        let (outcome, out, _) =
+            host.locate_lent("http://peer.test", false, [256, 256, 64, needed as usize]);
+        assert_eq!(outcome, Outcome::Ready);
+        assert_eq!(out.defaults_written, needed);
+        host.close();
+    }
+}
+
+/// Existing timer outputs carry the deadline in either door, including tiny output sinks.
+#[test]
+fn a_body_only_deadline_yields_cancellation_and_cannot_finish_successfully() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        for caps in [ROOMY, TIGHT] {
+            let mut host = Host::open(ops, "{}", caps);
+            let deadline = host.now + 1_000_000;
+            assert_eq!(
+                host.begin_stream(
+                    "/t.T/Unary",
+                    &[("content-type", "application/grpc"), ("grpc-timeout", "1m")]
+                ),
+                Outcome::Ready
+            );
+            assert_eq!(host.next_deadline(), Some(deadline));
+            assert_eq!(host.advance(deadline - 1), Outcome::Ready);
+            assert!(host.got.iter().all(|piece| !piece.failed()));
+            assert_eq!(host.advance(deadline), Outcome::Ready);
+            assert!(host.got.iter().any(Got::failed));
+            assert_eq!(host.next_deadline(), None);
+            let wire_before = host.wire_log.len();
+            assert_eq!(host.emit(1, b"too late", true, 0), Outcome::Ready);
+            assert_eq!(host.wire_log.len(), wire_before);
+            assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+            assert_eq!(
+                &host.wire_log[wire_before..],
+                b"grpc-status: 4\r\ngrpc-message: deadline%20exceeded\r\n"
+            );
+            host.close();
+        }
+    }
+}

@@ -387,7 +387,11 @@ impl Owed for Conn {
         &mut self.out
     }
     fn next_deadline(&self) -> Option<u64> {
-        self.io.next_deadline()
+        let accepted = match &self.side {
+            Side::Accept(accept) => accept.next_deadline(),
+            Side::Dial(_) => None,
+        };
+        self.io.next_deadline().into_iter().chain(accepted).min()
     }
     fn ended(&self) -> bool {
         self.conn_done.load(Ordering::Acquire)
@@ -476,7 +480,9 @@ impl Conn {
         let conn_done = Arc::new(AtomicBool::new(false));
         let arrivals = Arc::new(Mutex::new(Arrivals::default()));
         let svc_arrivals = arrivals.clone();
-        let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+        let clock = io.timer();
+        let svc = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+            req.extensions_mut().insert(ReceivedAt(clock.now_ns()));
             let reply = Reply::default();
             {
                 let mut a = svc_arrivals.lock().unwrap_or_else(PoisonError::into_inner);
@@ -515,6 +521,7 @@ impl Conn {
                 ended: Ended::default(),
                 policy: None,
                 waiting: VecDeque::new(),
+                now_ns,
             }),
         }
     }
@@ -779,6 +786,15 @@ impl Conn {
         Ok(())
     }
 
+    /// Apply accepting deadlines before a host operation can finish or emit a late success.
+    pub(crate) fn expire_deadlines(&mut self, now_ns: u64) {
+        if let Side::Accept(accept) = &mut self.side {
+            accept.now_ns = now_ns;
+            let mut room = Room::of(&self.out, self.turn);
+            accept.expire(&mut self.out, &mut room);
+        }
+    }
+
     /// Drive the connection at host time `now_ns` until nothing inside it has more to do.
     pub fn drive(&mut self, now_ns: u64) {
         self.io.set_time(now_ns);
@@ -815,6 +831,7 @@ impl Conn {
                     stream_failed |= failed;
                 }),
                 Side::Accept(a) => {
+                    a.now_ns = now_ns;
                     a.step(&mut self.out, &mut room, max, cx);
                     Ok(())
                 }
@@ -1120,7 +1137,6 @@ const RESERVED_ON_REQUEST: &[&str] = &[
     "method",
     "authority",
     "content-type",
-    msg::GRPC_TIMEOUT,
     "content-length",
     "host",
 ];
@@ -1393,6 +1409,9 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct ReceivedAt(u64);
+
 #[derive(Default)]
 struct Arrivals {
     next: u64,
@@ -1468,6 +1487,7 @@ struct Accept {
     ended: Ended,
     policy: Option<AcceptedPolicy>,
     waiting: VecDeque<Unadmitted>,
+    now_ns: u64,
 }
 
 struct AcceptedPolicy {
@@ -1481,6 +1501,7 @@ struct Unadmitted {
     request: Request<Incoming>,
     reply: Reply,
     ticket: Option<Ticket>,
+    deadline_ns: Option<u64>,
 }
 
 struct AStream {
@@ -1494,6 +1515,7 @@ struct AStream {
     head_buf: HeadBuf,
     head_sent: bool,
     reply_over: bool,
+    deadline_ns: Option<u64>,
 }
 
 impl AStream {
@@ -1503,6 +1525,7 @@ impl AStream {
         max: usize,
         policy: Option<Arc<Policy>>,
         unit: UnitRef,
+        deadline_ns: Option<u64>,
     ) -> Self {
         let content_type = request
             .headers()
@@ -1518,6 +1541,7 @@ impl AStream {
             head_buf: HeadBuf::default(),
             head_sent: false,
             reply_over: false,
+            deadline_ns,
         }
     }
 
@@ -1612,7 +1636,76 @@ fn cancelled_request(body: Option<&mut Incoming>, cx: &mut Context<'_>) -> (u16,
     (msg::CANCELLED, "the far end cancelled the call".into())
 }
 
+/// End a request before it was admitted; no host task or unit exists yet.
+fn close_unadmitted(reply: &Reply, code: u16, why: &str) {
+    let mut fields = HeaderMap::new();
+    fields.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static(msg::CONTENT_TYPE),
+    );
+    fields.insert(msg::GRPC_STATUS, HeaderValue::from(code));
+    fields.insert(
+        msg::GRPC_MESSAGE,
+        HeaderValue::from_str(&msg::encode_status_message(why.as_bytes()))
+            .expect("encoded message"),
+    );
+    reply.head(StatusCode::OK, fields);
+    reply.chan.end();
+}
+
 impl Accept {
+    fn next_deadline(&self) -> Option<u64> {
+        self.waiting
+            .iter()
+            .filter_map(|request| request.deadline_ns)
+            .chain(
+                self.calls
+                    .iter()
+                    .filter(|(_, stream)| !stream.reply_over)
+                    .filter_map(|(_, stream)| stream.deadline_ns),
+            )
+            .min()
+    }
+
+    fn expire(&mut self, out: &mut VecDeque<Piece>, room: &mut Room) {
+        self.waiting.retain_mut(|request| {
+            if !request
+                .deadline_ns
+                .is_some_and(|deadline| self.now_ns >= deadline)
+            {
+                return true;
+            }
+            if let (Some(policy), Some(ticket)) = (&mut self.policy, request.ticket) {
+                policy.loans.cancel(ticket);
+            }
+            close_unadmitted(&request.reply, msg::DEADLINE_EXCEEDED, "deadline exceeded");
+            self.ended.insert(request.id);
+            out.push_back(Piece {
+                status: Some(msg::DEADLINE_EXCEEDED),
+                ..Piece::failure(request.id, "deadline exceeded")
+            });
+            false
+        });
+        for (id, stream) in &mut self.calls {
+            if stream.reply_over
+                || !stream
+                    .deadline_ns
+                    .is_some_and(|deadline| self.now_ns >= deadline)
+            {
+                continue;
+            }
+            if let Some((_, messages)) = &stream.body {
+                room.partial = room.partial.saturating_sub(messages.buffered());
+            }
+            stream.reply.chan.drop_queued();
+            stream.fail_reply(msg::DEADLINE_EXCEEDED, b"deadline exceeded");
+            out.push_back(Piece {
+                status: Some(msg::DEADLINE_EXCEEDED),
+                ..Piece::failure(*id, "deadline exceeded")
+            });
+        }
+    }
+
     fn admit(
         &mut self,
         out: &mut VecDeque<Piece>,
@@ -1702,6 +1795,7 @@ impl Accept {
                     max,
                     Some(loan),
                     UnitRef::NONE,
+                    request.deadline_ns,
                 );
 
                 let validated = (|| {
@@ -1779,6 +1873,7 @@ impl Accept {
             id,
             request: req,
             reply,
+            deadline_ns,
             ..
         } = request;
         let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
@@ -1795,7 +1890,7 @@ impl Accept {
             ..Piece::fields(id, secret_bytes(field_block(req.headers(), &[])))
         });
         self.calls
-            .push((id, AStream::new(req, reply, max, policy, unit)));
+            .push((id, AStream::new(req, reply, max, policy, unit, deadline_ns)));
     }
 
     /// An op on `stream`, which this connection does not hold: dropped when the call ended (A
@@ -1815,6 +1910,8 @@ impl Accept {
         max: usize,
         cx: &mut Context<'_>,
     ) {
+        // Deadlines still cancel work while the host is backpressured.
+        self.expire(out, room);
         if !room.open() {
             return;
         }
@@ -1885,6 +1982,26 @@ impl Accept {
                 self.ended.insert(id);
                 continue;
             }
+            let received = req
+                .extensions()
+                .get::<ReceivedAt>()
+                .map_or(self.now_ns, |at| at.0);
+            let deadline_ns = match req.headers().get(msg::GRPC_TIMEOUT) {
+                Some(value) => match msg::timeout_ns(value.as_bytes()) {
+                    Ok(timeout) => Some(received.saturating_add(timeout)),
+                    Err(why) => {
+                        close_unadmitted(&reply, 3, why);
+                        self.ended.insert(id);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if deadline_ns.is_some_and(|deadline| self.now_ns >= deadline) {
+                close_unadmitted(&reply, msg::DEADLINE_EXCEEDED, "deadline exceeded");
+                self.ended.insert(id);
+                continue;
+            }
             if self.policy.is_some() {
                 if self.waiting.len() >= PENDING_REQUEST_LIMIT {
                     reply.head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
@@ -1897,6 +2014,7 @@ impl Accept {
                     request: req,
                     reply,
                     ticket: None,
+                    deadline_ns,
                 });
             } else {
                 self.publish(
@@ -1905,6 +2023,7 @@ impl Accept {
                         request: req,
                         reply,
                         ticket: None,
+                        deadline_ns,
                     },
                     max,
                     None,

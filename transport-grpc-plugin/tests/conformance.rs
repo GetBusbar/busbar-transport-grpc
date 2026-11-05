@@ -91,12 +91,14 @@ type Script = Vec<String>;
 fn script(p: &Plugin<Transport>) -> Script {
     let target = "http://peer.test:50051";
     let (mut a, mut n, mut alpn) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
+    let mut defaults = vec![0_u8; 256];
     let mut i: LocateIn = z();
     i.head = in_head();
     i.target = AbiStr::of(target);
     (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
     (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
     (i.alpn_buf, i.alpn_cap) = (alpn.as_mut_ptr(), alpn.len());
+    (i.defaults_buf, i.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
     let mut o: LocateOut = z();
     o.head = out_head();
     let mut f = Frame::new(i, o);

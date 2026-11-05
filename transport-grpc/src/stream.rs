@@ -9,8 +9,8 @@
 //!   before it is one; a call whose `grpc-encoding` names a compression this door does not take
 //!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding` (gRPC's
 //!   compression rules); the first `grpc-encoding` field is the call's, a repeat is not read;
-//!   a `grpc-timeout` it states is a fact for the plane in the head the host keeps: this framing
-//!   enforces no deadline and never closes a call `DEADLINE_EXCEEDED`;
+//!   a valid `grpc-timeout` starts a deadline on the host clock. The host must drive the
+//!   requested timer and cancel its work when the framing yields a failed piece;
 //! * `ingest` takes the call's body and yields each length-prefixed message's PAYLOAD as one piece
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
@@ -66,6 +66,8 @@ pub struct StreamCall {
     cut: Option<String>,
     /// An `emit` was answered `YIELD_STREAM_FULL`, and no writable piece has followed yet.
     announced: bool,
+    deadline_ns: Option<u64>,
+    timed_out: bool,
 }
 
 impl StreamCall {
@@ -84,12 +86,15 @@ impl StreamCall {
         max: usize,
     ) -> Result<Self, Failure> {
         let (mut grpc, mut encoding, mut post) = (false, None, true);
+        let mut timeout = None;
         for (n, v) in fields {
             if n.eq_ignore_ascii_case(b":method") || n.eq_ignore_ascii_case(b"method") {
                 // A gRPC call is a POST; the host passing the method states it.
                 post = v.eq_ignore_ascii_case(b"POST");
             } else if n.eq_ignore_ascii_case(b"content-type") && msg::is_grpc_content_type(v) {
                 grpc = true;
+            } else if timeout.is_none() && n.eq_ignore_ascii_case(msg::GRPC_TIMEOUT.as_bytes()) {
+                timeout = Some(msg::timeout_ns(v).map_err(|why| Failure(why.into()))?);
             } else if encoding.is_none() && n.eq_ignore_ascii_case(msg::GRPC_ENCODING.as_bytes()) {
                 encoding = Some(v);
             }
@@ -116,7 +121,34 @@ impl StreamCall {
             refused,
             cut: None,
             announced: false,
+            deadline_ns: timeout,
+            timed_out: false,
         })
+    }
+
+    /// Anchor the parsed relative timeout at this call's opening host instant.
+    pub(crate) fn start_clock(&mut self, now_ns: u64) {
+        self.deadline_ns = self
+            .deadline_ns
+            .map(|timeout| now_ns.saturating_add(timeout));
+    }
+
+    /// Signal cancellation once. Closing operations subsequently render DEADLINE_EXCEEDED.
+    pub(crate) fn expire(&mut self, now_ns: u64) {
+        if self.closed || self.timed_out || !self.deadline_ns.is_some_and(|at| now_ns >= at) {
+            return;
+        }
+        self.timed_out = true;
+        self.writing.clear();
+        self.wire.clear();
+        self.out.clear();
+        // This mode's numeric handoff is HTTP, so the gRPC code belongs in closing trailers.
+        self.out
+            .push_back(Piece::failure(STREAM, "deadline exceeded"));
+    }
+
+    pub(crate) fn timed_out(&self) -> bool {
+        self.timed_out
     }
 
     /// The response's possible final fields, declared before the host sends its response head.
@@ -157,7 +189,7 @@ impl StreamCall {
     /// The reply is cut here: its queue went past its bound (a host that kept emitting to a far
     /// end not reading, [`stream_bound`]), or its message is longer than a length prefix states.
     pub fn emit(&mut self, bytes: &[u8], ends: bool) -> Result<(), Failure> {
-        if self.closed || self.cut.is_some() {
+        if self.closed || self.cut.is_some() || self.timed_out {
             return Ok(());
         }
         if self.queued().saturating_add(bytes.len()) > stream_bound(self.max) {
@@ -209,7 +241,10 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        let lines = if let Some(e) = &self.refused {
+        let lines = if self.timed_out {
+            msg::status_lines(u32::from(msg::DEADLINE_EXCEEDED), b"deadline exceeded", &[])
+                .map_err(|e| Failure(e.into()))?
+        } else if let Some(e) = &self.refused {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else if let Some(why) = &self.cut {
             cut_lines(why)?
@@ -258,11 +293,14 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        if status == 0 && self.cut.is_none() && !self.writing.is_empty() {
+        if status == 0 && !self.timed_out && self.cut.is_none() && !self.writing.is_empty() {
             return Err(Failure("finish: the reply ended inside a message".into()));
         }
 
-        let lines = if let Some(e) = &self.refused {
+        let lines = if self.timed_out {
+            msg::status_lines(u32::from(msg::DEADLINE_EXCEEDED), b"deadline exceeded", &[])
+                .map_err(|e| Failure(e.into()))?
+        } else if let Some(e) = &self.refused {
             e.close_lines().map_err(|e| Failure(e.into()))?
         } else {
             match &self.cut {
@@ -306,9 +344,12 @@ impl Owed for StreamCall {
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
         &mut self.out
     }
-    /// No deadline: this framing asks the host for no timer.
     fn next_deadline(&self) -> Option<u64> {
-        None
+        if self.closed || self.timed_out {
+            None
+        } else {
+            self.deadline_ns
+        }
     }
     fn ended(&self) -> bool {
         self.closed && self.wire.is_empty() && self.out.is_empty()

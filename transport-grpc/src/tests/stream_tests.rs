@@ -143,12 +143,9 @@ fn a_finish_that_cannot_render_leaves_the_call_for_the_fallback_refusal() {
     assert!(wire(&mut c).contains("grpc-status:"));
 }
 
-/// A `grpc-timeout` THE CALLER STATES IS NEVER ENFORCED HERE, as predev's server enforced none:
-/// the call asks the host for no timer, and however long it runs it is never closed
-/// `DEADLINE_EXCEEDED` by this framing; the value stays in the head the host keeps, a fact for the
-/// plane.
+/// The body adapter exposes a host deadline, reports cancellation once, and refuses late success.
 #[test]
-fn a_stated_grpc_timeout_is_never_enforced_here() {
+fn a_stated_grpc_timeout_expires_and_overrides_a_late_success() {
     let mut c = StreamCall::open(
         [
             (&b"content-type"[..], &b"application/grpc"[..]),
@@ -157,18 +154,31 @@ fn a_stated_grpc_timeout_is_never_enforced_here() {
         .into_iter(),
         1024,
     )
-    .expect("a gRPC call");
-    assert_eq!(c.next_deadline(), None, "no timer is asked for");
-    c.ingest(&msg::frame(b"q"), true).expect("served");
-    assert!(
-        c.pieces().drain(..).all(|p| !p.failed),
-        "nothing fails the call"
-    );
+    .unwrap();
+    c.start_clock(1_000_000_000);
+    assert_eq!(c.next_deadline(), Some(1_005_000_000));
+    c.expire(1_004_999_999);
+    assert!(!c.timed_out());
+    c.expire(1_005_000_000);
+    assert_eq!(c.pieces().drain(..).filter(|piece| piece.failed).count(), 1);
+    assert_eq!(c.next_deadline(), None);
+    c.expire(2_000_000_000);
+    assert!(c.pieces().is_empty());
     c.emit(b"late but answered", true).unwrap();
     c.finish(0, b"", b"").unwrap();
-    let mut answer = msg::frame(b"late but answered");
-    answer.extend_from_slice(b"grpc-status: 0\r\n");
-    assert_eq!(c.take_wire(usize::MAX), answer);
+    assert_eq!(
+        c.take_wire(usize::MAX),
+        b"grpc-status: 4\r\ngrpc-message: deadline%20exceeded\r\n"
+    );
+}
+
+#[test]
+fn a_body_adapter_without_a_timeout_asks_for_no_timer() {
+    let mut c = grpc();
+    c.start_clock(5_000_000_000);
+    c.expire(u64::MAX);
+    assert_eq!(c.next_deadline(), None);
+    assert!(!c.timed_out());
 }
 
 /// AN EMIT AFTER THE CLOSE WRITES NOTHING: a reply message the host emits once the call is closed

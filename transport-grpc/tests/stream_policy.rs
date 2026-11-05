@@ -177,6 +177,7 @@ struct Host {
     ops: &'static Ops,
     instance: *mut c_void,
     framing: u64,
+    now_ns: u64,
     wire: Vec<u8>,
     frame: Vec<u8>,
     pieces: Vec<FramePiece>,
@@ -224,6 +225,7 @@ impl Host {
             ops,
             instance: out.instance,
             framing: 0,
+            now_ns: 7_000_000_000,
             wire: vec![0; 65536],
             frame: vec![0; 65536],
             pieces: vec![z(); 64],
@@ -243,7 +245,7 @@ impl Host {
             pieces_cap: self.pieces.len(),
             heads: self.heads.as_mut_ptr(),
             heads_cap: self.heads.len(),
-            now_monotonic_ns: 7_000_000_000,
+            now_monotonic_ns: self.now_ns,
             now_unix_ns: 1_790_000_000_000_000_000,
         }
     }
@@ -913,4 +915,45 @@ fn invalid_host_refusals_retire_the_stream_and_leave_the_connection_usable() {
             .iter()
             .any(|(piece, _)| piece.stream == 2 && piece.flags & PIECE_FIELDS != 0));
     }
+}
+
+/// Expiry cancels a pending policy but must not turn its resume into a fresh ingest.
+#[test]
+fn an_expired_policy_resume_never_replays_its_original_input() {
+    let mut host = Host::new();
+    host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+    assert_eq!(
+        host.ingest(&opening(), &[], ticket(10)).outcome,
+        Outcome::Ready
+    );
+    for _ in 0..4 {
+        assert_eq!(host.ingest(&[], &[], ticket(10)).outcome, Outcome::Ready);
+    }
+    let mut bytes = request(1, "/first", &message(b"private"), true);
+    let length =
+        (usize::from(bytes[0]) << 16) | (usize::from(bytes[1]) << 8) | usize::from(bytes[2]);
+    let timeout = b"\x00\x0cgrpc-timeout\x021m";
+    bytes.splice(9 + length..9 + length, timeout.iter().copied());
+    let length = length + timeout.len();
+    bytes[..3].copy_from_slice(&[(length >> 16) as u8, (length >> 8) as u8, length as u8]);
+    let (opening, original) = host.until_open(&bytes, ticket(2));
+    assert_eq!(opening.open.unwrap().stream, 1);
+    assert!(
+        !original.is_empty(),
+        "resume retains the already consumed HTTP2 input"
+    );
+    host.now_ns += 1_000_000;
+    let expired = host.ingest(&original, &policy(2, 22, "/first"), ticket(2));
+    assert_eq!(expired.outcome, Outcome::Ready);
+    assert!(expired
+        .pieces
+        .iter()
+        .any(|(piece, _)| piece.stream == 1 && piece.flags & PIECE_STREAM_FAILED != 0));
+    HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+    let next = request(3, "/second", &message(b"second"), true);
+    let (opening, original) = host.until_open(&next, ticket(3));
+    assert_eq!(opening.open.unwrap().stream, 2);
+    let admitted = host.ingest(&original, &policy(3, 33, "/second"), ticket(3));
+    assert_eq!(admitted.outcome, Outcome::Ready);
+    HANDED.with(|seen| assert_eq!(seen.borrow().len(), 1));
 }

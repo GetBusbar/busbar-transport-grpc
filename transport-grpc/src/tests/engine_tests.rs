@@ -403,30 +403,129 @@ fn the_callers_deadline_fails_the_call_when_it_passes_and_never_goes_upstream() 
     assert!(p.d.failure().is_none(), "the connection lives on");
 }
 
-/// AN ACCEPTED CALL'S `grpc-timeout` IS A FACT FOR THE PLANE, NEVER ENFORCED HERE, as predev's
-/// server enforced none: it is handed up among the head's fields, and long past it the call is
-/// still open, with no `DEADLINE_EXCEEDED` from this side.
+/// A caller's timeout bounds server work independently of its peer's willingness to cancel.
 #[test]
-fn an_accepted_calls_grpc_timeout_is_handed_up_and_never_enforced() {
-    let mut a = Conn::accept(posture(), 5 * SEC);
+fn an_accepted_calls_grpc_timeout_expires_on_the_host_clock() {
+    let now = 5 * SEC;
+    let deadline = now + 1_000_000;
+    let mut a = Conn::accept(posture(), now);
     a.ingest(
         &opening_with(Some("trailers"), &[("grpc-timeout", "1m")]),
         false,
     );
-    a.drive(5 * SEC);
+    a.drive(now);
     let got: Vec<Piece> = a.pieces().drain(..).collect();
     assert_eq!(
         field(&head(&got, 1).bytes, "grpc-timeout").as_deref(),
-        Some(&b"1m"[..]),
-        "the caller's deadline reaches the plane"
+        Some(&b"1m"[..])
     );
-    assert_eq!(a.next_deadline(), None, "no timer is asked for");
-    a.drive(60 * SEC);
+    assert_eq!(a.next_deadline(), Some(deadline));
+    a.drive(deadline - 1);
+    assert!(a.pieces().drain(..).all(|piece| !piece.failed));
+    a.drive(deadline);
+    let got: Vec<_> = a.pieces().drain(..).collect();
+    let failed = got.iter().filter(|piece| piece.failed).collect::<Vec<_>>();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].status, Some(msg::DEADLINE_EXCEEDED));
+    assert_eq!(held(&a), 0, "expired body and reply are retired");
+    assert_eq!(a.next_deadline(), None);
+    a.drive(deadline + SEC);
+    assert!(a.pieces().drain(..).all(|piece| !piece.failed));
+}
+
+#[test]
+fn accepted_deadlines_cancel_only_the_expired_stream_even_under_backpressure() {
+    let mut p = Pair::new();
+    p.d.emit(
+        1,
+        &call("/svc/Timed", &[("grpc-timeout", b"1m")], &[b"q"]),
+        true,
+        0,
+        p.now,
+    )
+    .unwrap();
+    p.d.emit(2, &call("/svc/Untimed", &[], &[b"q"]), true, 0, p.now)
+        .unwrap();
+    p.settle();
+    let mut out = std::collections::VecDeque::new();
+    out.push_back(Piece::data(
+        99,
+        bytes::Bytes::from(vec![0; super::STREAM_HIGH_WATER]),
+    ));
+    let mut room = super::Room::of(&out, 0);
+    let super::Side::Accept(accepted) = &mut p.a.side else {
+        panic!("accepted")
+    };
+    accepted.now_ns = p.now + 1_000_000;
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    accepted.step(&mut out, &mut room, posture().max_message_bytes, &mut cx);
+    assert!(out.iter().any(|piece| piece.stream == 1
+        && piece.failed
+        && piece.status == Some(msg::DEADLINE_EXCEEDED)));
     assert!(
-        a.pieces().drain(..).all(|p| !p.failed),
-        "nothing fails the call"
+        accepted
+            .calls
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .reply_over
     );
-    assert_eq!(held(&a), 1, "the call is still open");
+    assert!(
+        !accepted
+            .calls
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1
+            .reply_over
+    );
+}
+
+#[test]
+fn an_accepted_deadline_keeps_running_while_waiting_for_host_policy() {
+    use busbar_contract::abi::mechanism::extensions;
+    use busbar_contract::abi::sdk::transport::policy::Loans;
+    use busbar_contract::abi::transport::guest_policy;
+    let initial = guest_policy::encode(7, 1, &[]).unwrap();
+    let ext = extensions::encode(&[(guest_policy::EXT_GUEST_POLICY, &initial)]);
+    let mut p = Pair::new();
+    p.a = p.a.with_policies(Loans::from_initial(&ext).unwrap(), 0);
+    p.d.emit(
+        1,
+        &call("/svc/Timed", &[("grpc-timeout", b"1m")], &[b"q"]),
+        true,
+        0,
+        p.now,
+    )
+    .unwrap();
+    p.settle();
+    assert!(
+        p.got_a.iter().all(|piece| !piece.fields),
+        "unadmitted request is not published"
+    );
+    assert_eq!(p.a.next_deadline(), Some(p.now + 1_000_000));
+    p.at(p.now + 1_000_000);
+    let super::Side::Accept(accepted) = &p.a.side else {
+        panic!("accepted")
+    };
+    assert!(accepted.waiting.is_empty());
+    assert_eq!(
+        terminal(&p.got_d, 1).unwrap().status,
+        Some(msg::DEADLINE_EXCEEDED)
+    );
+}
+
+#[test]
+fn a_malformed_accepted_timeout_is_refused_before_publication() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    a.ingest(
+        &opening_with(Some("trailers"), &[("grpc-timeout", "1x")]),
+        false,
+    );
+    a.drive(5 * SEC);
+    assert!(a.pieces().is_empty());
+    assert_eq!(held(&a), 0);
 }
 
 #[test]
@@ -1337,11 +1436,10 @@ fn the_first_grpc_encoding_field_is_the_calls() {
     assert_eq!(held(&a), 0);
 }
 
-/// NO `grpc-timeout` GOES UPSTREAM, as predev's hop sent none (predev
-/// `crates/busbar-a2a/src/a2a/relay.rs` `build_request`): not one of the dial's own, and not one
-/// the head carries.
+/// The transport preserves the authenticated timeout field. The host's local attempt
+/// deadline still independently bounds the call; this stage cannot rewrite signed fields.
 #[test]
-fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
+fn a_supplied_grpc_timeout_reaches_upstream_without_changing_the_local_deadline() {
     let mut p = Pair::new();
     let t0 = p.now;
     let carried: [(&str, &[u8]); 3] = [
@@ -1359,7 +1457,7 @@ fn no_grpc_timeout_goes_upstream_even_when_the_head_carries_one() {
     .expect("emit");
     p.settle();
     let h = head(&p.got_a, 1);
-    assert_eq!(field(&h.bytes, "grpc-timeout"), None, "no grpc-timeout");
+    assert_eq!(field(&h.bytes, "grpc-timeout").as_deref(), Some(&b"7S"[..]));
     assert_eq!(
         field(&h.bytes, "content-type").as_deref(),
         Some(&b"application/grpc"[..])

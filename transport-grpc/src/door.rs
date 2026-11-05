@@ -232,7 +232,7 @@ slot!(
     /// listener (`LocateIn::accept`), the offer that listener makes: `h2` alone, the protocol a
     /// gRPC client negotiates over TLS. A listener names no far end, so no target is read and no
     /// authority, name or head line is stated.
-    Locate, LocateIn, LocateOut, |_, i, o| {
+    Locate, LocateIn, LocateOut, |p, i, o| {
         if i.accept() != 0 {
             let mut alpn = i.alpn_buf();
             alpn.extend(OFFER_H2);
@@ -269,6 +269,25 @@ slot!(
             o.error("locate: the target names no host");
             return Outcome::Failed;
         };
+        // The host translates this request deadline to the exact CLOCK_NOW provider epoch.
+        // Declare the remaining budget before auth; Emit must never rewrite a signed field.
+        let deadline = i.field(|x| &x.head).deadline_ns;
+        let timeout_line = if deadline == 0 {
+            None
+        } else {
+            let Some(host) = p.get().and_then(Held::host) else {
+                o.error("locate: a request deadline requires the host clock");
+                return Outcome::Failed;
+            };
+            let reading = match host.connector(Ticket::NONE).clock_now() {
+                std::task::Poll::Ready(Ok(reading)) => reading,
+                _ => {
+                    o.error("locate: the host clock could not be read for the request deadline");
+                    return Outcome::Failed;
+                }
+            };
+            Some(format!("grpc-timeout: {}\r\n", msg::timeout_value(deadline.saturating_sub(reading.mono_ns))))
+        };
         let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let authority = if host.contains(':') {
@@ -285,10 +304,11 @@ slot!(
         a.extend(authority.as_bytes());
         n.extend(host.as_bytes());
         l.extend(offer);
-        // A host that lends no defaults buffer predates it: no line is stated, and the dial writes
-        // its own as before (the contract's `LocateIn::defaults_buf`).
-        if i.defaults_cap() != 0 {
-            d.extend(DEFAULT_LINES.as_bytes());
+        // Zero capacity is a short buffer too: every host receives the complete defaults
+        // before authentication signs the request.
+        d.extend(DEFAULT_LINES.as_bytes());
+        if let Some(line) = timeout_line {
+            d.extend(line.as_bytes());
         }
         // One short answer for every buffer, each at its full size. The framer's own lines are
         // owed to every call, so a lent defaults buffer too small for them is a short answer too.
@@ -356,6 +376,7 @@ slot!(
                 Ok(call) => call,
                 Err(e) => return o.fail(Refusal::refused(e.0)),
             };
+            call.start_clock(i.sink().now_monotonic_ns());
             call.declare_response_fields();
             let token = inst.next.fetch_add(1, Ordering::Relaxed);
             o.set(|x| &x.framing, token);
@@ -502,7 +523,7 @@ slot!(
     /// `timer`.
     Timer, FramingIn, FramerOut, |p, i, o| {
         if let Some(call) = one_stream(&p, i.framing()) {
-            // One stream asks for no timer (it enforces no deadline): a call only fills.
+            // on_stream applies the host clock before filling the deadline failure.
             return on_stream("timer", &call, i.sink(), &mut o, |_| Ok(()));
         }
         with(Crossing { op: "timer", head: i.field(|x| &x.head) }, &p, i.framing(), i.sink(), &mut o, |_| Ok(()))
@@ -640,8 +661,11 @@ fn on_stream(
     f: impl FnOnce(&mut StreamCall) -> Result<(), transport::Failure>,
 ) -> Outcome {
     let mut c = call.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Err(e) = f(&mut c) {
-        return o.fail(op_failed(op, &e));
+    c.expire(sink.now_monotonic_ns());
+    if !c.timed_out() || matches!(op, "refuse" | "finish") {
+        if let Err(e) = f(&mut c) {
+            return o.fail(op_failed(op, &e));
+        }
     }
     // A one-stream framing only emits a numeric piece for its opening head; final gRPC
     // numbers remain in the transport-rendered trailers.
@@ -836,7 +860,11 @@ fn step(
     f: impl FnOnce(&mut Conn) -> Result<(), transport::Failure>,
     host: &mut HostAdmission<'_>,
 ) -> Outcome {
-    if !c.policy_pending(host.ticket) {
+    // A resumed policy call already consumed its input, even if its deadline now cancels
+    // that policy opening. Remember this before expiry removes the pending ticket.
+    let input_taken = c.policy_pending(host.ticket);
+    c.expire_deadlines(sink.now_monotonic_ns());
+    if !input_taken {
         if let Err(e) = f(c) {
             return o.fail(op_failed(op, &e));
         }

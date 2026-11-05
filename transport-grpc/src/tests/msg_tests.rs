@@ -460,3 +460,50 @@ fn a_partial_tail_does_not_keep_a_completed_messages_allocation_alive() {
     );
     assert_eq!(messages.buf.as_ref(), &prefix(100).unwrap()[..2]);
 }
+
+#[test]
+fn grpc_timeouts_parse_all_units_and_saturate_the_host_clock() {
+    for (value, want) in [
+        (b"1H".as_slice(), 3_600_000_000_000),
+        (b"1M", 60_000_000_000),
+        (b"1S", 1_000_000_000),
+        (b"1m", 1_000_000),
+        (b"1u", 1_000),
+        (b"1n", 1),
+        (b"0n", 0),
+        (b"99999999H", u64::MAX),
+    ] {
+        assert_eq!(timeout_ns(value), Ok(want));
+    }
+    for value in [
+        b"".as_slice(),
+        b"S",
+        b"1",
+        b"1s",
+        b"+1S",
+        b"1.0S",
+        b"100000000n",
+        b" 1S",
+        b"1S ",
+    ] {
+        assert!(timeout_ns(value).is_err(), "{value:?}");
+    }
+}
+
+#[test]
+fn grpc_timeout_defaults_floor_to_the_finest_wire_unit_without_extending_the_budget() {
+    for (remaining, expected) in [
+        (0, "0n"),
+        (1, "1n"),
+        (99_999_999, "99999999n"),
+        (100_000_001, "100000u"),
+        (100_000_000_001, "100000m"),
+        (100_000_000_000_001, "100000S"),
+        (100_000_000_000_000_001, "1666666M"),
+        (u64::MAX, "5124095H"),
+    ] {
+        let encoded = timeout_value(remaining);
+        assert_eq!(encoded, expected);
+        assert!(timeout_ns(encoded.as_bytes()).unwrap() <= remaining);
+    }
+}
