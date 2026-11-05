@@ -39,6 +39,7 @@ serde_json = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 # THE DOOR'S BEHAVIOUR, BOTH WAYS IN (`tests/door.rs`): the shipped dropped-in image, the plugin
 # crate's cdylib, loaded beside the linked door.
 libloading = { workspace = true }
