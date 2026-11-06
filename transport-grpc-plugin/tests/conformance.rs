@@ -9,7 +9,7 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Outcome};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::DoorFn;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
@@ -87,7 +87,7 @@ fn open(p: &Plugin<Transport>) {
 /// What one door answered: what it located, then what a dial's begin answered.
 type Script = Vec<String>;
 
-/// One scripted exchange through the dispatcher: locate a target, begin a dial.
+/// One scripted exchange through the dispatcher: locate, begin, close, then reject another begin.
 fn script(p: &Plugin<Transport>) -> Script {
     let target = "http://peer.test:50051";
     let (mut a, mut n, mut alpn) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
@@ -143,6 +143,28 @@ fn script(p: &Plugin<Transport>) -> Script {
     o.head = out_head();
     let mut f = Frame::new(i, o);
     seen.push(format!("begin {:?}", p.call(slot::BEGIN, &mut f).outcome));
+    assert_eq!(seen.last().map(String::as_str), Some("begin Ready"));
+
+    let crossings = || {
+        p.inner.crossings.load(std::sync::atomic::Ordering::SeqCst)
+            - p.inner.resumes.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let before = crossings();
+    let mut close: Frame<InHead, OutHead> = Frame::new(in_head(), out_head());
+    let outcome = p.call(life::CLOSE, &mut close).outcome;
+    assert_eq!(outcome, Outcome::Ready, "the actual image closes");
+    assert_eq!(crossings() - before, 1, "CLOSE crosses the actual image");
+    seen.push(format!("close {outcome:?}"));
+
+    let before = crossings();
+    let outcome = p.call(slot::BEGIN, &mut f).outcome;
+    assert_eq!(
+        outcome,
+        Outcome::Fault,
+        "the closed image cannot begin again"
+    );
+    assert_eq!(crossings(), before, "a closed image is not entered again");
+    seen.push(format!("begin after close {outcome:?}"));
     seen
 }
 
@@ -171,8 +193,8 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
     assert_eq!(same_script(&a, &b), Ok(()), "both doors answer alike");
     assert_eq!(
         a.last().map(String::as_str),
-        Some("begin Ready"),
-        "both doors begin the dial"
+        Some("begin after close Fault"),
+        "both actual images close and reject another begin"
     );
 
     let mut off = b.clone();
