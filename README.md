@@ -7,7 +7,6 @@ First-party signed kind:transport plugin cdylib: the grpc transport, packaged as
 |---|---|---|---|---|
 | `transport` | `grpc` | `busbar-transport-grpc-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
 
-[![ci](https://github.com/GetBusbar/busbar-transport-grpc/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-transport-grpc/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
 ## What it is for
