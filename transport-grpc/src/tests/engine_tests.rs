@@ -2752,8 +2752,8 @@ fn sensitive_query_targets_fail_before_request_construction() {
 #[test]
 fn head_buffer_growth_preserves_credentials_until_consumed() {
     let mut head = super::HeadBuf::new(Vec::with_capacity(1));
-    super::append_head(&mut head, b"authorization: secret");
-    super::append_head(&mut head, b"\r\nx-other: value\r\n\r\n");
+    super::extend_wiped(&mut head, b"authorization: secret");
+    super::extend_wiped(&mut head, b"\r\nx-other: value\r\n\r\n");
     assert_eq!(
         head.as_slice(),
         b"authorization: secret\r\nx-other: value\r\n\r\n"

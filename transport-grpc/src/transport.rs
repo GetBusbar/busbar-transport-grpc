@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use crate::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
+use crate::hyper_io::{extend_wiped, field_block, held_bytes, HeadWords, HostIo, Owed, Piece};
 use busbar_contract::abi::host::service::UnitRef;
 use busbar_contract::abi::mechanism::ticket::Ticket;
 use busbar_contract::abi::sdk::services::{HeadViewArgs, RefusalCopy};
@@ -37,33 +37,6 @@ use crate::msg::{self, Head, Messages};
 /// head carries the auth's credential lines (TSEAL: until the attach slot is sealed, credentials
 /// reach the framer as plaintext, and the framer wipes the copies it owns).
 type HeadBuf = zeroize::Zeroizing<Vec<u8>>;
-
-struct SecretBytes(HeadBuf);
-
-impl AsRef<[u8]> for SecretBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-}
-
-fn secret_bytes(bytes: Vec<u8>) -> Bytes {
-    Bytes::from_owner(SecretBytes(HeadBuf::new(bytes)))
-}
-
-fn append_head(buf: &mut HeadBuf, bytes: &[u8]) {
-    if buf.capacity().saturating_sub(buf.len()) < bytes.len() {
-        let capacity = buf
-            .len()
-            .saturating_add(bytes.len())
-            .max(buf.capacity().saturating_mul(2));
-        let mut replacement = HeadBuf::new(Vec::with_capacity(capacity));
-        replacement.extend_from_slice(buf);
-        replacement.extend_from_slice(bytes);
-        *buf = replacement;
-    } else {
-        buf.extend_from_slice(bytes);
-    }
-}
 
 /// The connection posture every framing carries.
 #[derive(Debug, Clone, Copy)]
@@ -697,7 +670,7 @@ impl Conn {
                     return Ok(());
                 }
                 if !s.head_sent {
-                    append_head(&mut s.head_buf, bytes);
+                    extend_wiped(&mut s.head_buf, bytes);
                     let read = match msg::read_head(&s.head_buf, max) {
                         Ok(None) if end => Err("the frame ended inside the head block".into()),
                         read => read,
@@ -1060,7 +1033,7 @@ impl DialStream {
     fn take(&mut self, base: &str, bytes: &[u8], end: bool, max: usize) -> Result<(), String> {
         let body: Vec<u8> = match &mut self.stage {
             DStage::Head(buf) => {
-                append_head(buf, bytes);
+                extend_wiped(buf, bytes);
                 let Some((head, took)) = msg::read_head(buf, max)? else {
                     if end {
                         return Err("the frame ended inside the head block".into());
@@ -1901,7 +1874,10 @@ impl Accept {
         };
         out.push_back(Piece {
             head: Some(words),
-            ..Piece::fields(id, secret_bytes(field_block(req.headers(), &[])))
+            ..Piece::fields(
+                id,
+                held_bytes(HeadBuf::new(field_block(req.headers(), &[]))),
+            )
         });
         self.calls
             .push((id, AStream::new(req, reply, max, policy, unit, deadline_ns)));
