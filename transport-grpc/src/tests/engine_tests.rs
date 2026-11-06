@@ -2160,7 +2160,29 @@ fn a_connection_failing_while_it_holds_a_body_back_still_says_so() {
     p.d.drive(p.now);
     p.d.ingest(&[], true);
     p.d.drive(p.now);
-    assert!(p.d.failure().is_some(), "the connection failed");
+    assert!(
+        p.d.held_back,
+        "the host still holds the response at its mark"
+    );
+    assert_eq!(p.d.failure(), None, "buffered frames remain drainable");
+    let queued = held_for_host(&p.d);
+    p.d.drive(p.now);
+    assert_eq!(held_for_host(&p.d), queued, "backpressure remains bounded");
+    // A frame-boundary EOF cannot discard buffered DATA. Let the host take those
+    // pieces before requiring the missing-trailers failure from the same EOF.
+    for _ in 0..200 {
+        if p.d.failure().is_some() {
+            break;
+        }
+        assert!(p.d.wire_pending(), "the host is owed a drain re-call");
+        p.d.pieces().clear();
+        p.d.drive(p.now);
+    }
+    assert!(
+        p.d.failure().is_some(),
+        "the connection failed after draining"
+    );
+    assert!(p.d.pieces().iter().any(|piece| piece.failed));
     p.d.pieces().clear();
     assert!(!p.d.wire_pending(), "a failed connection owes no re-call");
 }
@@ -2704,10 +2726,10 @@ fn admission_queue_is_capped_and_reaps_all_reset_requests_in_one_round() {
     };
     assert_eq!(accepted.waiting.len(), super::PENDING_REQUEST_LIMIT);
     let mut donor = Pair::new();
-    donor
-        .d
-        .emit(1, &call("/svc/Call", &[], &[]), false, 0, donor.now)
-        .unwrap();
+    // Keep the donor body open: call(..., &[]) declares content-length: 0,
+    // which completes the upload even when emit's end flag is false.
+    let open_head = msg::render_head(&[("path", b"/svc/Call")], None).unwrap();
+    donor.d.emit(1, &open_head, false, 0, donor.now).unwrap();
     donor.settle();
     let super::Side::Accept(donor_accept) = &mut donor.a.side else {
         panic!("accepted");
@@ -2783,8 +2805,9 @@ fn partial_responses_share_a_connection_budget() {
 #[test]
 fn accepted_headers_and_resets_wait_for_the_host_to_drain() {
     let mut p = Pair::new();
-    p.d.emit(1, &call("/svc/Call", &[], &[]), false, 0, p.now)
-        .unwrap();
+    // This request must retain an Incoming body for the queued-arrival fixture.
+    let open_head = msg::render_head(&[("path", b"/svc/Call")], None).unwrap();
+    p.d.emit(1, &open_head, false, 0, p.now).unwrap();
     p.settle();
     let super::Side::Accept(accepted) = &mut p.a.side else {
         panic!("accepted");
