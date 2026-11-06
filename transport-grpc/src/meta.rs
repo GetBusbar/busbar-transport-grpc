@@ -103,7 +103,8 @@ pub(crate) fn fault_of(code: u16) -> u8 {
 
 /// How the breaker reads a BARE HTTP ANSWER (a far end, or a proxy or auth wall in front of it,
 /// answering a call with an HTTP status and no `grpc-status`), by that HTTP status: 401/403 hard
-/// (`Auth` -> `HardDown`); 408, 429, 529 and 5xx transient; every other status the caller's.
+/// (`Auth` -> `HardDown`); 429 rate-limited; 408 and every 5xx transient; every other status the
+/// caller's.
 const HTTP_FAULTS: &[(u16, u16, u8)] = &[
     (401, 401, FAULT_HARD),
     (403, 403, FAULT_HARD),

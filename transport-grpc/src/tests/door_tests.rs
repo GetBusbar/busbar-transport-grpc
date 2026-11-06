@@ -86,9 +86,11 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     assert_eq!(p.timeout.as_secs(), 300);
     assert_eq!(p.max_message_bytes, 33_554_432);
 
+    // No more often than gRPC servers' default ping enforcement allows (gRFC A8: 5 minutes, two
+    // strikes, then GOAWAY `too_many_pings`), so an idle call is never torn down for its pings.
     assert_eq!(
         p.keep_alive_interval,
-        Some(std::time::Duration::from_secs(30))
+        Some(std::time::Duration::from_secs(300))
     );
     assert_eq!(p.keep_alive_timeout, std::time::Duration::from_secs(10));
     assert!(p.adaptive_window);
@@ -97,6 +99,12 @@ fn settings_read_as_declared_and_refuse_what_is_not() {
     )
     .expect("settings");
     assert_eq!((p.timeout.as_secs(), p.max_message_bytes), (5, 1024));
+    let p = read_settings(
+        br#"{"limits.upstream_request_timeout_secs":18446744073709551615,"limits.request_body_max_bytes":18446744073709551615}"#,
+    )
+    .expect("the schema maximum is accepted");
+    assert_eq!(p.timeout, std::time::Duration::from_secs(u64::MAX));
+    assert_eq!(p.max_message_bytes, usize::MAX);
     assert!(read_settings(b"not json").is_err());
     assert!(read_settings(br#"{"limits.upstream_request_timeout_secs":"5"}"#).is_err());
 }

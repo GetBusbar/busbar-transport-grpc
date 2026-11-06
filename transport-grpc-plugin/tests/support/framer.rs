@@ -34,10 +34,6 @@ fn abi_bytes(b: &(impl AsRef<[u8]> + ?Sized)) -> AbiStr {
 fn count(p: &Plugin<Transport>) -> u64 {
     p.inner.crossings.load(Ordering::SeqCst) - p.inner.resumes.load(Ordering::SeqCst)
 }
-enum Expected {
-    Exact(String),
-    Prefix(&'static str),
-}
 use busbar_contract::abi::mechanism::call::{Field, OutHead, Outcome};
 use busbar_contract::abi::transport::{
     slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn,
@@ -124,6 +120,12 @@ struct Sink {
     wire: Vec<u8>,
     frame: Vec<u8>,
     pieces: Vec<FramePiece>,
+    /// The host's framing context the ops cross in, as the connector's own scoped crossing
+    /// provides it: (the framing token it was made for, the context).
+    scope: Option<(
+        u64,
+        std::sync::Arc<busbar_plugin_loader::dispatch::framing_context::FramingContext>,
+    )>,
 }
 
 impl Sink {
@@ -143,6 +145,7 @@ impl Sink {
             wire: vec![0; wire],
             frame: vec![0; frame],
             pieces: vec![piece; pieces],
+            scope: None,
         }
     }
 
@@ -268,7 +271,7 @@ impl Op<'_> {
 
             Op::Emit(..) => Op::Emit(&[], false),
             Op::Refuse(_) => Op::Refuse(&[]),
-            Op::Adopt(_) | Op::Begin(..) => Op::Timer,
+            Op::Begin(..) => Op::Timer,
             other => other,
         }
     }
@@ -281,8 +284,28 @@ fn go<I: InFrame, O: OutFrame>(p: &Plugin<Transport>, s: u32, i: I) -> (Called, 
 }
 
 fn cross(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> (Called, FramerOut) {
+    if framing == 0
+        || sink
+            .scope
+            .as_ref()
+            .is_none_or(|(token, _)| *token != framing)
+    {
+        sink.scope = Some((
+            framing,
+            busbar_plugin_loader::dispatch::framing_context::FramingContext::new(
+                p.instance().0,
+                0,
+                framing,
+                None,
+            )
+            .expect("actual product framing context"),
+        ));
+    }
+    let scope = sink.scope.as_ref().map(|(_, scope)| {
+        scope.clone() as std::sync::Arc<dyn busbar_contract::framing_scope::FramingScope>
+    });
     let raw = sink.raw();
-    match op {
+    busbar_plugin_loader::dispatch::framing_context::with_context(scope, || match op {
         Op::Begin(side, target) => {
             let mut i: BeginIn = input();
             (i.side, i.sink, i.target) = (side, raw, abi_bytes(target));
@@ -334,7 +357,7 @@ fn cross(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> (C
             };
             go(p, s, i)
         }
-    }
+    })
 }
 
 fn once(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> Yielded {
@@ -378,48 +401,6 @@ fn carrier_ops(p: &Plugin<Transport>) -> [Outcome; 8] {
             .0
             .outcome,
     ]
-}
-
-type HeadLine = (Vec<u8>, Vec<u8>);
-
-fn located_defaults(p: &Plugin<Transport>, target: &[u8]) -> (String, (Vec<HeadLine>, bool)) {
-    let (mut authority, mut name, mut alpn, mut defaults) = (
-        vec![0_u8; AMPLE],
-        vec![0_u8; AMPLE],
-        vec![0_u8; AMPLE],
-        vec![0_u8; AMPLE],
-    );
-    let mut i: LocateIn = input();
-    i.target = abi_bytes(target);
-    (i.authority_buf, i.authority_cap) = (authority.as_mut_ptr(), authority.len());
-    (i.name_buf, i.name_cap) = (name.as_mut_ptr(), name.len());
-    (i.alpn_buf, i.alpn_cap) = (alpn.as_mut_ptr(), alpn.len());
-    (i.defaults_buf, i.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
-    let mut f: Frame<LocateIn, LocateOut> = Frame::new(i, output());
-    let c = p.call(slot::LOCATE, &mut f);
-    let written = (f.out.defaults_written as usize).min(defaults.len());
-    let lines: Vec<HeadLine> = if c.outcome == Outcome::Ready {
-        defaults[..written]
-            .split(|b| *b == b'\n')
-            .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-            .filter(|l| !l.is_empty())
-            .filter_map(|l| {
-                let at = l.iter().position(|b| *b == b':')?;
-                let value = &l[at + 1..];
-                let start = value.iter().position(|b| *b != b' ').unwrap_or(value.len());
-                Some((l[..at].to_vec(), value[start..].to_vec()))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let states_length = c.outcome == Outcome::Ready && f.out.states_length != 0;
-    let line = format!(
-        "{:?} defaults={} states_length={states_length}",
-        c.outcome,
-        lines.len()
-    );
-    (line, (lines, states_length))
 }
 
 fn locate(
@@ -482,10 +463,23 @@ fn ready_locate(authority: &[u8], secure: bool, has_name: bool) -> String {
         lossy(authority)
     )
 }
+/// A connection framing's READY answer: every one leases its retained-input report
+/// (`framer.retained_input`); `encode`, which drives no framing, leases nothing.
 fn yielded_line(wire: &[u8], frames: &[Vec<u8>], raw: &[u8], flags: u32, framing: bool) -> String {
+    answer_line(true, wire, frames, raw, flags, framing)
+}
+
+fn answer_line(
+    lease: bool,
+    wire: &[u8],
+    frames: &[Vec<u8>],
+    raw: &[u8],
+    flags: u32,
+    framing: bool,
+) -> String {
     let frames: Vec<String> = frames.iter().map(|f| lossy(f)).collect();
     format!(
-        "Ready lease=false err=\"\" wire={:?} frames={frames:?} partial=\"\" raw={:?} flags={flags} framing={framing}",
+        "Ready lease={lease} err=\"\" wire={:?} frames={frames:?} partial=\"\" raw={:?} flags={flags} framing={framing}",
         lossy(wire),
         lossy(raw)
     )
@@ -538,88 +532,70 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let before = count(p);
     assert_eq!(carrier_ops(p), [Outcome::Refused; 8]);
     assert_eq!(count(p) - before, 8);
-    match &k["locate"] {
-        Value::String(v) if v == "refused" => {
+    {
+        let l = &k["locate"];
+        let reads = l["reads"]
+            .as_array()
+            .expect("conformance.json: transport.locate.reads must be an array");
+        assert!(!reads.is_empty(), "transport.locate.reads is empty");
+        for (n, read) in reads.iter().enumerate() {
+            let target = text(&read["target"], "locate.reads.target");
+            let authority = text(&read["authority"], "locate.reads.authority");
+            let secure = read["secure"].as_bool().unwrap_or(false);
+            let has_name = read["has_name"].as_bool().unwrap_or(false);
+            let want = ready_locate(&authority, secure, has_name);
             {
-                let label = "locate";
+                let label = &format!("locate #{n}");
+
                 let before = count(p);
-                let value = locate(p, b"conformance", AMPLE).0;
+                let value = locate(p, &target, AMPLE).0;
                 assert_eq!(count(p) - before, 1, "{label} crossings");
                 let answer = value;
-                assert!(answer.starts_with("Refused "), "{label}: {answer}");
+                assert_eq!(answer, want, "{label}");
                 transcript.push(format!("{label}: {answer}"));
             };
         }
-        l => {
-            let reads = l["reads"]
-                .as_array()
-                .expect("conformance.json: transport.locate.reads must be an array");
-            assert!(!reads.is_empty(), "transport.locate.reads is empty");
-            for (n, read) in reads.iter().enumerate() {
-                let target = text(&read["target"], "locate.reads.target");
-                let authority = text(&read["authority"], "locate.reads.authority");
-                let secure = read["secure"].as_bool().unwrap_or(false);
-                let has_name = read["has_name"].as_bool().unwrap_or(false);
-                let want = Expected::Exact(ready_locate(&authority, secure, has_name));
-                {
-                    let label = &format!("locate #{n}");
+        let target = text(&reads[0]["target"], "locate.reads.target");
+        let authority = text(&reads[0]["authority"], "locate.reads.authority");
+        let secure = reads[0]["secure"].as_bool().unwrap_or(false);
+        let has_name = reads[0]["has_name"].as_bool().unwrap_or(false);
+        assert!(
+            authority.len() > 1,
+            "transport.locate.reads[0].authority must be longer than one byte"
+        );
+        let want = format!(
+            "needed={} then {}",
+            authority.len(),
+            ready_locate(&authority, secure, has_name)
+        );
 
-                    let before = count(p);
-                    let value = locate(p, &target, AMPLE).0;
-                    assert_eq!(count(p) - before, 1, "{label} crossings");
-                    let answer = value;
-                    match want {
-                        Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                        Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-                    };
-                    transcript.push(format!("{label}: {answer}"));
+        {
+            let label = "locate short";
+
+            let before = count(p);
+            let value = (|| {
+                let (first, token) = locate(p, &target, 1);
+                let Some((token, needed)) = token else {
+                    return format!("{first} (no re-call)");
                 };
-            }
-            let target = text(&reads[0]["target"], "locate.reads.target");
-            let authority = text(&reads[0]["authority"], "locate.reads.authority");
-            let secure = reads[0]["secure"].as_bool().unwrap_or(false);
-            let has_name = reads[0]["has_name"].as_bool().unwrap_or(false);
-            assert!(
-                authority.len() > 1,
-                "transport.locate.reads[0].authority must be longer than one byte"
-            );
-            let want = Expected::Exact(format!(
-                "needed={} then {}",
-                authority.len(),
-                ready_locate(&authority, secure, has_name)
-            ));
-
+                let again = locate_on(p, &target, needed as usize, Some(token)).0;
+                format!("needed={needed} then {again}")
+            })();
+            assert_eq!(count(p) - before, 2, "{label} crossings");
+            let answer = value;
+            assert_eq!(answer, want, "{label}");
+            transcript.push(format!("{label}: {answer}"));
+        };
+        for (n, t) in texts(&l["refuses"], "locate.refuses").iter().enumerate() {
             {
-                let label = "locate short";
-
+                let label = &format!("locate refused #{n}");
                 let before = count(p);
-                let value = (|| {
-                    let (first, token) = locate(p, &target, 1);
-                    let Some((token, needed)) = token else {
-                        return format!("{first} (no re-call)");
-                    };
-                    let again = locate_on(p, &target, needed as usize, Some(token)).0;
-                    format!("needed={needed} then {again}")
-                })();
-                assert_eq!(count(p) - before, 2, "{label} crossings");
+                let value = locate(p, t, AMPLE).0;
+                assert_eq!(count(p) - before, 1, "{label} crossings");
                 let answer = value;
-                match want {
-                    Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                    Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-                };
+                assert!(answer.starts_with("Failed "), "{label}: {answer}");
                 transcript.push(format!("{label}: {answer}"));
             };
-            for (n, t) in texts(&l["refuses"], "locate.refuses").iter().enumerate() {
-                {
-                    let label = &format!("locate refused #{n}");
-                    let before = count(p);
-                    let value = locate(p, t, AMPLE).0;
-                    assert_eq!(count(p) - before, 1, "{label} crossings");
-                    let answer = value;
-                    assert!(answer.starts_with("Failed "), "{label}: {answer}");
-                    transcript.push(format!("{label}: {answer}"));
-                };
-            }
         }
     }
 
@@ -635,7 +611,6 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
 
     let armed = |step: &str| -> u32 {
         let on = match &dial["deadline"] {
-            Value::Bool(b) => *b && step == "emit",
             Value::Array(a) => a.iter().any(|v| v.as_str() == Some(step)),
             _ => false,
         };
@@ -658,106 +633,13 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         };
         assert_eq!(count(p) - before, pinned, "{label} crossings");
         let (answer, result) = value;
-        match want {
-            Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-            Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-        };
+        assert_eq!(answer, want, "{label}");
         transcript.push(format!("{label}: {answer}"));
         result
     };
 
-    if !dial["answer"].is_null() {
-        let answer = text(&dial["answer"], "dial.answer");
-        let heard = if dial["answer_frames"].is_null() {
-            Vec::new()
-        } else {
-            texts(&dial["answer_frames"], "dial.answer_frames")
-        };
-        let want = Expected::Exact(yielded_line(&[], &heard, &[], 0, false));
-        {
-            let label = "dial answer";
-
-            let before = count(p);
-            let value = pump(p, token, Op::Ingest(&answer, false), &mut tight).line();
-            assert_eq!(
-                count(p) - before,
-                frame_sinkfuls(&heard),
-                "{label} crossings"
-            );
-            let answer = value;
-            match want {
-                Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-            };
-            transcript.push(format!("{label}: {answer}"));
-        };
-    }
-
-    let emit = if dial["request"].is_null() {
-        text(&dial["emit"], "dial.emit")
-    } else {
-        let request = &dial["request"];
-        let body = opt_text(&request["body"], "dial.request.body");
-        let mut named: Vec<HeadLine> = request["fields"]
-            .as_array()
-            .map(|fs| {
-                fs.iter()
-                    .map(|f| {
-                        (
-                            text(&f[0], "dial.request.fields name"),
-                            text(&f[1], "dial.request.fields value"),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (defaults, states_length) = {
-            let label = "dial defaults";
-            let before = count(p);
-            let value = located_defaults(p, &target);
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let (answer, result) = value;
-            transcript.push(format!("{label}: {answer}"));
-            result
-        };
-        for (name, value) in defaults {
-            if !named.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
-                named.push((name, value));
-            }
-        }
-
-        if states_length
-            && !body.is_empty()
-            && !named
-                .iter()
-                .any(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
-        {
-            named.push((
-                b"content-length".to_vec(),
-                body.len().to_string().into_bytes(),
-            ));
-        }
-        let fields: Vec<Field> = named
-            .iter()
-            .map(|(n, v)| Field {
-                name: abi_bytes(n),
-                value: abi_bytes(v),
-            })
-            .collect();
-        {
-            let label = "dial encode";
-            let before = count(p);
-            let value = {
-                let y = once(p, 0, Op::Encode(&body, &fields), &mut Sink::ample());
-                (y.line(), y.wire)
-            };
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let (answer, result) = value;
-            transcript.push(format!("{label}: {answer}"));
-            result
-        }
-    };
-    let want = Expected::Exact(yielded_line(&wire, &[], &[], armed("emit"), false));
+    let emit = text(&dial["emit"], "dial.emit");
+    let want = yielded_line(&wire, &[], &[], armed("emit"), false);
     {
         let label = "emit";
 
@@ -769,10 +651,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             "{label} crossings"
         );
         let answer = value;
-        match want {
-            Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-            Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-        };
+        assert_eq!(answer, want, "{label}");
         transcript.push(format!("{label}: {answer}"));
     };
 
@@ -781,7 +660,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
 
     let ends = !dial["ingest_wire"].is_null() && dial["ingest_ends"].as_bool().unwrap_or(true);
     let ingest_flags = armed("ingest") | if ends { YIELD_ENDED } else { 0 };
-    let want = Expected::Exact(yielded_line(&answered, &frames, &[], ingest_flags, false));
+    let want = yielded_line(&answered, &frames, &[], ingest_flags, false);
     {
         let label = "ingest";
 
@@ -789,13 +668,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let value = pump(p, token, Op::Ingest(&ingest, false), &mut tight).line();
         assert_eq!(count(p) - before, ingest_calls, "{label} crossings");
         let answer = value;
-        match want {
-            Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-            Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-        };
+        assert_eq!(answer, want, "{label}");
         transcript.push(format!("{label}: {answer}"));
     };
-    let want = Expected::Exact(yielded_line(&[], &[], &[], YIELD_ENDED, false));
+    let want = yielded_line(&[], &[], &[], YIELD_ENDED, false);
     {
         let label = "ingest end";
 
@@ -803,14 +679,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let value = pump(p, token, Op::Ingest(&[], true), &mut tight).line();
         assert_eq!(count(p) - before, 1, "{label} crossings");
         let answer = value;
-        match want {
-            Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-            Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-        };
+        assert_eq!(answer, want, "{label}");
         transcript.push(format!("{label}: {answer}"));
     };
-    let finish = opt_text(&dial["finish"], "dial.finish");
-    let want = Expected::Exact(yielded_line(&finish, &[], &[], YIELD_ENDED, false));
+    let want = answer_line(false, &[], &[], &[], YIELD_ENDED, false);
     {
         let label = "finish";
 
@@ -818,14 +690,11 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let value = pump(p, token, Op::Finish, &mut tight).line();
         assert_eq!(
             count(p) - before,
-            sinkfuls(finish.len(), TIGHT_WIRE),
+            sinkfuls(0, TIGHT_WIRE),
             "{label} crossings"
         );
         let answer = value;
-        match want {
-            Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-            Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-        };
+        assert_eq!(answer, want, "{label}");
         transcript.push(format!("{label}: {answer}"));
     };
     {
@@ -863,10 +732,14 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                 value: abi_bytes(v),
             })
             .collect();
-        let want = match &case["wire"] {
-            Value::Null => Expected::Prefix("Failed "),
-            v => Expected::Exact(yielded_line(&text(v, "encode.wire"), &[], &[], 0, false)),
-        };
+        let want = answer_line(
+            false,
+            &text(&case["wire"], "encode.wire"),
+            &[],
+            &[],
+            0,
+            false,
+        );
         {
             let label = &format!("encode #{n}");
 
@@ -874,25 +747,18 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             let value = once(p, 0, Op::Encode(&body, &fields), &mut Sink::ample()).line();
             assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
-            match want {
-                Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-            };
+            assert_eq!(answer, want, "{label}");
             transcript.push(format!("{label}: {answer}"));
         };
     }
 
-    if refused(&k["refuse"]) {
-        unreachable!("both real products accept connections");
-    } else {
+    {
         let refuse = &k["refuse"];
-        let (bytes, wire) = (
-            text(&refuse["bytes"], "refuse.bytes"),
-            text(&refuse["wire"], "refuse.wire"),
-        );
+        assert_eq!(refuse["refused"], true, "this door refuses a refusal");
+        let bytes = text(&refuse["bytes"], "refuse.bytes");
 
         let accept_opening = opt_text(&refuse["begin"], "refuse.begin");
-        let want = Expected::Exact(yielded_line(&accept_opening, &[], &[], 0, true));
+        let want = yielded_line(&accept_opening, &[], &[], 0, true);
         let pinned = sinkfuls(accept_opening.len(), TIGHT_WIRE);
         let token = {
             let label = "begin accept";
@@ -904,67 +770,22 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             };
             assert_eq!(count(p) - before, pinned, "{label} crossings");
             let (answer, result) = value;
-            match want {
-                Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-            };
+            assert_eq!(answer, want, "{label}");
             transcript.push(format!("{label}: {answer}"));
             result
         };
 
-        if !refuse["opening"].is_null() {
-            let opening = text(&refuse["opening"], "refuse.opening");
-            let answer = opt_text(&refuse["answer"], "refuse.answer");
-            let want = Expected::Exact(yielded_line(&answer, &[], &[], 0, false));
-            {
-                let label = "accept opening";
-
-                let before = count(p);
-                let value = pump(p, token, Op::Ingest(&opening, false), &mut tight).line();
-                assert_eq!(
-                    count(p) - before,
-                    sinkfuls(answer.len(), TIGHT_WIRE),
-                    "{label} crossings"
-                );
-                let answer = value;
-                match want {
-                    Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                    Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-                };
-                transcript.push(format!("{label}: {answer}"));
-            };
-        }
-
-        let refuses_none = refuse["refused"].as_bool().unwrap_or(false);
-        let ends = refuse["ends"].as_bool().unwrap_or(false);
-        let ended = if ends { YIELD_ENDED } else { 0 };
-        let want = if refuses_none {
-            Expected::Prefix("Refused ")
-        } else {
-            Expected::Exact(yielded_line(&wire, &[], &[], ended, false))
-        };
         {
             let label = "refuse";
 
             let before = count(p);
             let value = pump(p, token, Op::Refuse(&bytes), &mut tight).line();
-            assert_eq!(
-                count(p) - before,
-                sinkfuls(wire.len(), TIGHT_WIRE),
-                "{label} crossings"
-            );
+            assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
-            match want {
-                Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-            };
+            assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
         };
-        let want = if ends {
-            Expected::Prefix("Failed ")
-        } else {
-            Expected::Exact(yielded_line(&[], &[], &[], 0, false))
-        };
+        let want = yielded_line(&[], &[], &[], 0, false);
         {
             let label = "timer";
 
@@ -972,10 +793,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             let value = pump(p, token, Op::Timer, &mut tight).line();
             assert_eq!(count(p) - before, 1, "{label} crossings");
             let answer = value;
-            match want {
-                Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-            };
+            assert_eq!(answer, want, "{label}");
             transcript.push(format!("{label}: {answer}"));
         };
         {
@@ -1017,6 +835,8 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let mut i: TickIn = input();
     i.now_ns = 1;
     let (c, o): (_, TickOut) = go(p, life::TICK, i);
+    assert_eq!(c.outcome, Outcome::Ready, "tick crossing");
+    assert_eq!(o.next_tick_ns, 0, "the door wants no further tick");
     transcript.push(format!(
         "tick {:?} lease={} err={:?} next={}",
         c.outcome,
@@ -1089,160 +909,38 @@ fn the_linked_and_the_dropped_in_door_are_one_plugin() {
     let linked_transcript = exercise(&linked, &d);
     let dropped_transcript = exercise(&dropped, &d);
     assert_eq!(linked_transcript, dropped_transcript);
-    let mut changed = dropped_transcript.clone();
-    changed[1].push('!');
-    assert_ne!(
-        linked_transcript, changed,
-        "a changed product answer fails parity"
-    );
-}
-#[test]
-fn the_suite_runs_in_the_profile_it_was_asked_to() {
-    assert!(
-        !(cfg!(debug_assertions) && std::env::var_os("BUSBAR_EXPECT_RELEASE").is_some()),
-        "run with --release"
-    );
 }
 fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token: u64) {
     let mut tight = Sink::tight();
-    let whole = &k["handoff"];
-    let refused_ = || once(p, 0, Op::Adopt(b"conformance"), &mut Sink::tight()).line();
-    if refused(whole) {
-        {
-            let label = "detach";
-            let before = count(p);
-            let value = once(p, token, Op::Detach, &mut tight).line();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Refused "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-        {
-            let label = "adopt";
-            let before = count(p);
-            let value = (refused_)();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Refused "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-        {
-            let label = "finish upgrade";
-            let before = count(p);
-            let value = once(p, token, Op::Finish, &mut tight).line();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Ready "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-        return;
-    }
-
-    let (detach, of, adopt, adopt_of, leftover) = if whole.is_null() {
-        (&k["detach"], "detach", &k["adopt"], "adopt", "leftover")
-    } else {
-        (whole, "handoff", whole, "handoff", "adopt")
-    };
-    if refused(detach) {
-        {
-            let label = "detach";
-            let before = count(p);
-            let value = once(p, token, Op::Detach, &mut tight).line();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Refused "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-    } else {
-        let ingest = text(&detach["ingest"], &format!("{of}.ingest"));
-        let detached = text(&detach["detached"], &format!("{of}.detached"));
-
-        {
-            let label = "ingest before upgrade";
-            let before = count(p);
-            let value = once(p, token, Op::Ingest(&ingest, false), &mut tight).line();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Ready "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-        let want = Expected::Exact(yielded_line(&[], &[], &detached, YIELD_ENDED, false));
-        {
-            let label = "detach";
-
-            let before = count(p);
-            let value = pump(p, token, Op::Detach, &mut tight).line();
-            assert_eq!(
-                count(p) - before,
-                sinkfuls(detached.len(), TIGHT_FRAME),
-                "{label} crossings"
-            );
-            let answer = value;
-            match want {
-                Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-                Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-            };
-            transcript.push(format!("{label}: {answer}"));
-        };
-    }
-
-    if whole.is_null() {
-        {
-            let label = "finish upgrade";
-            let before = count(p);
-            let value = once(p, token, Op::Finish, &mut tight).line();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Ready "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-    }
-    if refused(adopt) {
-        {
-            let label = "adopt";
-            let before = count(p);
-            let value = (refused_)();
-            assert_eq!(count(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Refused "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
-        };
-        return;
-    }
-    let left = text(&adopt[leftover], &format!("{adopt_of}.{leftover}"));
-    let frames = texts(&adopt["frames"], &format!("{adopt_of}.frames"));
-
-    let wire = if whole.is_null() {
-        opt_text(&adopt["wire"], "adopt.wire")
-    } else {
-        Vec::new()
-    };
-    let crossings = sinkfuls(wire.len(), TIGHT_WIRE).max(frame_sinkfuls(&frames));
-    let want = Expected::Exact(yielded_line(&wire, &frames, &[], 0, true));
-    let adopted = {
-        let label = "adopt";
-
+    assert!(
+        refused(&k["detach"]) && refused(&k["adopt"]),
+        "a framer hands nothing off"
+    );
+    {
+        let label = "detach";
         let before = count(p);
-        let value = {
-            let y = pump(p, 0, Op::Adopt(&left), &mut tight);
-            (y.line(), y.framing)
-        };
-        assert_eq!(count(p) - before, crossings, "{label} crossings");
-        let (answer, result) = value;
-        match want {
-            Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
-            Expected::Prefix(v) => assert!(answer.starts_with(v), "{label}: {answer}"),
-        };
+        let value = once(p, token, Op::Detach, &mut tight).line();
+        assert_eq!(count(p) - before, 1, "{label} crossings");
+        let answer = value;
+        assert!(answer.starts_with("Refused "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
-        result
     };
     {
-        let label = "finish adopted";
+        let label = "finish upgrade";
         let before = count(p);
-        let value = once(p, adopted, Op::Finish, &mut tight).line();
+        let value = once(p, token, Op::Finish, &mut tight).line();
         assert_eq!(count(p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Ready "), "{label}: {answer}");
+        transcript.push(format!("{label}: {answer}"));
+    };
+    {
+        let label = "adopt";
+        let before = count(p);
+        let value = once(p, 0, Op::Adopt(b"conformance"), &mut Sink::tight()).line();
+        assert_eq!(count(p) - before, 1, "{label} crossings");
+        let answer = value;
+        assert!(answer.starts_with("Refused "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
     };
 }
@@ -1250,12 +948,12 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
 fn refused(v: &Value) -> bool {
     v.as_str() == Some("refused")
 }
-fn begin_dial_want(dial: &Value, flags: u32) -> Expected {
-    Expected::Exact(yielded_line(
+fn begin_dial_want(dial: &Value, flags: u32) -> String {
+    yielded_line(
         &opt_text(&dial["opening"], "dial.opening"),
         &[],
         &[],
         flags,
         true,
-    ))
+    )
 }

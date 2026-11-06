@@ -172,6 +172,18 @@ fn a_stated_grpc_timeout_expires_and_overrides_a_late_success() {
     );
 }
 
+/// A huge peer timeout at a non-zero host clock is far away, not an overflow and not at once.
+#[test]
+fn a_huge_grpc_timeout_at_a_non_zero_clock_does_not_expire() {
+    let mut c = open_with(&[(b"grpc-timeout", b"99999999H")]);
+    c.start_clock(7_000_000_000);
+    let hour = 3_600_000_000_000;
+    assert!(c.next_deadline().is_some_and(|d| d > 7_000_000_000 + hour));
+    c.expire(7_000_000_000 + hour);
+    assert!(!c.timed_out());
+    assert!(c.pieces().is_empty());
+}
+
 #[test]
 fn a_body_adapter_without_a_timeout_asks_for_no_timer() {
     let mut c = grpc();
@@ -412,6 +424,21 @@ fn a_finish_after_an_oversize_message_is_resource_exhausted_not_ok() {
     assert!(!w.contains("grpc-status: 0"), "{w}");
 }
 
+/// A refused body closes in the framer's words whatever close `finish` states, even while the
+/// unit's reply message is half written: the framer's refusal, not a FAILED `finish`.
+#[test]
+fn a_finish_after_a_refused_body_with_a_half_written_reply_closes_in_the_framers_words() {
+    let mut c = grpc();
+    let mut body = vec![0u8];
+    body.extend_from_slice(&1025u32.to_be_bytes());
+    c.ingest(&body, false).expect_err("over the ceiling");
+    c.emit(b"half", false).unwrap();
+    c.finish(0, b"", b"").expect("the refused call closes");
+    let w = wire(&mut c);
+    assert!(w.contains("grpc-status: 8\r\n"), "{w}");
+    assert!(!w.contains("half"), "{w}");
+}
+
 /// A COMPRESSED MESSAGE WITH NO ENCODING ON THE STREAM PATH CLOSES INTERNAL with the framer's words,
 /// as on the connection side, not with the host's neutral refusal status.
 #[test]
@@ -542,6 +569,42 @@ fn unfinished_fragments_past_the_bound_cut_the_reply() {
 }
 
 #[test]
+fn a_refusal_after_a_cut_reply_closes_resource_exhausted_in_the_cuts_words() {
+    let mut c = StreamCall::open(
+        [(&b"content-type"[..], &b"application/grpc"[..])].into_iter(),
+        100,
+    )
+    .unwrap();
+    let chunk = [b'a'; 64];
+    let e = loop {
+        if let Err(e) = c.emit(&chunk, false) {
+            break e;
+        }
+    };
+    c.refuse(b"", 0, false).unwrap();
+    assert_eq!(
+        wire(&mut c),
+        format!(
+            "content-type: application/grpc\r\ngrpc-status: 8\r\ngrpc-message: {}\r\n",
+            msg::encode_status_message(e.0.as_bytes())
+        )
+    );
+}
+
+#[test]
+fn a_refusal_after_the_deadline_closes_deadline_exceeded() {
+    let mut c = open_with(&[(b"grpc-timeout", b"5m")]);
+    c.start_clock(1_000_000_000);
+    c.expire(1_005_000_000);
+    assert!(c.timed_out());
+    c.refuse(b"", 429, false).unwrap();
+    assert_eq!(
+        wire(&mut c),
+        "content-type: application/grpc\r\ngrpc-status: 4\r\ngrpc-message: deadline%20exceeded\r\n"
+    );
+}
+
+#[test]
 fn refusal_opening_status_is_metadata_in_its_declared_domain() {
     let mut call = grpc();
     call.refuse(b"", 429, false).unwrap();
@@ -550,4 +613,35 @@ fn refusal_opening_status_is_metadata_in_its_declared_domain() {
     assert!(StreamCall::code_handoff(&opening));
     assert!(opening.fields);
     assert!(!wire(&mut call).contains(":status"));
+}
+
+/// A STREAM THE HOST MUST GIVE UP IS NEVER ANNOUNCED WRITABLE: once a reply answered full is cut
+/// past its bound, or its deadline passes, no writable piece follows the failure.
+#[test]
+fn a_cut_or_expired_reply_is_never_announced_writable() {
+    for expire in [false, true] {
+        let mut c = StreamCall::open(
+            [
+                (&b"content-type"[..], &b"application/grpc"[..]),
+                (&b"grpc-timeout"[..], &b"1S"[..]),
+            ]
+            .into_iter(),
+            1024,
+        )
+        .unwrap();
+        c.start_clock(0);
+        while !c.announce_full() {
+            c.emit(&[b'a'; 1000], true).unwrap();
+        }
+        if expire {
+            c.expire(2_000_000_000);
+        } else {
+            while c.emit(&[b'a'; 1000], true).is_ok() {}
+        }
+        let _ = c.take_wire(usize::MAX);
+        assert!(
+            !c.pieces().iter().any(|p| p.writable),
+            "no writable piece after the reply is given up (expired: {expire})"
+        );
+    }
 }

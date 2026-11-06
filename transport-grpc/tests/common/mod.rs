@@ -602,6 +602,31 @@ impl Host {
         self.drain(slot::INGEST, 0)
     }
 
+    /// `ingest` `bytes` once, without re-calling on `YIELD_MORE`: its outcome, and the far-side
+    /// byte count its answer reports the framing still holds unread (`framer.retained_input`).
+    pub fn feed_reported(&mut self, bytes: &[u8]) -> (Outcome, Option<u64>) {
+        let mut i: IngestIn = z();
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let r = unsafe { call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST) };
+        let ext = o.head.extensions;
+        let bytes: &[u8] = if ext.len == 0 {
+            &[]
+        } else {
+            // SAFETY: the door's answer lease holds its extension bytes; the harness never releases.
+            unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) }
+        };
+        let retained = busbar_contract::abi::sdk::transport::receive::decode(bytes)
+            .expect("a well-formed retained-input report");
+        self.take(r, &o);
+        (r, retained)
+    }
+
     /// `finish` the framing with the close's FINAL TAIL: `status`, its `message` and `details`.
     pub fn finish_final(&mut self, status: u32, message: &[u8], details: &[u8]) -> Outcome {
         let bytes = [message, details].concat();

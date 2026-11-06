@@ -1,5 +1,4 @@
 {
-  "settings": {},
   "transport": {
     "locate": {
       "reads": [
@@ -65,7 +64,6 @@
         "hex": "0000180400000000000003000000c800040000ffff000500004000000600004000"
       },
       "bytes": "no",
-      "wire": "",
       "refused": true
     },
     "detach": "refused",

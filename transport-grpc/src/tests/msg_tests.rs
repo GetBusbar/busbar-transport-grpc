@@ -416,6 +416,25 @@ fn invalid_compression_flags_are_not_reported_as_compression() {
 }
 
 #[test]
+fn an_invalid_flag_is_worded_and_closes_the_call_internal() {
+    let bad = Bad::InvalidFlag(2);
+    assert_eq!(bad.to_string(), "invalid gRPC compression flag: 2");
+    assert_eq!(bad.status(), INTERNAL);
+    assert_eq!(
+        bad.close_lines().unwrap(),
+        b"grpc-status: 13\r\ngrpc-message: invalid%20gRPC%20compression%20flag:%202\r\n"
+    );
+}
+
+#[test]
+fn a_flag_found_in_a_buffered_message_is_remembered() {
+    let mut m = Messages::new(64);
+    assert_eq!(m.push(&[1]).unwrap().len(), 0);
+    assert_eq!(m.push(&[0, 0, 0, 1, b'z']), Err(Bad::Compressed));
+    assert_eq!(m.push(&[0]), Err(Bad::Compressed), "the failure stays");
+}
+
+#[test]
 fn completed_fragmented_messages_release_the_cutter_allocation() {
     let mut messages = Messages::new(8192);
     let wire = frame(&vec![7; 8192]);

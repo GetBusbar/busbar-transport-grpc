@@ -67,7 +67,6 @@ fn red_a_door_at_another_kind_abi_is_refused() {
         };
         let e = busbar_plugin_loader::dispatch::load::rendering_of_raw(changed_door).unwrap_err();
         assert_eq!(e, want);
-        assert!(e.to_string().contains("rebuild"));
         let e = LinkedRow::of_raw(changed_door)
             .and_then(|r| load_linked::<Transport>(&r, bind(&d)).map(|_| ()))
             .unwrap_err();
@@ -282,20 +281,21 @@ fn red_a_door_asked_for_as_another_kind_is_refused() {
 fn the_declared_needs_are_the_statements() {
     let r = row();
     let read = rendering::read(&r.statement).unwrap();
-    assert!(read.needs.is_empty());
     let declares: serde_json::Value =
         serde_json::from_str(include_str!("../../../transport-grpc/declares.json")).unwrap();
-    assert!(
-        declares.get("needs").is_none() || declares["needs"].as_array().is_some_and(Vec::is_empty)
-    );
-}
-
-#[test]
-fn no_outbound_auth_family_is_driven() {
-    let r = row();
-    let read = rendering::read(&r.statement).unwrap();
-    assert_eq!(read.kind, KindCode::Transport as u32);
-    let inputs: serde_json::Value =
-        serde_json::from_str(include_str!("../conformance.json")).unwrap();
-    assert!(inputs["auth"]["outbound"].is_null());
+    let declared: Vec<&serde_json::Value> = match declares.get("needs") {
+        None => Vec::new(),
+        Some(n) => n
+            .as_array()
+            .expect("declares needs is an array")
+            .iter()
+            .collect(),
+    };
+    assert_eq!(read.needs.len(), declared.len());
+    for (stated, declared) in read.needs.iter().zip(declared) {
+        assert_eq!(
+            Some(stated.transport.as_str()),
+            declared["transport"].as_str()
+        );
+    }
 }

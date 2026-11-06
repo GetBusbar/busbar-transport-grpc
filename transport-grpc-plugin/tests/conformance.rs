@@ -9,18 +9,12 @@
 use std::mem::zeroed;
 use std::sync::Arc;
 
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::call::{Blob, Outcome};
 use busbar_contract::abi::mechanism::door::DoorFn;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
-use busbar_contract::abi::mechanism::KindCode;
-use busbar_contract::abi::transport::{
-    slot, BeginIn, FramerOut, FramerSink, LocateIn, LocateOut, SIDE_DIAL,
-};
-use busbar_plugin_loader::dispatch::kinds::hook::Hook;
 use busbar_plugin_loader::dispatch::kinds::transport::Transport;
 use busbar_plugin_loader::dispatch::{
-    in_head, load_dropped, load_linked, out_head, Bind, ConnTable, DispatchConfig, Dispatcher,
-    Frame, LinkedRow, LoadError, LoadedDoor, NoSink, Plugin,
+    in_head, out_head, Bind, ConnTable, Dispatcher, Frame, LinkedRow, LoadedDoor, NoSink, Plugin,
 };
 
 fn z<T>() -> T {
@@ -74,157 +68,13 @@ fn bind(d: &Dispatcher) -> Bind {
 }
 
 fn open(p: &Plugin<Transport>) {
-    let settings = "{}";
     let mut i: OpenIn = z();
     i.head = in_head();
-    i.settings = Blob::json(settings.as_bytes());
+    i.settings = Blob::json(b"{}");
     let mut o: OpenOut = z();
     o.head = out_head();
     let mut f = Frame::new(i, o);
     assert_eq!(p.call(life::OPEN, &mut f).outcome, Outcome::Ready);
-}
-
-/// What one door answered: what it located, then what a dial's begin answered.
-type Script = Vec<String>;
-
-/// One scripted exchange through the dispatcher: locate, begin, close, then reject another begin.
-fn script(p: &Plugin<Transport>) -> Script {
-    let target = "http://peer.test:50051";
-    let (mut a, mut n, mut alpn) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
-    let mut defaults = vec![0_u8; 256];
-    let mut i: LocateIn = z();
-    i.head = in_head();
-    i.target = AbiStr::of(target);
-    (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
-    (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
-    (i.alpn_buf, i.alpn_cap) = (alpn.as_mut_ptr(), alpn.len());
-    (i.defaults_buf, i.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
-    let mut o: LocateOut = z();
-    o.head = out_head();
-    let mut f = Frame::new(i, o);
-    let outcome = p.call(slot::LOCATE, &mut f).outcome;
-    let o = f.out;
-    let mut seen = vec![
-        format!("locate {outcome:?}"),
-        format!(
-            "authority {:?}",
-            String::from_utf8_lossy(&a[..o.authority_written as usize])
-        ),
-        format!(
-            "name {:?} has_name {}",
-            String::from_utf8_lossy(&n[..o.name_written as usize]),
-            o.has_name
-        ),
-        format!("secure {}", o.secure),
-        format!("alpn {:?}", &alpn[..o.alpn_written as usize]),
-    ];
-    assert_eq!(outcome, Outcome::Ready, "the door locates a gRPC target");
-
-    let (mut wire, mut frame) = (vec![0_u8; 4096], vec![0_u8; 4096]);
-    let mut pieces = vec![z(); 8];
-    let mut i: BeginIn = z();
-    i.head = in_head();
-    i.side = SIDE_DIAL;
-    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
-    i.target = AbiStr::of(target);
-    i.sink = FramerSink {
-        wire: wire.as_mut_ptr(),
-        wire_cap: wire.len(),
-        frame: frame.as_mut_ptr(),
-        frame_cap: frame.len(),
-        pieces: pieces.as_mut_ptr(),
-        pieces_cap: pieces.len(),
-        now_monotonic_ns: 1,
-        now_unix_ns: 1,
-        heads: std::ptr::null_mut(),
-        heads_cap: 0,
-    };
-    let mut o: FramerOut = z();
-    o.head = out_head();
-    let mut f = Frame::new(i, o);
-    seen.push(format!("begin {:?}", p.call(slot::BEGIN, &mut f).outcome));
-    assert_eq!(seen.last().map(String::as_str), Some("begin Ready"));
-
-    let crossings = || {
-        p.inner.crossings.load(std::sync::atomic::Ordering::SeqCst)
-            - p.inner.resumes.load(std::sync::atomic::Ordering::SeqCst)
-    };
-    let before = crossings();
-    let mut close: Frame<InHead, OutHead> = Frame::new(in_head(), out_head());
-    let outcome = p.call(life::CLOSE, &mut close).outcome;
-    assert_eq!(outcome, Outcome::Ready, "the actual image closes");
-    assert_eq!(crossings() - before, 1, "CLOSE crosses the actual image");
-    seen.push(format!("close {outcome:?}"));
-
-    let before = crossings();
-    let outcome = p.call(slot::BEGIN, &mut f).outcome;
-    assert_eq!(
-        outcome,
-        Outcome::Fault,
-        "the closed image cannot begin again"
-    );
-    assert_eq!(crossings(), before, "a closed image is not entered again");
-    seen.push(format!("begin after close {outcome:?}"));
-    seen
-}
-
-/// Two doors' scripts must be the same lines: `Err` names the first that differs.
-fn same_script(a: &Script, b: &Script) -> Result<(), String> {
-    match a.iter().zip(b).position(|(x, y)| x != y) {
-        None if a.len() == b.len() => Ok(()),
-        None => Err(format!("{} lines vs {}", a.len(), b.len())),
-        Some(i) => Err(format!("line {i}: {:?} vs {:?}", a[i], b[i])),
-    }
-}
-
-#[test]
-fn the_linked_and_the_dropped_in_door_are_one_framer() {
-    let d = Dispatcher::new(DispatchConfig::default());
-    let linked: Plugin<Transport> = load_linked(&row(), bind(&d)).expect("the linked door loads");
-    let dropped: Plugin<Transport> =
-        load_dropped(&cdylib(), &row().statement, bind(&d)).expect("the dropped-in door loads");
-    assert_eq!(linked.name(), "grpc");
-    assert_eq!(dropped.name(), linked.name());
-    open(&linked);
-    open(&dropped);
-
-    let a = script(&linked);
-    let b = script(&dropped);
-    assert_eq!(same_script(&a, &b), Ok(()), "both doors answer alike");
-    assert_eq!(
-        a.last().map(String::as_str),
-        Some("begin after close Fault"),
-        "both actual images close and reject another begin"
-    );
-
-    let mut off = b.clone();
-    off[1].push('!');
-    assert!(
-        same_script(&a, &off).is_err_and(|e| e.starts_with("line 1:")),
-        "a differing line is caught"
-    );
-    let short: Script = b[..b.len() - 1].to_vec();
-    assert!(same_script(&a, &short).is_err(), "a missing line is caught");
-}
-
-#[test]
-fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
-    let d = Dispatcher::new(DispatchConfig::default());
-    let want = (KindCode::Transport, KindCode::Hook);
-    match load_linked::<Hook>(&row(), bind(&d)) {
-        Err(LoadError::ManifestKind {
-            stated,
-            want: asked,
-        }) => assert_eq!((stated, asked), want),
-        other => panic!("the linked door loaded as a hook: {:?}", other.err()),
-    }
-    match load_dropped::<Hook>(&cdylib(), &row().statement, bind(&d)) {
-        Err(LoadError::ManifestKind {
-            stated,
-            want: asked,
-        }) => assert_eq!((stated, asked), want),
-        other => panic!("the dropped-in door loaded as a hook: {:?}", other.err()),
-    }
 }
 
 #[path = "support/framer.rs"]

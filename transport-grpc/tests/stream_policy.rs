@@ -9,7 +9,8 @@ use std::mem::size_of;
 
 use busbar_contract::abi::host::service::{
     AuthAnswer, AuthRef, HostSlots, RefusalAnswer, ServiceOut, UnitHandInIn, UnitRef, UnitRefuseIn,
-    FLOW_CONTINUE, FLOW_STOP, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS, SCHEME_PLAIN, SERVICES,
+    FLOW_CONTINUE, FLOW_STOP, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS, REFUSE_NO_ROUTE,
+    SCHEME_PLAIN, SERVICES,
 };
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, Field, InHead, OutHead, Outcome, RawOutcome, BLOB_OCTETS,
@@ -47,6 +48,7 @@ thread_local! {
     static REFUSAL_MODE: Cell<u8> = const { Cell::new(0) };
     static REFUSAL_FIELD: RefCell<Option<Field>> = const { RefCell::new(None) };
     static FLOW: Cell<u32> = const { Cell::new(FLOW_CONTINUE) };
+    static NO_UNIT: Cell<bool> = const { Cell::new(false) };
     static REFUSED: RefCell<Vec<(u32, u32, UnitRef)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -79,9 +81,13 @@ extern "C" fn hand_in(_: HostCtx, input: *const c_void, out: *mut ServiceOut) ->
         input.answer.write_unaligned(AuthAnswer {
             size: size_of::<AuthAnswer>() as u32,
             flow: FLOW.with(Cell::get),
-            unit: UnitRef {
-                id: u64::from(input.line),
-                mac: input.auth.mac,
+            unit: if NO_UNIT.with(Cell::get) {
+                UnitRef::NONE
+            } else {
+                UnitRef {
+                    id: u64::from(input.line),
+                    mac: input.auth.mac,
+                }
             },
         });
         (*out).outcome = RawOutcome::of(Outcome::Ready);
@@ -146,9 +152,19 @@ fn policy(generation: u64, line: u32, path: &str) -> Vec<u8> {
 }
 
 fn policy_for_methods(generation: u64, line: u32, path: &str, methods: u32) -> Vec<u8> {
+    policy_with_points(generation, line, path, methods, 0)
+}
+
+fn policy_with_points(
+    generation: u64,
+    line: u32,
+    path: &str,
+    methods: u32,
+    points: u32,
+) -> Vec<u8> {
     let line = GuestLine {
         line,
-        points: 0,
+        points,
         auth: AuthRef {
             id: u64::from(line),
             mac: generation,
@@ -171,6 +187,7 @@ struct Answer {
     pieces: Vec<(FramePiece, Vec<u8>)>,
     open: Option<Open>,
     framing: u64,
+    error: String,
 }
 
 struct Host {
@@ -195,6 +212,7 @@ impl Host {
         HANDED.with(|seen| seen.borrow_mut().clear());
         REFUSED.with(|seen| seen.borrow_mut().clear());
         FLOW.with(|flow| flow.set(FLOW_CONTINUE));
+        NO_UNIT.with(|none| none.set(false));
         REFUSAL_MODE.with(|mode| mode.set(0));
         let mut slots: Box<HostSlots> = Box::new(z());
         slots.size = size_of::<HostSlots>() as u32;
@@ -259,6 +277,15 @@ impl Host {
                 .to_vec()
         };
         let open = extensions::get(&ext, EXT_GUEST_OPEN).map(|value| Open::decode(value).unwrap());
+        if open.is_some() {
+            // A policy-open answer carries its open alone: the retained-input report rides only
+            // answers that finished their drive.
+            assert_eq!(
+                busbar_contract::abi::sdk::transport::receive::decode(&ext),
+                Ok(None),
+                "a policy-open answer carries no retained-input report"
+            );
+        }
         let answer = Answer {
             outcome,
             flags: out.yielded.flags,
@@ -275,6 +302,7 @@ impl Host {
                 .collect(),
             open,
             framing: out.framing,
+            error: text(out.head.error),
         };
         if out.head.lease != 0 {
             let mut input: ReleaseIn = z();
@@ -956,4 +984,160 @@ fn an_expired_policy_resume_never_replays_its_original_input() {
     let admitted = host.ingest(&original, &policy(3, 33, "/second"), ticket(3));
     assert_eq!(admitted.outcome, Outcome::Ready);
     HANDED.with(|seen| assert_eq!(seen.borrow().len(), 1));
+}
+
+/// A CONNECTION THAT BROKE ADMITS NOTHING MORE: with one request admitted and another parked for
+/// its policy, the far end breaks the connection (a DATA frame on stream 0); the parked request is
+/// failed with the connection's streams, never opens a policy and is never handed in, and the
+/// framing fails once the host has taken what it owes (its GOAWAY).
+#[test]
+fn a_broken_connection_admits_none_of_its_parked_requests() {
+    let mut host = Host::new();
+    host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+    let mut bytes = opening();
+    bytes.extend(request(1, "/first", &message(b"first"), true));
+    bytes.extend(request(3, "/second", &message(b"second"), true));
+    let (opening, original) = host.until_open(&bytes, ticket(2));
+    assert_eq!(opening.open.unwrap().stream, 1);
+    let admitted = host.ingest(&original, &policy(2, 22, "/first"), ticket(2));
+    assert_eq!(admitted.outcome, Outcome::Ready);
+    assert!(admitted.open.is_none(), "the second waits for a later op");
+    let mut answer = host.ingest(&frame(0, 0, 0, &[0]), &[], ticket(3));
+    let mut failed = false;
+    for n in 4..20 {
+        assert!(
+            answer.open.is_none(),
+            "no policy opens on a broken connection"
+        );
+        if answer.outcome == Outcome::Failed {
+            failed = true;
+            break;
+        }
+        answer = host.ingest(&[], &[], ticket(n));
+    }
+    assert!(failed, "the broken connection fails");
+    HANDED.with(|seen| assert_eq!(seen.borrow().len(), 1, "only the first was handed in"));
+}
+
+/// A request whose head names its authority by a `host` field, not an `:authority` pseudo-field.
+fn request_with_host(stream: u32, target: &str, host: &str) -> Vec<u8> {
+    let mut head = vec![0x83, 0x86];
+    for (name, value) in [
+        (":path", target),
+        ("host", host),
+        ("content-type", "application/grpc"),
+    ] {
+        head.extend([0, name.len() as u8]);
+        head.extend_from_slice(name.as_bytes());
+        head.push(value.len() as u8);
+        head.extend_from_slice(value.as_bytes());
+    }
+    let mut wire = frame(1, 4, stream, &head);
+    wire.extend(frame(0, 1, stream, &[]));
+    wire
+}
+
+#[test]
+fn a_request_without_an_authority_is_handed_in_under_its_host_field() {
+    let mut host = Host::new();
+    host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+    let mut bytes = opening();
+    bytes.extend(request_with_host(1, "/first", "hostfield.test"));
+    let (_, original) = host.until_open(&bytes, ticket(2));
+    let admitted = host.ingest(&original, &policy(2, 22, "/first"), ticket(2));
+    assert_eq!(admitted.outcome, Outcome::Ready);
+    HANDED.with(|seen| {
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].target, "/first");
+        assert_eq!(seen[0].authority, "hostfield.test");
+    });
+}
+
+/// A host answer the door cannot honour fails the framing in words, retires only that stream, and
+/// leaves the connection admitting the next request.
+#[test]
+fn a_hand_in_the_door_cannot_honour_fails_in_words_and_leaves_the_connection_usable() {
+    use busbar_contract::abi::auth::POINT_HEAD;
+    for (points, no_unit, words) in [
+        (
+            POINT_HEAD,
+            false,
+            "gRPC offers no inbound authentication points",
+        ),
+        (0, true, "unit.hand_in: Broken"),
+    ] {
+        let mut host = Host::new();
+        host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+        let mut bytes = opening();
+        bytes.extend(request(1, "/first", &[], true));
+        let (_, original) = host.until_open(&bytes, ticket(2));
+        NO_UNIT.with(|none| none.set(no_unit));
+        let failed = host.ingest(
+            &original,
+            &policy_with_points(2, 22, "/first", METHOD_POST, points),
+            ticket(2),
+        );
+        assert_eq!(failed.outcome, Outcome::Failed, "{words}");
+        assert!(failed.error.contains(words), "{}", failed.error);
+        assert!(failed
+            .pieces
+            .iter()
+            .all(|(piece, _)| piece.flags & PIECE_FIELDS == 0));
+        NO_UNIT.with(|none| none.set(false));
+        // The retired stream is failed to the host before the next request opens its policy.
+        let second = request(3, "/second", &[], true);
+        let mut pieces = failed.pieces;
+        let mut answer = host.ingest(&second, &[], ticket(3));
+        let mut opened = None;
+        for _ in 0..100 {
+            assert_eq!(answer.outcome, Outcome::Ready);
+            pieces.extend(answer.pieces);
+            if let Some(open) = answer.open {
+                opened = Some(open);
+                break;
+            }
+            answer = host.ingest(&[], &[], ticket(3));
+        }
+        assert_eq!(opened.expect("the next request opens").stream, 2, "{words}");
+        assert!(
+            pieces
+                .iter()
+                .any(|(piece, _)| piece.stream == 1 && piece.flags & PIECE_STREAM_FAILED != 0),
+            "{words}: the retired stream is reported failed"
+        );
+        let original = second;
+        let admitted = host.ingest(&original, &policy(3, 33, "/second"), ticket(3));
+        assert_eq!(admitted.outcome, Outcome::Ready);
+        assert!(admitted
+            .pieces
+            .iter()
+            .any(|(piece, _)| piece.stream == 2 && piece.flags & PIECE_FIELDS != 0));
+    }
+}
+
+#[test]
+fn a_path_no_policy_line_names_is_refused_as_no_route_and_never_handed_in() {
+    let mut host = Host::new();
+    host.begin(SIDE_ACCEPT, &policy(1, 11, "/initial"));
+    let mut bytes = opening();
+    bytes.extend(request(1, "/first", &[], true));
+    let (_, original) = host.until_open(&bytes, ticket(2));
+    let refused = host.ingest(&original, &policy(2, 22, "/elsewhere"), ticket(2));
+    assert_eq!(refused.outcome, Outcome::Ready);
+    assert!(refused
+        .wire
+        .windows(b"denied-verbatim".len())
+        .any(|bytes| bytes == b"denied-verbatim"));
+    assert!(refused
+        .pieces
+        .iter()
+        .all(|(piece, _)| piece.flags & PIECE_FIELDS == 0));
+    HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+    REFUSED.with(|seen| {
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[(REFUSE_NO_ROUTE, LINE_NONE, UnitRef::NONE)]
+        )
+    });
 }

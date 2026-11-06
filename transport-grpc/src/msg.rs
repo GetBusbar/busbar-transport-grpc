@@ -312,6 +312,8 @@ pub const OK: u16 = 0;
 pub const CANCELLED: u16 = 1;
 /// `UNKNOWN`.
 pub const UNKNOWN: u16 = 2;
+/// `INVALID_ARGUMENT`.
+pub const INVALID_ARGUMENT: u16 = 3;
 /// `DEADLINE_EXCEEDED`.
 pub const DEADLINE_EXCEEDED: u16 = 4;
 /// `PERMISSION_DENIED`.
@@ -388,7 +390,7 @@ pub fn reset_name(code: u32) -> String {
         .map_or_else(|| format!("error code {code:#x}"), |n| (*n).to_owned())
 }
 
-/// The `grpc-status` a refusal's neutral status ([`RefuseIn::status`]) stands for on a call's
+/// The `grpc-status` a refusal's neutral status (`RefuseIn::status`) stands for on a call's
 /// end: the HTTP-to-status table, and `413` as `RESOURCE_EXHAUSTED`.
 #[must_use]
 pub fn status_of_refusal(status: u32) -> u16 {

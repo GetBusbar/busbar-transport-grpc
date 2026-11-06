@@ -33,12 +33,12 @@ bytes = { workspace = true }
 # HTTP/2's own error codes: a far end's RST_STREAM code, read off the error `hyper` hands up
 # (`std::error::Error::source`), is mapped to its gRPC status. The same `h2` `hyper` runs on.
 h2 = { workspace = true }
-# The door's settings blob is JSON.
-serde_json = { workspace = true }
 # A head block may carry an auth's credential lines: the copies this framer owns are wiped.
 zeroize = { workspace = true }
 
 [dev-dependencies]
+# The settings-schema tests read the published schema and settings as JSON.
+serde_json = { workspace = true }
 jsonschema = { workspace = true }
 # THE DOOR'S BEHAVIOUR, BOTH WAYS IN (`tests/door.rs`): the shipped dropped-in image, the plugin
 # crate's cdylib, loaded beside the linked door.

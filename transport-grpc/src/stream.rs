@@ -9,8 +9,9 @@
 //!   before it is one; a call whose `grpc-encoding` names a compression this door does not take
 //!   fails its first `ingest`, and its close is `UNIMPLEMENTED` with `grpc-accept-encoding` (gRPC's
 //!   compression rules); the first `grpc-encoding` field is the call's, a repeat is not read;
-//!   a valid `grpc-timeout` starts a deadline on the host clock. The host must drive the
-//!   requested timer and cancel its work when the framing yields a failed piece;
+//!   a valid `grpc-timeout` starts a deadline on the host clock, and an invalid one refuses the
+//!   call. The host must drive the requested timer and cancel its work when the framing yields a
+//!   failed piece;
 //! * `ingest` takes the call's body and yields each length-prefixed message's PAYLOAD as one piece
 //!   on stream `1` that ends its frame (no piece ends the stream: the host's framer knows where the
 //!   body ended);
@@ -21,7 +22,9 @@
 //!   call then closes `RESOURCE_EXHAUSTED`, whatever close it states);
 //! * `finish` closes the call with the final status the unit stated: `grpc-status`, `grpc-message`
 //!   (the unit's message) and `grpc-status-details-bin` (the unit's value, verbatim), in tonic
-//!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers;
+//!   0.14's bytes and order ([`msg::status_lines`]), the host's trailers; a close stating success
+//!   while a reply message is half written is the call's last answer all the same, and closes
+//!   `INTERNAL` ("the reply ended inside a message"), the half message dropped;
 //! * `refuse` closes it refused: the trailer block the refusal's bytes state, or its neutral status
 //!   mapped ([`msg::status_of_refusal`]); a body the framer refused closes in this framer's words,
 //!   whatever the refusal (and whatever close `finish` states): a message over the ceiling
@@ -46,7 +49,7 @@ pub const STREAM: u64 = 1;
 /// One call's framing.
 pub struct StreamCall {
     messages: Messages,
-    /// The largest message payload carried, either way.
+    /// The largest message payload read from the far end; it also sizes the reply's queue bound.
     max: usize,
     writing: Vec<u8>,
     /// The bytes owed the host's wire, taken from the front ([`Owed::take_wire`]): a deque, so a
@@ -80,7 +83,7 @@ impl StreamCall {
     /// # Errors
     ///
     /// The call is not gRPC: its `content-type` is none of gRPC's, or its method (when stated) is
-    /// not POST.
+    /// not POST; or its first `grpc-timeout` is not a valid one.
     pub fn open<'f>(
         fields: impl Iterator<Item = (&'f [u8], &'f [u8])>,
         max: usize,
@@ -225,6 +228,11 @@ impl StreamCall {
         full
     }
 
+    /// A reply message is half written: bytes emitted without the `ends` that completes it.
+    pub(crate) fn reply_unfinished(&self) -> bool {
+        !self.writing.is_empty()
+    }
+
     /// Cut the reply for `why`: the message being written is dropped, no reply byte more is taken,
     /// and the call closes `RESOURCE_EXHAUSTED` in these words, whatever close the host states (the
     /// far end never takes a reply missing a message for a whole one).
@@ -293,7 +301,12 @@ impl StreamCall {
         if self.closed {
             return Ok(());
         }
-        if status == 0 && !self.timed_out && self.cut.is_none() && !self.writing.is_empty() {
+        if status == 0
+            && !self.timed_out
+            && self.cut.is_none()
+            && self.refused.is_none()
+            && !self.writing.is_empty()
+        {
             return Err(Failure("finish: the reply ended inside a message".into()));
         }
 
@@ -332,7 +345,13 @@ impl Owed for StreamCall {
         let n = cap.min(self.wire.len());
         let taken = self.wire.drain(..n).collect();
 
-        if self.announced && !self.closed && self.wire.len() <= STREAM_LOW_WATER {
+        // A reply given up (cut, or past its deadline) is never writable again.
+        if self.announced
+            && !self.closed
+            && self.cut.is_none()
+            && !self.timed_out
+            && self.wire.len() <= STREAM_LOW_WATER
+        {
             self.announced = false;
             self.out.push_back(Piece::writable(STREAM));
         }

@@ -516,6 +516,59 @@ fn an_accepted_deadline_keeps_running_while_waiting_for_host_policy() {
     );
 }
 
+/// A huge peer timeout at a non-zero host clock neither overflows nor fails the call at once.
+#[test]
+fn a_huge_accepted_timeout_at_a_non_zero_clock_publishes_and_is_not_failed() {
+    let now = 7 * SEC;
+    let mut a = Conn::accept(posture(), now);
+    a.ingest(
+        &opening_with(Some("trailers"), &[("grpc-timeout", "99999999H")]),
+        false,
+    );
+    a.drive(now);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    assert_eq!(
+        field(&head(&got, 1).bytes, "grpc-timeout").as_deref(),
+        Some(&b"99999999H"[..])
+    );
+    assert!(got.iter().all(|piece| !piece.failed));
+    assert!(a.next_deadline().is_some_and(|d| d > now + 3600 * SEC));
+    a.drive(now + 3600 * SEC);
+    assert!(a.pieces().drain(..).all(|piece| !piece.failed));
+}
+
+/// A request that ends inside a length-prefixed message fails that call INTERNAL on both ends.
+#[test]
+fn a_request_ending_inside_a_message_fails_the_call_internal() {
+    let mut p = Pair::new();
+    let mut c = msg::render_head(&[("path", b"/pkg.Svc/Z")], Some(3)).expect("head");
+    c.extend_from_slice(&[0, 0, 0]);
+    p.d.emit(1, &c, true, 0, p.now).expect("emit");
+    p.settle();
+    let a = terminal(&p.got_a, 1).expect("the accepted side fails it");
+    assert!(a.failed);
+    assert_eq!(a.status, Some(msg::INTERNAL));
+    let d = terminal(&p.got_d, 1).expect("and answers the dialled side");
+    assert_eq!(d.status, Some(msg::INTERNAL));
+}
+
+/// A body the far end breaks (fewer bytes than its content-length, then the end) fails the call
+/// and ends the reply, rather than leaving the stream held.
+#[test]
+fn a_request_body_that_breaks_its_length_fails_the_call() {
+    let mut a = Conn::accept(posture(), 5 * SEC);
+    let mut wire = opening_with(Some("trailers"), &[("content-length", "10")]);
+    wire.extend(h2(0, 0x1, 1, &msg::frame(b"q")[..3]));
+    a.ingest(&wire, false);
+    a.drive(5 * SEC);
+    a.drive(5 * SEC);
+    let got: Vec<Piece> = a.pieces().drain(..).collect();
+    let t = terminal(&got, 1).expect("the broken body ends the call");
+    assert!(t.failed);
+    assert_eq!(t.status, Some(msg::INTERNAL));
+    assert_eq!(held(&a), 0);
+}
+
 #[test]
 fn a_malformed_accepted_timeout_is_refused_before_publication() {
     let mut a = Conn::accept(posture(), 5 * SEC);
@@ -526,6 +579,19 @@ fn a_malformed_accepted_timeout_is_refused_before_publication() {
     a.drive(5 * SEC);
     assert!(a.pieces().is_empty());
     assert_eq!(held(&a), 0);
+    let wire = a.take_wire(usize::MAX);
+    let (flags, block) =
+        response_headers(&wire, 1).expect("the refused stream got a trailers-only answer");
+    assert_eq!(flags & 0x1, 0x1, "the answer ends the stream");
+    // HPACK as hyper's server writes it: `:status 200` (static 8) ...
+    assert_eq!(block[0], 0x88, ":status 200: {block:?}");
+    // ... and `grpc-status: 3` (INVALID_ARGUMENT): literal indexed, Huffman name, Huffman "3".
+    assert!(
+        block
+            .windows(12)
+            .any(|w| w == [64, 136, 154, 202, 200, 178, 18, 52, 218, 143, 129, 103]),
+        "grpc-status 3 (INVALID_ARGUMENT): {block:?}"
+    );
 }
 
 #[test]
@@ -640,6 +706,22 @@ fn resets(wire: &[u8]) -> Vec<(u32, u32)> {
         i += 9 + len;
     }
     out
+}
+
+/// The first HEADERS frame (flags, header block) a server wrote on `stream`, if any.
+fn response_headers(wire: &[u8], stream: u32) -> Option<(u8, Vec<u8>)> {
+    let mut i = 0;
+    while i + 9 <= wire.len() {
+        let len =
+            usize::from(wire[i]) << 16 | usize::from(wire[i + 1]) << 8 | usize::from(wire[i + 2]);
+        let id =
+            u32::from_be_bytes([wire[i + 5], wire[i + 6], wire[i + 7], wire[i + 8]]) & 0x7fff_ffff;
+        if wire[i + 3] == 1 && id == stream && i + 9 + len <= wire.len() {
+            return Some((wire[i + 4], wire[i + 9..i + 9 + len].to_vec()));
+        }
+        i += 9 + len;
+    }
+    None
 }
 
 /// A `te` value other than `trailers` is reset with HTTP/2 `PROTOCOL_ERROR` before admission.
@@ -2184,7 +2266,12 @@ fn a_connection_failing_while_it_holds_a_body_back_still_says_so() {
     );
     assert!(p.d.pieces().iter().any(|piece| piece.failed));
     p.d.pieces().clear();
-    assert!(!p.d.wire_pending(), "a failed connection owes no re-call");
+    // What the HTTP/2 machine wrote on the way down is still the host's to take, once.
+    let _ = p.d.take_wire(usize::MAX);
+    assert!(
+        !p.d.wire_pending(),
+        "a failed connection owes no re-call once its wire is taken"
+    );
 }
 
 /// ONE BUSY STREAM DOES NOT STARVE ANOTHER while the host holds the connection at its mark: two
@@ -2457,15 +2544,6 @@ fn an_accepted_conn_dropped_with_a_call_in_flight_is_freed() {
     );
 }
 
-/// A literal HPACK field, no indexing, no Huffman.
-fn lit(name: &str, value: &str) -> Vec<u8> {
-    let mut v = vec![0x00, name.len() as u8];
-    v.extend_from_slice(name.as_bytes());
-    v.push(value.len() as u8);
-    v.extend_from_slice(value.as_bytes());
-    v
-}
-
 /// Premature status never becomes successful completion; an ordinary response keeps its body
 /// and its actual terminal trailers.
 #[test]
@@ -2489,13 +2567,15 @@ fn a_premature_status_is_refused_and_real_final_trailers_are_preserved() {
         d.ingest(&wire, false);
         turn(&mut d, &mut got);
         let mut head_block = vec![0x88];
-        head_block.extend(lit("content-type", "application/grpc"));
+        lit_field(&mut head_block, "content-type", "application/grpc");
         if premature {
-            head_block.extend(lit("grpc-status", "0"));
+            lit_field(&mut head_block, "grpc-status", "0");
         }
         let mut wire = h2(1, 0x04, 1, &head_block);
         wire.extend(h2(0, 0, 1, &msg::frame(b"answer")));
-        wire.extend(h2(1, 0x05, 1, &lit("grpc-status", "13")));
+        let mut trailers = Vec::new();
+        lit_field(&mut trailers, "grpc-status", "13");
+        wire.extend(h2(1, 0x05, 1, &trailers));
         d.ingest(&wire, false);
         turn(&mut d, &mut got);
         let t = terminal(&got, 1).expect("the trailers' status");
@@ -2537,7 +2617,22 @@ fn a_get_with_a_grpc_content_type_is_refused_and_never_handed_up() {
     a.drive(5 * SEC);
     let got: Vec<Piece> = a.pieces().drain(..).collect();
     assert!(got.is_empty(), "a GET was handed up as a call: {got:?}");
-    assert!(!a.take_wire(usize::MAX).is_empty(), "it was answered");
+    let wire = a.take_wire(usize::MAX);
+    let (flags, block) =
+        response_headers(&wire, 1).expect("the refused GET's stream got a HEADERS answer");
+    assert_eq!(flags & 0x1, 0x1, "the answer ends the stream");
+    // HPACK as hyper's server writes it: `:status` (static name 8) literal, Huffman "405" ...
+    assert!(
+        block.starts_with(&[0x48, 0x83, 104, 13, 255]),
+        ":status 405, not another answer: {block:?}"
+    );
+    // ... and `allow` (static name 22) literal, Huffman "POST".
+    assert!(
+        block
+            .windows(6)
+            .any(|w| w == [0x56, 0x84, 215, 171, 118, 255]),
+        "allow: POST: {block:?}"
+    );
     // Its id is used; the next call (arrival 2, h2 stream 3) is still served.
     let mut next = opening(Some("trailers"));
     next.drain(..24 + 9);
@@ -2549,6 +2644,59 @@ fn a_get_with_a_grpc_content_type_is_refused_and_never_handed_up() {
     assert_eq!(
         head(&got, 2).head.as_ref().map(|w| w.method.as_ref()),
         Some(&b"POST"[..])
+    );
+}
+
+/// SETTINGS AT THE SCHEMA MAXIMUM (`u64::MAX`, what `read_settings` accepts) must not overflow the
+/// deadline arithmetic: the call goes out on the wire and nothing fails.
+#[test]
+fn a_dialled_call_under_the_schema_maximum_posture_goes_out_without_overflow() {
+    let now = 5 * SEC;
+    let mut max = posture();
+    max.timeout = Duration::from_secs(u64::MAX);
+    max.max_message_bytes = usize::MAX;
+    let mut d = Conn::dial("http://peer.test:50051", max, now).expect("dial");
+    d.emit(1, &call("/pkg.Svc/Get", &[], &[b"k"]), true, 0, now)
+        .expect("emit");
+    let mut sent: Vec<u8> = Vec::new();
+    let mut got: Vec<Piece> = Vec::new();
+    let mut turn = |d: &mut Conn| {
+        for _ in 0..20 {
+            d.drive(now);
+            sent.extend(d.take_wire(usize::MAX));
+            got.extend(d.pieces().drain(..));
+        }
+    };
+    turn(&mut d);
+    let mut wire = h2(4, 0, 0, &[]);
+    wire.extend(h2(4, 1, 0, &[]));
+    d.ingest(&wire, false);
+    turn(&mut d);
+    assert!(
+        response_headers(&sent[24..], 1).is_some(),
+        "the request went out on stream 1"
+    );
+    assert!(d.failure().is_none(), "{:?}", d.failure());
+    assert!(
+        got.iter().all(|p| !p.failed && p.status.is_none()),
+        "no failure piece: {got:?}"
+    );
+    // The deadline saturates rather than wraps: ten hours on, the call is still live.
+    let later = now + 36_000 * SEC;
+    for _ in 0..20 {
+        d.drive(later);
+        sent.extend(d.take_wire(usize::MAX));
+        got.extend(d.pieces().drain(..));
+    }
+    assert!(d.failure().is_none(), "{:?}", d.failure());
+    assert!(
+        got.iter().all(|p| !p.failed && p.status.is_none()),
+        "no deadline failure after hours: {got:?}"
+    );
+    assert!(
+        resets(&sent[24..]).is_empty(),
+        "no RST_STREAM after hours: {:?}",
+        resets(&sent[24..])
     );
 }
 

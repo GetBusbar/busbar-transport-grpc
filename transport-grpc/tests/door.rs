@@ -86,6 +86,11 @@ fn dial(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec<Str
         "hang asks back at {:?}",
         host.next_deadline().map(|d| d - t0)
     ));
+    assert_eq!(
+        host.next_deadline(),
+        Some(t0 + 2 * SEC),
+        "the door asks to be called back exactly at the call's deadline"
+    );
     assert_eq!(host.advance(t0 + 2 * SEC - 1), Outcome::Ready);
     assert!(host.terminal(9).is_none(), "not before the deadline");
     assert_eq!(host.advance(t0 + 2 * SEC), Outcome::Ready);
@@ -144,6 +149,11 @@ fn accept(ops: &'static Ops, rt: &tokio::runtime::Runtime) -> Vec<String> {
     assert_eq!(
         words,
         ("POST".into(), "/t.T/Unary".into(), "door.test".into())
+    );
+    assert_eq!(field(&f[0], "x-meta").as_deref(), Some("one"));
+    assert_eq!(
+        field(&f[0], "content-type").as_deref(),
+        Some("application/grpc")
     );
     assert_eq!(field(&f[0], "path"), None, "no pseudo-field");
     assert_eq!(field(&f[0], "te"), None, "te is checked, then dropped");
@@ -531,14 +541,15 @@ fn a_stream_refused_before_any_reply_is_predevs_trailers_only_answer() {
 /// Non-gRPC calls and details that cannot form a field value are refused.
 #[test]
 fn a_call_that_is_not_grpc_and_details_that_are_not_a_value_are_refused() {
-    let mut host = Host::open(linked(), "{}", ROOMY);
-    assert_eq!(
-        host.begin_stream("/t.T/Unary", &[("content-type", "application/json")]),
-        Outcome::Refused
-    );
     use busbar_contract::abi::mechanism::call::Span;
     let (d, _lib) = dropped();
     for ops in [linked(), d] {
+        let mut refused = Host::open(ops, "{}", ROOMY);
+        assert_eq!(
+            refused.begin_stream("/t.T/Unary", &[("content-type", "application/json")]),
+            Outcome::Refused
+        );
+        refused.close();
         let mut host = Host::open(ops, "{}", ROOMY);
         host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
         let at = host.wire_log.len();
@@ -1106,5 +1117,229 @@ fn a_body_only_deadline_yields_cancellation_and_cannot_finish_successfully() {
             );
             host.close();
         }
+    }
+}
+
+/// A ONE-STREAM CLOSE IS THE CALL'S LAST ANSWER: a close stating success while a reply message is
+/// half written cannot be success, and nothing comes after it to refuse the call, so it closes
+/// `INTERNAL` in the framer's words (the half message dropped) and the framing is let go.
+#[test]
+fn a_success_close_inside_a_reply_message_closes_internal_and_lets_the_call_go() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
+        assert_eq!(host.emit(1, b"half", false, 0), Outcome::Ready);
+        let at = host.wire_log.len();
+        assert_eq!(host.finish_final(0, b"", b""), Outcome::Ready);
+        let block = String::from_utf8_lossy(&host.wire_log[at..]).into_owned();
+        assert!(block.contains("grpc-status: 13\r\n"), "{block}");
+        assert!(!block.contains("grpc-status: 0\r\n"), "{block}");
+        assert!(!block.contains("half"), "{block}");
+        assert_eq!(
+            host.finish_final(0, b"", b""),
+            Outcome::Failed,
+            "the closed call is no longer held"
+        );
+        host.close();
+    }
+}
+
+/// `begin` REFUSES WHAT IT CANNOT SERVE IN ITS OWN WORDS: a dialled target that is not text or not
+/// a URL, a side it does not know, and a policy it cannot read; and none of them leaves a framing.
+#[test]
+fn begin_names_why_it_cannot_serve_a_target_a_side_or_a_policy() {
+    use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
+    use busbar_contract::abi::mechanism::extensions;
+    use busbar_contract::abi::transport::guest_policy::EXT_GUEST_POLICY;
+    use busbar_contract::abi::transport::{slot, BeginIn, FramerOut};
+    let (d, _lib) = dropped();
+    let not_text = [0xff_u8, 0xfe];
+    let bad_policy = extensions::encode(&[(EXT_GUEST_POLICY, b"invalid")]);
+    for ops in [linked(), d] {
+        let host = Host::open(ops, "{}", ROOMY);
+        let o = host.ops;
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let begin = |set: &dyn Fn(&mut BeginIn)| unsafe {
+            host.op_text::<BeginIn, FramerOut>(o.begin, slot::BEGIN, true, |i| set(i))
+        };
+        assert_eq!(
+            begin(&|i| {
+                i.side = SIDE_DIAL;
+                i.target = AbiStr {
+                    ptr: not_text.as_ptr(),
+                    len: not_text.len(),
+                };
+            }),
+            (Outcome::Failed, "begin: the target is not text".to_owned())
+        );
+        assert_eq!(
+            begin(&|i| {
+                i.side = SIDE_DIAL;
+                i.target = s("not a url");
+            }),
+            (Outcome::Failed, "begin: the target is not a URL".to_owned())
+        );
+        assert_eq!(
+            begin(&|i| i.side = 99),
+            (
+                Outcome::Failed,
+                "begin: the side is neither accept nor dial".to_owned()
+            )
+        );
+        let (r, why) = begin(&|i| {
+            i.side = SIDE_ACCEPT;
+            i.head.extensions = Blob {
+                ptr: bad_policy.as_ptr(),
+                len: bad_policy.len(),
+                fmt: BLOB_OCTETS,
+                flags: 0,
+            };
+        });
+        assert_eq!(r, Outcome::Failed);
+        assert!(why.starts_with("begin: "), "{why}");
+        host.close();
+    }
+}
+
+/// `locate` SAYS WHY A TARGET CANNOT BE DIALLED when it is not a URL at all.
+#[test]
+fn locate_names_a_target_that_is_not_a_url() {
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let (r, _, why) = host.locate_lent("http://[::1", false, [256, 256, 64, 256]);
+        assert_eq!(
+            (r, why.as_str()),
+            (Outcome::Failed, "locate: the target is not a URL")
+        );
+        host.close();
+    }
+}
+
+/// A CONNECTION IS NEVER REFUSED WHOLE, and a finished connection's framing is gone with its end.
+#[test]
+fn a_connection_is_not_refused_whole_and_a_finished_one_is_gone() {
+    use busbar_contract::abi::transport::{slot, FinishIn, FramerOut, RefuseIn};
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        host.begin(SIDE_ACCEPT, "", "", None);
+        let framing = host.framing;
+        let o = host.ops;
+        assert_eq!(
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<RefuseIn, FramerOut>(o.refuse, slot::REFUSE, true, |i| {
+                    i.framing = framing;
+                    i.has_stream = 0;
+                })
+            },
+            (
+                Outcome::Refused,
+                "refuse: gRPC refuses a call, never a connection".to_owned()
+            )
+        );
+        for (outcome, words) in [
+            (Outcome::Ready, ""),
+            (Outcome::Failed, "finish: no such framing"),
+        ] {
+            assert_eq!(
+                // SAFETY: as above.
+                unsafe {
+                    host.op_text::<FinishIn, FramerOut>(o.finish, slot::FINISH, true, |i| {
+                        i.framing = framing;
+                    })
+                },
+                (outcome, words.to_owned())
+            );
+        }
+        assert_eq!(
+            // SAFETY: as above; no instance is lent.
+            unsafe {
+                host.op_text::<FinishIn, FramerOut>(o.finish, slot::FINISH, false, |i| {
+                    i.framing = framing;
+                })
+            },
+            (Outcome::Failed, "finish: no open instance".to_owned())
+        );
+        host.close();
+    }
+}
+
+/// `encode` WRITES ONE CALL OR SAYS WHY IT CANNOT: the target head word wins over an envelope
+/// `path`, and a field that is not text, a line that cannot be written, or a wire buffer too small
+/// for the call is a failure in the op's words.
+#[test]
+fn encode_names_what_the_envelope_cannot_express_and_what_does_not_fit() {
+    use busbar_contract::abi::mechanism::call::{AbiStr, Field};
+    use busbar_contract::abi::transport::{slot, EncodeIn, FramerOut};
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let mut host = Host::open(ops, "{}", ROOMY);
+        let wire = host.encode("/pkg.Svc/Call", &[("path", "/ignored"), ("x-a", "1")], b"b");
+        let head = String::from_utf8_lossy(&wire);
+        assert_eq!(head.matches("path: ").count(), 1, "{head}");
+        assert!(
+            head.starts_with("path: /pkg.Svc/Call\r\nx-a: 1\r\n"),
+            "{head}"
+        );
+        assert!(!head.contains("/ignored"));
+
+        let o = host.ops;
+        let not_text = [0xff_u8];
+        let bad_name = [Field {
+            name: AbiStr {
+                ptr: not_text.as_ptr(),
+                len: 1,
+            },
+            value: s("v"),
+        }];
+        let bad_line = [Field {
+            name: s("x-a"),
+            value: s("one\r\ntwo"),
+        }];
+        let fine = [Field {
+            name: s("x-a"),
+            value: s("v"),
+        }];
+        let encode = |fields: &[Field], wire_cap: usize| {
+            let mut wire = vec![0_u8; wire_cap];
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                host.op_text::<EncodeIn, FramerOut>(o.encode, slot::ENCODE, true, |i| {
+                    i.target = s("/pkg.Svc/Call");
+                    i.fields = fields.as_ptr();
+                    i.fields_len = fields.len();
+                    i.sink.wire = wire.as_mut_ptr();
+                    i.sink.wire_cap = wire.len();
+                })
+            }
+        };
+        assert_eq!(
+            encode(&bad_name, 4096),
+            (
+                Outcome::Failed,
+                "encode: a field name is not text".to_owned()
+            )
+        );
+        assert_eq!(
+            encode(&bad_line, 4096),
+            (
+                Outcome::Failed,
+                "encode: the envelope cannot be expressed on this wire".to_owned()
+            )
+        );
+        assert_eq!(
+            encode(&fine, 8),
+            (
+                Outcome::Failed,
+                "encode: the rendered call is larger than the wire buffer".to_owned()
+            )
+        );
+        host.close();
     }
 }

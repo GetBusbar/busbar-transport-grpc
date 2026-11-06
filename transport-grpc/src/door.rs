@@ -13,7 +13,7 @@ use crate::hyper_io::{fill, mark_stream_full, Owed};
 use busbar_contract::abi::host::service::{
     UnitRef, FLOW_CONTINUE, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS, REFUSE_NO_ROUTE,
 };
-use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome, BLOB_OCTETS};
 use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut};
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
@@ -92,8 +92,10 @@ pub struct Instance {
 }
 
 /// HTTP/2 keep-alive on a dialled connection: a PING this often (fixed here, not an operator
-/// setting), so a far end gone silent is found while a call waits on it.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// setting), so a far end gone silent is found while a call waits on it. No more often than gRPC
+/// servers' default ping enforcement permits (gRFC A8: a minimum of 5 minutes, then GOAWAY
+/// `too_many_pings` after two strikes), so a long idle call is not torn down for its own pings.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How long a keep-alive PING may go unanswered before the dialled connection is failed.
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -559,8 +561,18 @@ slot!(
                 }
             };
             let status = i.final_status();
+            // The close is the call's last answer (`FinishIn`): a success stated inside a reply
+            // message is no success, and nothing follows to refuse the call, so it closes
+            // `INTERNAL` in the framer's words rather than staying held for good.
             let answered = on_stream("finish", &call, i.sink(), &mut o, |c| {
-                c.finish(status, message, details)
+                match c.finish(status, message, details) {
+                    Err(_) if status == 0 && c.reply_unfinished() => c.finish(
+                        u32::from(msg::INTERNAL),
+                        b"the reply ended inside a message",
+                        b"",
+                    ),
+                    finished => finished,
+                }
             });
             // A close the sink could not take whole stays until the host's re-call drains it, and a
             // close that failed stays for the host's fallback refusal to close the call. The call
@@ -883,6 +895,14 @@ fn step(
         }
     }
     fill(c, sink, o, class_of, fault_of);
+    // The far-side bytes this framing still holds unread, so the host counts them in its own
+    // receive backpressure (`framer.retained_input`) and stops feeding a stalled connection.
+    o.lease(
+        |x| &x.head.extensions,
+        host.leases,
+        busbar_contract::abi::sdk::transport::receive::encode(c.retained_input() as u64),
+        BLOB_OCTETS,
+    );
     Outcome::Ready
 }
 

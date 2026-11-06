@@ -76,7 +76,8 @@ pub struct Posture {
     pub adaptive_window: bool,
     /// A dialled call's deadline when the host states none.
     pub timeout: Duration,
-    /// The largest message payload carried, either way.
+    /// The largest message payload read from a far end; what the host emits is bounded by the
+    /// stream's queue ([`stream_bound`]), not by this.
     pub max_message_bytes: usize,
 }
 
@@ -143,6 +144,8 @@ const INBOUND_HIGH_WATER: usize = STREAM_HIGH_WATER;
 /// What one piece held for the host counts beside its bytes ([`INBOUND_HIGH_WATER`]).
 const PIECE_COST: usize = 64;
 
+/// The most requests one accepted connection holds unanswered in each of its two queues: newly
+/// arrived and not yet read, and awaiting host admission. A request past either is answered 503.
 const PENDING_REQUEST_LIMIT: usize = 200;
 
 /// What `out` holds for the host, as [`INBOUND_HIGH_WATER`] counts it.
@@ -155,7 +158,8 @@ fn held_for_host(out: &VecDeque<Piece>) -> usize {
 pub(crate) const OVER_BOUND: &str =
     "the stream's queue is past its bound: the far end is not reading";
 
-/// The room a head block may take beside one whole message: an answer's head block is read up to
+/// The room a head block may take beside one whole message: a head block the host emits (an
+/// accepted call's answer, or a dialled call's request with its auth's lines) is read up to
 /// `max_message_bytes` and this much, and a stream's bound counts it as part of the one message
 /// more it holds past the high-water mark.
 pub(crate) const HEAD_ALLOWANCE: usize = 64 * 1024;
@@ -380,8 +384,10 @@ impl Owed for Conn {
     }
     /// Wire bytes still owed, or a body the last drive left unread for the host's sake: either way
     /// the host calls again (`YIELD_MORE`), and the re-call reads on once it has taken its pieces.
+    /// A failed connection still owes what its HTTP/2 machine wrote on the way down (its GOAWAY):
+    /// the host takes that before the framing fails.
     fn wire_pending(&self) -> bool {
-        self.failed.is_none() && (self.io.wire_pending() || self.held_back)
+        self.io.wire_pending() || (self.failed.is_none() && self.held_back)
     }
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
         &mut self.out
@@ -871,6 +877,13 @@ impl Conn {
         }
     }
 
+    /// Far-side bytes ingested and not yet read by the connection: what it retains while
+    /// `hyper` has stopped reading (its own writes are blocked on a far end not reading them).
+    #[must_use]
+    pub fn retained_input(&self) -> usize {
+        self.io.pending_input()
+    }
+
     /// Why this framing failed, once it has.
     #[must_use]
     pub fn failure(&self) -> Option<&Failure> {
@@ -917,8 +930,9 @@ impl Room {
         }
     }
 
-    /// The order a round reads `n` streams in: from [`Room::first`] round, so that while the host is
-    /// the bottleneck no stream fills the room ahead of the others on every drive.
+    /// The order a round reads `n` streams in: every stream once, starting at [`Room::first`]
+    /// (modulo `n`) and wrapping, so that while the host is the bottleneck no stream fills the room
+    /// ahead of the others on every drive.
     fn order(&self, n: usize) -> impl Iterator<Item = usize> {
         let first = if n == 0 { 0 } else { self.first % n };
         (0..n).map(move |k| (first + k) % n)
@@ -1948,14 +1962,17 @@ impl Accept {
                 self.ended.insert(id);
                 continue;
             }
-            let ct = req.headers().get(http::header::CONTENT_TYPE).cloned();
-            let Some(_ct) = ct.filter(|v| msg::is_grpc_content_type(v.as_bytes())) else {
+            if !req
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .is_some_and(|v| msg::is_grpc_content_type(v.as_bytes()))
+            {
                 reply.head(StatusCode::UNSUPPORTED_MEDIA_TYPE, HeaderMap::new());
                 reply.chan.end();
                 // Never handed up, and its id is used: ended, so the ended runs stay contiguous.
                 self.ended.insert(id);
                 continue;
-            };
+            }
             if let Some(bad) = req
                 .headers()
                 .get(msg::GRPC_ENCODING)
@@ -1990,7 +2007,7 @@ impl Accept {
                 Some(value) => match msg::timeout_ns(value.as_bytes()) {
                     Ok(timeout) => Some(received.saturating_add(timeout)),
                     Err(why) => {
-                        close_unadmitted(&reply, 3, why);
+                        close_unadmitted(&reply, msg::INVALID_ARGUMENT, why);
                         self.ended.insert(id);
                         continue;
                     }

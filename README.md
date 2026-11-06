@@ -17,13 +17,25 @@ First-party signed kind:transport plugin cdylib: the grpc transport, packaged as
 
 Configured under the `grpc` module name.
 
+Settings (`transport-grpc/settings.schema.json`; unknown keys and `null` are refused):
+
+| key | meaning | default |
+|---|---|---|
+| `limits.upstream_request_timeout_secs` | a dialled call's deadline when the host states none, in seconds (above 0) | `300` |
+| `limits.request_body_max_bytes` | the largest message payload read from a far end, in bytes (above 0) | `33554432` |
+
 ## Limits and failure handling
 
-Message payloads obey `limits.request_body_max_bytes`. Across a connection,
+Message payloads read from a far end obey `limits.request_body_max_bytes`. Across a connection,
 partial incoming messages share a budget of that limit plus 1 MiB and 64 KiB;
 a stream exceeding the budget fails with `RESOURCE_EXHAUSTED`. Requests awaiting
 host admission and newly arrived requests each have a 200-request queue limit;
 overflow receives HTTP 503, and peer resets release pending admission state.
+Far-side bytes a connection has been handed and not yet read (its HTTP/2 machine stops reading
+while a far end leaves what it is owed untaken) are reported as `framer.retained_input` on each
+READY connection answer that completes its drive (not on a policy-open request, which is recalled
+at once), so the host's receive backpressure counts them. A dialled connection pings an idle far
+end every 5 minutes, no more often than gRPC servers permit by default.
 
 A valid inbound `grpc-timeout` bounds each accepted call on the host monotonic
 clock, including time awaiting admission. Expiry yields a stream failure and

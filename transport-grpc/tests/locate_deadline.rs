@@ -157,10 +157,25 @@ fn locate_timeout_preparation_fails_closed_without_a_working_host_clock() {
             assert_eq!(out.defaults_written, 0);
             assert!(rendered.is_empty());
         }
-        let (outcome, _, rendered) = locate(ops, 0, Clock::NoHost, 256);
+        // A working clock service is installed, but no deadline asks for it: it is never called.
+        let (outcome, _, rendered) = locate(ops, 0, Clock::Available, 256);
         assert_eq!(outcome, Outcome::Ready);
         assert_eq!(rendered, STATIC);
         CLOCK_CALLED.with(|called| assert!(!called.get()));
+    }
+}
+
+#[test]
+fn locate_without_a_deadline_needs_no_host_clock() {
+    let (d, _library) = dropped();
+    for ops in [linked(), d] {
+        for clock in [Clock::NoHost, Clock::Missing] {
+            let (outcome, out, rendered) = locate(ops, 0, clock, 256);
+            assert_eq!(outcome, Outcome::Ready);
+            assert_eq!(out.defaults_written as usize, STATIC.len());
+            assert_eq!(rendered, STATIC);
+            CLOCK_CALLED.with(|called| assert!(!called.get()));
+        }
     }
 }
 
