@@ -366,12 +366,12 @@ fn b64_nopad(raw: &[u8]) -> String {
 }
 
 /// What predev's gRPC line wrote for a status: tonic 0.14's own header rendering, as field lines
-/// (with `head`: the trailers-only answer's `:status` and `content-type` first, `into_http`).
+/// (with `head`: the trailers-only answer's fields, including `content-type`, from `into_http`).
+/// The opening HTTP status is separate handoff metadata, never a pseudo-field in this block.
 fn tonic_block(status: tonic::Status, head: bool) -> String {
     let mut out = String::new();
     let map = if head {
         let r = status.into_http::<()>();
-        out.push_str(&format!(":status: {}\r\n", r.status().as_u16()));
         r.headers().clone()
     } else {
         let mut map = http::HeaderMap::new();
@@ -384,6 +384,29 @@ fn tonic_block(status: tonic::Status, head: bool) -> String {
         out.push_str(&format!("{n}: {}\r\n", v.to_str().expect("text")));
     }
     out
+}
+
+/// A trailers-only reply hands the outer transport its opening status separately from fields.
+fn assert_opening_status(host: &Host, at: usize) {
+    use busbar_contract::abi::transport::PIECE_CODE_HANDOFF;
+    let opening = &host.got[at..];
+    assert_eq!(opening.len(), 1, "exactly one opening status handoff");
+    let piece = &opening[0];
+    assert_eq!((piece.stream, piece.code), (1, 200));
+    assert!(piece.fields() && piece.coded());
+    assert_ne!(piece.flags & PIECE_CODE_HANDOFF, 0);
+    assert!(
+        !piece.failed(),
+        "the opening HTTP status is not an RPC failure"
+    );
+    assert!(
+        !piece.end(),
+        "the opening status is not a terminal stream piece"
+    );
+    assert!(
+        piece.bytes.is_empty(),
+        "status is metadata, not a field line"
+    );
 }
 
 /// One stream through `ops`: its body's messages, a reply framed, and the close rendered from the
@@ -491,7 +514,9 @@ fn a_stream_refused_before_any_reply_is_predevs_trailers_only_answer() {
         let mut host = Host::open(ops, "{}", ROOMY);
         host.begin_stream("/t.T/Unary", &[("content-type", "application/grpc")]);
         let at = host.wire_log.len();
+        let pieces_at = host.got.len();
         assert_eq!(host.refuse_as(1, b"", 401), Outcome::Ready);
+        assert_opening_status(&host, pieces_at);
         assert_eq!(
             String::from_utf8_lossy(&host.wire_log[at..]),
             tonic_block(
@@ -552,10 +577,12 @@ fn a_stream_in_an_encoding_the_door_does_not_take_closes_unimplemented() {
         assert_eq!(host.begin_stream("/t.T/Unary", &fields), Outcome::Ready);
         assert_eq!(host.feed(&[1, 0, 0, 0, 1, b'z'], true), Outcome::Failed);
         let at = host.wire_log.len();
+        let pieces_at = host.got.len();
         assert_eq!(host.refuse_as(1, b"", 400), Outcome::Ready);
+        assert_opening_status(&host, pieces_at);
         assert_eq!(
             String::from_utf8_lossy(&host.wire_log[at..]),
-            ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-accept-encoding: identity\r\n\
+            "content-type: application/grpc\r\ngrpc-accept-encoding: identity\r\n\
              grpc-status: 12\r\ngrpc-message: the%20message%20encoding%20%60gzip%60%20is%20not\
              %20supported:%20this%20server%20takes%20identity\r\n"
         );
@@ -578,10 +605,12 @@ fn an_oversize_message_is_refused_at_the_configured_limit_in_this_framers_words(
         body.extend_from_slice(&2049u32.to_be_bytes());
         assert_eq!(host.feed(&body, false), Outcome::Failed);
         let at = host.wire_log.len();
+        let pieces_at = host.got.len();
         assert_eq!(host.refuse_as(1, b"", 400), Outcome::Ready);
+        assert_opening_status(&host, pieces_at);
         assert_eq!(
             String::from_utf8_lossy(&host.wire_log[at..]),
-            ":status: 200\r\ncontent-type: application/grpc\r\ngrpc-status: 8\r\n\
+            "content-type: application/grpc\r\ngrpc-status: 8\r\n\
              grpc-message: the%20message%20is%202049%20bytes,%20over%20the%20limit%20of%202048\
              %20bytes%20(limits.request_body_max_bytes)\r\n"
         );
