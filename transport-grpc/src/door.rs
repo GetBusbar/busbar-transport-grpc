@@ -141,7 +141,9 @@ fn read_settings(bytes: &[u8]) -> Result<Posture, Refusal> {
 type State = Held<Instance>;
 
 /// This framer's instance, where the op has one open.
-fn mine<'a>(p: &sdk::Instance<'a, State>) -> Option<&'a Instance> {
+fn mine<'a>(
+    p: &sdk::Instance<'a, State, busbar_contract::plugin::markers::TransportKind>,
+) -> Option<&'a Instance> {
     p.get().map(Held::life)
 }
 
@@ -152,11 +154,12 @@ macro_rules! slot {
         $(#[$doc])*
         pub struct $name;
         impl SafeSlot for $name {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
             type In = $in;
             type Out = $out;
             type State = State;
             fn call(
-                $inst: sdk::Instance<'_, State>,
+                $inst: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
                 $input: Lent<'_, $in>,
                 #[allow(unused_mut)] mut $o: Out<'_, $out>,
             ) -> Outcome $body
@@ -165,6 +168,7 @@ macro_rules! slot {
 }
 
 impl Life for Instance {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     /// The default when Cancel finds no unadmitted policy opening on its ticket.
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
@@ -653,7 +657,10 @@ slot!(
 );
 
 /// The one-stream framing `token` names, where it names one.
-fn one_stream(p: &sdk::Instance<'_, State>, token: u64) -> Option<Arc<Mutex<StreamCall>>> {
+fn one_stream(
+    p: &sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+    token: u64,
+) -> Option<Arc<Mutex<StreamCall>>> {
     mine(p).and_then(|inst| {
         inst.calls
             .lock()
@@ -702,7 +709,7 @@ struct Crossing<'a> {
 }
 
 struct HostAdmission<'a> {
-    services: Option<Services>,
+    services: Option<Services<busbar_contract::plugin::markers::TransportKind>>,
     ticket: Ticket,
     conn: u64,
     extensions: &'a [u8],
@@ -710,7 +717,7 @@ struct HostAdmission<'a> {
 }
 
 fn host_admission<'a, 'call: 'a>(
-    p: &sdk::Instance<'call, State>,
+    p: &sdk::Instance<'call, State, busbar_contract::plugin::markers::TransportKind>,
     head: Lent<'a, InHead>,
     conn: u64,
 ) -> HostAdmission<'a> {
@@ -822,7 +829,7 @@ impl Admission for HostAdmission<'_> {
 /// Run `f` on framing `token`, then drive it and fill the sink, as `op`.
 fn with(
     crossing: Crossing<'_>,
-    p: &sdk::Instance<'_, State>,
+    p: &sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -834,7 +841,7 @@ fn with(
 /// [`with`], then `then` on the framing and the answer, where the op answered READY.
 fn with_then(
     crossing: Crossing<'_>,
-    p: &sdk::Instance<'_, State>,
+    p: &sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,

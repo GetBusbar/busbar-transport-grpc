@@ -14,7 +14,7 @@ mod stream;
 mod transport;
 
 /// The door: the one entry, linked here and exported by the dropped-in build alike.
-pub use door::door;
+pub use door::{door, MACRO_DOOR};
 
 /// The transport axis entry the composition root folds for this transport: its key, the layers it
 /// declares and its door.
