@@ -463,7 +463,17 @@ pub fn message_text(v: &[u8]) -> Vec<u8> {
     let mut out = String::with_capacity(decoded.len().min(MESSAGE_TEXT_MAX));
     for c in String::from_utf8_lossy(&decoded).chars() {
         let before = out.len();
-        if c.is_control() || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+        if c.is_control()
+            || matches!(c,
+                '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0001}'..='\u{E007F}'
+            )
+        {
             out.extend(c.escape_debug());
         } else {
             out.push(c);

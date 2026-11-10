@@ -539,10 +539,10 @@ impl Conn {
             .position(|request| request.id == stream)
         {
             let request = accept.waiting.remove(at).expect("position above");
-            request.reply.chan.reset();
             request
                 .reply
                 .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+            request.reply.chan.end();
         }
         accept.ended.insert(stream);
         true
@@ -666,7 +666,7 @@ impl Conn {
                 let Some((_, s)) = a.calls.iter_mut().find(|(s, _)| *s == stream) else {
                     return a.late(stream);
                 };
-                if bytes.is_empty() || s.reply_over {
+                if s.reply_over || (bytes.is_empty() && (s.head_sent || !end)) {
                     return Ok(());
                 }
                 if !s.head_sent {
@@ -1283,7 +1283,18 @@ fn advance(
                     }
                     Err(other) => {
                         if let Ok(t) = other.into_trailers() {
-                            msgs.end().map_err(|e| (e.to_string(), e.status(), false))?;
+                            if let Err(e) = msgs.end() {
+                                // The far end truncated the message stream. Use
+                                // the trailers' own status when it is not OK;
+                                // a truncated stream that claims success is the
+                                // framer's INTERNAL, not the far end's OK.
+                                let code = t
+                                    .get(msg::GRPC_STATUS)
+                                    .map_or(msg::UNKNOWN, |v| msg::parse_status(v.as_bytes()));
+                                if code == msg::OK {
+                                    return Err((e.to_string(), e.status(), false));
+                                }
+                            }
                             out.extend(trailers(id, &t, &t));
                             s.stage = DStage::Done;
                             return Ok(());
@@ -1377,11 +1388,14 @@ fn trailers(id: u64, fields: &HeaderMap, status: &HeaderMap) -> [Piece; 2] {
                 if canonical {
                     format!("grpc-status {code}").into_bytes()
                 } else {
-                    format!(
-                        "grpc-status {} (not a gRPC status; read as UNKNOWN)",
-                        sent.as_bytes().escape_ascii()
-                    )
-                    .into_bytes()
+                    {
+                        let mut text = format!(
+                            "grpc-status {} (not a gRPC status; read as UNKNOWN)",
+                            sent.as_bytes().escape_ascii()
+                        );
+                        text.truncate(msg::MESSAGE_TEXT_MAX);
+                        text.into_bytes()
+                    }
                 }
             } else {
                 b"the answer's trailers carry no grpc-status".to_vec()
@@ -1736,16 +1750,16 @@ impl Accept {
             Err(error) => {
                 policy.loans.cancel(ticket);
                 let request = self.waiting.remove(at).expect("position above");
-                request.reply.chan.reset();
                 request
                     .reply
                     .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+                request.reply.chan.end();
                 self.ended.insert(request.id);
                 out.push_back(Piece {
                     status: Some(msg::INTERNAL),
                     ..Piece::failure(request.id, &error.0)
                 });
-                return Err(error);
+                return Ok(AdmissionProgress::Published);
             }
         };
         let request = self.waiting.remove(at).expect("position above");
@@ -1806,16 +1820,16 @@ impl Accept {
                 let (status, fields) = match validated {
                     Ok(validated) => validated,
                     Err(error) => {
-                        stream.reply.chan.reset();
                         stream
                             .reply
                             .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+                        stream.reply.chan.end();
                         self.ended.insert(request.id);
                         out.push_back(Piece {
                             status: Some(msg::INTERNAL),
                             ..Piece::failure(request.id, &error.0)
                         });
-                        return Err(error);
+                        return Ok(AdmissionProgress::Published);
                     }
                 };
                 stream.reply.head(status, fields);
@@ -1833,16 +1847,16 @@ impl Accept {
                 });
             }
             Err(error) => {
-                request.reply.chan.reset();
                 request
                     .reply
                     .head(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new());
+                request.reply.chan.end();
                 self.ended.insert(request.id);
                 out.push_back(Piece {
                     status: Some(msg::INTERNAL),
                     ..Piece::failure(request.id, &error.0)
                 });
-                return Err(error);
+                return Ok(AdmissionProgress::Published);
             }
         }
         Ok(AdmissionProgress::Published)
