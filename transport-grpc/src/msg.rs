@@ -521,7 +521,10 @@ pub fn terminate_block(bytes: &[u8]) -> Vec<u8> {
 /// refusal's neutral status).
 pub fn refusal_block(bytes: &[u8]) -> Result<Option<Head>, String> {
     match read_head(&terminate_block(bytes), usize::MAX) {
-        Ok(Some((h, _))) => Ok(h.get(GRPC_STATUS).is_some().then_some(h)),
+        Ok(Some((h, _))) => Ok(h
+            .get(GRPC_STATUS)
+            .is_some_and(|v| canonical_status(v).is_some())
+            .then_some(h)),
         Ok(None) => Ok(None),
         Err(why) => {
             let status_line = |line: &[u8]| {

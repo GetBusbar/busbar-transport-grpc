@@ -1812,7 +1812,7 @@ impl Accept {
                     }
                     let status = u16::try_from(refusal.status)
                         .ok()
-                        .filter(|status| (100..=599).contains(status))
+                        .filter(|status| (200..=599).contains(status))
                         .and_then(|status| StatusCode::from_u16(status).ok())
                         .ok_or_else(|| Failure("the host refusal has an invalid status".into()))?;
                     Ok::<_, Failure>((status, fields))

@@ -270,12 +270,18 @@ impl StreamCall {
                     lines.truncate(lines.len() - 2);
                     lines
                 }
-                None if status != 0 => msg::status_lines(
-                    u32::from(msg::status_of_refusal(status)),
-                    msg::refusal_message(status).as_bytes(),
-                    &[],
-                )
-                .map_err(|e| Failure(e.into()))?,
+                None if status != 0 => {
+                    u16::try_from(status)
+                        .ok()
+                        .filter(|s| (200..=599).contains(s))
+                        .ok_or(Failure("the host refusal has an invalid status".into()))?;
+                    msg::status_lines(
+                        u32::from(msg::status_of_refusal(status)),
+                        msg::refusal_message(status).as_bytes(),
+                        &[],
+                    )
+                    .map_err(|e| Failure(e.into()))?
+                }
 
                 None => msg::status_lines(u32::from(msg::UNKNOWN), bytes, &[])
                     .map_err(|e| Failure(e.into()))?,
