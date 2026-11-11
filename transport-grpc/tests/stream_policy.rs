@@ -214,6 +214,7 @@ fn assert_admission_failure(answer: &Answer, reason: &str) {
     let mut at = 0;
     let mut terminal = false;
     let mut head = false;
+    let mut response_wire = Vec::new();
     while at < answer.wire.len() {
         assert!(at + 9 <= answer.wire.len(), "complete HTTP/2 frame header");
         let wire = &answer.wire[at..];
@@ -228,6 +229,7 @@ fn assert_admission_failure(answer: &Answer, reason: &str) {
         if stream == 1 {
             head |= wire[3] == 1;
             terminal |= matches!(wire[3], 0 | 1) && wire[4] & 1 != 0;
+            response_wire.extend_from_slice(&wire[..9 + length]);
         }
         at += 9 + length;
     }
@@ -235,6 +237,57 @@ fn assert_admission_failure(answer: &Answer, reason: &str) {
         head && terminal,
         "the peer receives a terminal response on stream 1"
     );
+    // Decode the actual HPACK response with an independent h2 client, rather than
+    // treating any syntactically complete HEADERS frame as a meaningful refusal.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let request = http::Request::post("http://policy.test/first")
+            .body(())
+            .unwrap();
+        let (response, _) = sender.send_request(request, true).unwrap();
+        // Supply a server preface for the standalone decoder; the following response
+        // frames, including their status and metadata, are the door's exact bytes.
+        peer.write_all(&frame(4, 0, 0, &[])).await.unwrap();
+        let mut preface = [0; 24];
+        peer.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        // Let the client actually open stream 1 before delivering its response.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let mut header = [0; 9];
+                peer.read_exact(&mut header).await.unwrap();
+                let len = (usize::from(header[0]) << 16)
+                    | (usize::from(header[1]) << 8)
+                    | usize::from(header[2]);
+                peer.read_exact(&mut vec![0; len]).await.unwrap();
+                if header[3] == 1 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the decoder's request opens");
+        peer.write_all(&response_wire).await.unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response)
+            .await
+            .expect("the peer receives the refusal")
+            .expect("a response, not a reset");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key("grpc-status"));
+        assert!(
+            response.body().is_end_stream(),
+            "the refusal ends without a body"
+        );
+        driver.abort();
+        let _ = driver.await;
+    });
 }
 
 struct Host {
