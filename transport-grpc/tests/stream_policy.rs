@@ -26,7 +26,8 @@ use busbar_contract::abi::transport::guest_policy::{
 use busbar_contract::abi::transport::route::{METHOD_GET, METHOD_POST, PATH_EXACT};
 use busbar_contract::abi::transport::{
     slot, BeginIn, FramePiece, FramerOut, FramerSink, HeadSlots, IngestIn, Ops, CANCEL_PARTIAL,
-    PIECE_FIELDS, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_ACCEPT_STREAM, YIELD_MORE,
+    PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE, PIECE_STREAM_FAILED, SIDE_ACCEPT,
+    SIDE_ACCEPT_STREAM, YIELD_ENDED, YIELD_MORE,
 };
 use common::{call, linked, s, z};
 
@@ -188,6 +189,52 @@ struct Answer {
     open: Option<Open>,
     framing: u64,
     error: String,
+}
+
+/// Admission failure ends only this stream: the SDK requires a failure piece, while
+/// the peer receives an ordinary terminal response rather than RST_STREAM or GOAWAY.
+fn assert_admission_failure(answer: &Answer, reason: &str) {
+    assert_eq!(answer.outcome, Outcome::Ready);
+    assert!(answer.error.is_empty(), "no connection-level failure");
+    assert_eq!(answer.flags & YIELD_ENDED, 0);
+    assert!(answer.open.is_none());
+    let [(piece, bytes)] = answer.pieces.as_slice() else {
+        panic!("exactly one stream failure, with no request head or body");
+    };
+    assert_eq!(piece.stream, 1);
+    assert_eq!(
+        piece.flags,
+        PIECE_STREAM_FAILED | PIECE_END_OF_FRAME | PIECE_HAS_CODE
+    );
+    assert_eq!(
+        piece.code, 13,
+        "gRPC INTERNAL describes the local admission failure"
+    );
+    assert_eq!(bytes, reason.as_bytes());
+    let mut at = 0;
+    let mut terminal = false;
+    let mut head = false;
+    while at < answer.wire.len() {
+        assert!(at + 9 <= answer.wire.len(), "complete HTTP/2 frame header");
+        let wire = &answer.wire[at..];
+        let length =
+            (usize::from(wire[0]) << 16) | (usize::from(wire[1]) << 8) | usize::from(wire[2]);
+        assert!(
+            at + 9 + length <= answer.wire.len(),
+            "complete HTTP/2 frame"
+        );
+        assert!(!matches!(wire[3], 3 | 7), "no RST_STREAM or GOAWAY");
+        let stream = u32::from_be_bytes(wire[5..9].try_into().unwrap()) & 0x7fff_ffff;
+        if stream == 1 {
+            head |= wire[3] == 1;
+            terminal |= matches!(wire[3], 0 | 1) && wire[4] & 1 != 0;
+        }
+        at += 9 + length;
+    }
+    assert!(
+        head && terminal,
+        "the peer receives a terminal response on stream 1"
+    );
 }
 
 struct Host {
@@ -606,9 +653,36 @@ fn a_malformed_stream_policy_never_reaches_admission_or_request_publication() {
     let (_, original) = host.until_open(&bytes, ticket(2));
     let malformed = extensions::encode(&[(EXT_GUEST_POLICY, b"invalid")]);
     let failed = host.ingest(&original, &malformed, ticket(2));
-    assert_eq!(failed.outcome, Outcome::Failed);
-    assert!(failed.pieces.is_empty());
+    assert_admission_failure(&failed, "the policy version is unknown");
     HANDED.with(|seen| assert!(seen.borrow().is_empty()));
+    let (open, original) =
+        host.until_open(&request(3, "/second", &message(b"public"), true), ticket(3));
+    assert_eq!(open.open.unwrap().stream, 2);
+    let mut admitted = host.ingest(&original, &policy(3, 33, "/second"), ticket(3));
+    let mut body = Vec::new();
+    let mut ended = false;
+    for _ in 0..100 {
+        assert_eq!(admitted.outcome, Outcome::Ready);
+        for (piece, bytes) in admitted.pieces {
+            assert_eq!(piece.stream, 2);
+            assert_eq!(piece.flags & PIECE_STREAM_FAILED, 0);
+            ended |= piece.flags & PIECE_END != 0;
+            if piece.flags & PIECE_FIELDS == 0 {
+                body.extend(bytes);
+            }
+        }
+        if ended {
+            break;
+        }
+        admitted = host.ingest(&[], &[], ticket(3));
+    }
+    assert!(ended, "the next request completes");
+    assert_eq!(
+        body,
+        message(b"public"),
+        "only the admitted request body is published"
+    );
+    HANDED.with(|seen| assert_eq!(seen.borrow().len(), 1));
 }
 
 #[test]
@@ -905,10 +979,14 @@ fn invalid_host_refusals_retire_the_stream_and_leave_the_connection_usable() {
         FLOW.with(|flow| flow.set(FLOW_STOP));
         REFUSAL_MODE.with(|value| value.set(mode));
         let failed = host.ingest(&original, &policy(2, 22, "/first"), ticket(2));
-        assert_eq!(
-            failed.outcome,
-            Outcome::Failed,
-            "invalid refusal mode {mode}"
+        assert_admission_failure(
+            &failed,
+            match mode {
+                1 => "the host refusal has an invalid status",
+                2 => "the host refusal has an invalid field name",
+                3 => "the host refusal has an invalid field value",
+                _ => unreachable!(),
+            },
         );
         let mut input: EmitIn = z();
         input.framing = host.framing;
@@ -1054,7 +1132,7 @@ fn a_request_without_an_authority_is_handed_in_under_its_host_field() {
     });
 }
 
-/// A host answer the door cannot honour fails the framing in words, retires only that stream, and
+/// A host answer the door cannot honour fails the stream in words, retires only that stream, and
 /// leaves the connection admitting the next request.
 #[test]
 fn a_hand_in_the_door_cannot_honour_fails_in_words_and_leaves_the_connection_usable() {
@@ -1078,12 +1156,7 @@ fn a_hand_in_the_door_cannot_honour_fails_in_words_and_leaves_the_connection_usa
             &policy_with_points(2, 22, "/first", METHOD_POST, points),
             ticket(2),
         );
-        assert_eq!(failed.outcome, Outcome::Failed, "{words}");
-        assert!(failed.error.contains(words), "{}", failed.error);
-        assert!(failed
-            .pieces
-            .iter()
-            .all(|(piece, _)| piece.flags & PIECE_FIELDS == 0));
+        assert_admission_failure(&failed, words);
         NO_UNIT.with(|none| none.set(false));
         // The retired stream is failed to the host before the next request opens its policy.
         let second = request(3, "/second", &[], true);
